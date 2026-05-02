@@ -4,12 +4,17 @@ using RPG.Data;
 using RPG.Managers;
 using RPG.UI;
 using System;
+using System.Collections.Generic;
 
 namespace RPG.Character
 {
     [RequireComponent(typeof(NavMeshAgent))]
     public class PlayerEntity : MonoBehaviour
     {
+        // ── Registro estático — evita FindObjectsOfType nos monstros ─────
+        // Corrige: TryAggro() e Die() chamavam FindObjectsOfType a cada frame/morte
+        public static readonly HashSet<PlayerEntity> All = new HashSet<PlayerEntity>();
+
         public CharacterData Data        { get; private set; }
         public DerivedStats  Stats       { get; private set; }
         public BuffBonuses   ActiveBuffs { get; private set; } = new BuffBonuses();
@@ -26,9 +31,11 @@ namespace RPG.Character
         public event Action               OnStatsChanged;
 
         /// <summary>
-        /// Disparado UMA vez quando Initialize() conclui.
-        /// UIManager assina isso para atualizar o HUD com os valores reais,
-        /// resolvendo o bug de HP/MP mostrando 100/100 ao entrar no jogo.
+        /// Disparado UMA vez quando Initialize() conclui com dados reais.
+        /// CORREÇÃO BUG HUD 100/100:
+        ///   O UIManager assina este evento para atualizar HP/MP APÓS os dados
+        ///   reais do personagem estarem disponíveis. Sem isso, a UI usava os
+        ///   valores padrão dos Sliders (maxValue=1, value=1 → mostra 100/100).
         /// </summary>
         public event Action OnInitialized;
 
@@ -41,6 +48,11 @@ namespace RPG.Character
 
         public ITargetable CurrentTarget { get; private set; }
 
+        // ── Registro ──────────────────────────────────────────────────────
+
+        private void OnEnable()  => All.Add(this);
+        private void OnDisable() => All.Remove(this);
+
         private void Awake()
         {
             _agent = GetComponent<NavMeshAgent>();
@@ -48,7 +60,11 @@ namespace RPG.Character
 
         private void Start()
         {
+            // ManagedByNetwork é setado pelo NetworkPlayer.OnStartLocalPlayer() ANTES
+            // de o Start() de outros players remotos rodar na mesma cena.
+            // Em modo offline, ManagedByNetwork nunca é setado → inicializa normalmente.
             if (ManagedByNetwork) return;
+
             var charData = GameManager.Instance?.SelectedCharacter;
             if (charData != null && !IsInitialized)
                 Initialize(charData);
@@ -62,6 +78,15 @@ namespace RPG.Character
 
         // ── Inicialização ─────────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO BUG HUD 100/100:
+        ///   Initialize() agora dispara OnInitialized e força OnHPChanged/OnMPChanged
+        ///   com os valores REAIS do personagem (vindos do CharacterData salvo).
+        ///   O UIManager recebe esses eventos e atualiza os sliders corretamente.
+        ///
+        ///   Antes: os Sliders ficavam com maxValue=1 (padrão do Unity) até o
+        ///   primeiro dano/cura, por isso mostravam 100/100 (1/1 formatado).
+        /// </summary>
         public void Initialize(CharacterData data)
         {
             if (data == null)
@@ -73,6 +98,7 @@ namespace RPG.Character
             Data = data;
             RefreshStats();
 
+            // Usa HP/MP salvos; se zero (novo personagem) usa o máximo
             CurrentHP = data.CurrentHP > 0 ? data.CurrentHP : Stats.MaxHP;
             CurrentMP = data.CurrentMP > 0 ? data.CurrentMP : Stats.MaxMP;
 
@@ -85,10 +111,13 @@ namespace RPG.Character
             Debug.Log($"[PlayerEntity] {data.CharacterName} inicializado | " +
                       $"HP:{CurrentHP:0}/{Stats.MaxHP:0} | MP:{CurrentMP:0}/{Stats.MaxMP:0} | Lv:{data.Level}");
 
-            // Notifica que os dados reais estão prontos — UIManager atualiza HUD aqui
+            // PASSO 1: Notifica que os dados reais estão prontos.
+            // UIManager assina isso e chama ForceRefreshAll() — atualiza nome, level, etc.
             OnInitialized?.Invoke();
 
-            // Força eventos de HP/MP para qualquer UI já vinculada
+            // PASSO 2: Força eventos de HP/MP com os valores reais.
+            // Isso garante que os Sliders recebam maxValue e value corretos AGORA,
+            // independente de quando o UIManager se vinculou.
             OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
             OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
@@ -288,4 +317,5 @@ namespace RPG.Character
 
         private void OnApplicationQuit() => SaveToData();
     }
+
 }

@@ -9,14 +9,15 @@ using System.Collections;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkMonsterEntity v5
+    /// NetworkMonsterEntity v6
     ///
     /// CORREÇÕES:
-    ///   - _attackTimer zerado corretamente ao entrar em Combat (evita ataque instantâneo)
-    ///   - Respawn usa StartCoroutine em vez de Invoke (mais confiável no servidor)
-    ///   - Level sincronizado via CmdSyncLevel após level up no RpcGrantExp
-    ///   - TryAggro agora passa a lista de jogadores como parâmetro para evitar
-    ///     múltiplos FindObjectsOfType desnecessários
+    ///   - TryAggro() e ServerDie() usam NetworkPlayer.All em vez de
+    ///     FindObjectsOfType — elimina travadas com muitos monstros online.
+    ///   - Sistema de morte em 2 fases: hideDelay (corpo no chão) + respawnDelay.
+    ///   - hideDelay configurável no Inspector ("Tempo visível após morrer").
+    ///   - Corpo some (RpcHideVisuals) antes de respawnar (RpcOnRespawned).
+    ///   - _attackTimer zerado ao entrar em Combat (evita ataque instantâneo).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -44,8 +45,15 @@ namespace RPG.Network
         [SerializeField] private float pathUpdateRate = 0.2f;
         [SerializeField] private Transform[] patrolPoints;
 
-        [Header("Respawn")]
-        [Tooltip("Segundos até o monstro reaparecer após morrer. 0 = não respawna.")]
+        [Header("Morte e Respawn")]
+        [Tooltip("Segundos até o VISUAL do mob sumir após morrer (corpo no chão).\n" +
+                 "0 = some imediatamente ao morrer.\n" +
+                 "Ex: 3 = fica 3s visível, depois some.")]
+        [SerializeField] private float hideDelay = 3f;
+
+        [Tooltip("Segundos até o mob RENASCER depois de sumir.\n" +
+                 "0 = não respawna (sumiu para sempre).\n" +
+                 "Ex: 15 = respawna 15s após sumir.")]
         [SerializeField] private float respawnDelay = 15f;
 
         [Header("Recompensa")]
@@ -117,7 +125,7 @@ namespace RPG.Network
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
         }
 
-        // ── Respawn ───────────────────────────────────────────────────────
+        // ── Reset / Respawn (servidor) ────────────────────────────────────
 
         [Server]
         private void ServerReset()
@@ -130,10 +138,12 @@ namespace RPG.Network
             _attackTimer = 0f;
             _pathTimer   = 0f;
 
+            transform.position = _spawnPosition;
+
             if (_agent != null)
             {
                 _agent.enabled = true;
-                _agent.Warp(_spawnPosition);
+                if (_agent.isOnNavMesh) _agent.Warp(_spawnPosition);
             }
 
             RpcOnRespawned();
@@ -191,8 +201,7 @@ namespace RPG.Network
 
             if (dist <= attackRange)
             {
-                // CORREÇÃO: zera o timer ao entrar em Combat para não atacar instantaneamente
-                _attackTimer = 0f;
+                _attackTimer = 0f; // zera para não atacar instantaneamente
                 _state = State.Combat;
                 _agent.ResetPath();
                 return;
@@ -212,13 +221,8 @@ namespace RPG.Network
 
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
 
-            if (dist > attackRange * 1.4f)
-            {
-                _state = State.Chase;
-                return;
-            }
+            if (dist > attackRange * 1.4f) { _state = State.Chase; return; }
 
-            // Kite — mantém distância mínima
             if (_agent.isOnNavMesh)
             {
                 if (dist < kiteDistance)
@@ -226,20 +230,14 @@ namespace RPG.Network
                     Vector3 away = (transform.position - _aggroTarget.transform.position).normalized;
                     _agent.SetDestination(transform.position + away * (kiteDistance + 0.5f));
                 }
-                else
-                {
-                    _agent.ResetPath();
-                }
+                else _agent.ResetPath();
             }
 
-            // Gira para o alvo
-            Vector3 dir = (_aggroTarget.transform.position - transform.position);
-            dir.y = 0f;
+            Vector3 dir = (_aggroTarget.transform.position - transform.position); dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.Slerp(
                     transform.rotation, Quaternion.LookRotation(dir), 10f * Time.deltaTime);
 
-            // Ataca respeitando o cooldown
             if (_attackTimer >= attackCooldown)
             {
                 _attackTimer = 0f;
@@ -249,13 +247,18 @@ namespace RPG.Network
 
         // ── Aggro ─────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO PERFORMANCE:
+        ///   Usa NetworkPlayer.All (HashSet estático) em vez de FindObjectsOfType.
+        ///   No servidor dedicado com muitos mobs, FindObjectsOfType causava spike
+        ///   de CPU a cada tick da IA.
+        /// </summary>
         private bool TryAggro()
         {
             float         closest = aggroRange;
             NetworkPlayer found   = null;
 
-            // FindObjectsOfType só nos estados Idle/Patrol — aceitável
-            foreach (var np in FindObjectsOfType<NetworkPlayer>())
+            foreach (var np in NetworkPlayer.All)
             {
                 if (np.Dead) continue;
                 float dist = Vector3.Distance(transform.position, np.transform.position);
@@ -266,7 +269,7 @@ namespace RPG.Network
             {
                 _aggroTarget = found;
                 _state       = State.Chase;
-                _pathTimer   = pathUpdateRate; // força update imediato do path
+                _pathTimer   = pathUpdateRate;
                 _attackTimer = 0f;
                 Debug.Log($"[NetworkMonster] {monsterDisplayName} agrou {found.CharacterName}");
                 return true;
@@ -294,31 +297,20 @@ namespace RPG.Network
             if (_aggroTarget == null || _aggroTarget.Dead) return;
 
             bool hit = StatsCalculator.RollHit(_stats.HIT, 20f);
-            if (!hit)
-            {
-                RpcShowMiss(_aggroTarget.transform.position);
-                return;
-            }
+            if (!hit) { RpcShowMiss(_aggroTarget.transform.position); return; }
 
             bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
             float dmg  = StatsCalculator.CalculatePhysicalDamage(_stats.ATK, 10f, crit, _stats.CritDMG);
-
-            Debug.Log($"[NetworkMonster] {monsterDisplayName} → {_aggroTarget.CharacterName} | " +
-                      $"Dmg:{dmg:0} Crit:{crit}");
 
             _aggroTarget.ServerApplyDamage(dmg);
             RpcPlayAnim("Attack");
         }
 
-        // ── TakeDamage (ITargetable) ──────────────────────────────────────
+        // ── TakeDamage ────────────────────────────────────────────────────
 
         public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
         {
-            if (isServer)
-            {
-                ServerTakeDamage(rawAtk, rawMatk, isPhysical);
-                return;
-            }
+            if (isServer) { ServerTakeDamage(rawAtk, rawMatk, isPhysical); return; }
             CmdRequestTakeDamage(rawAtk, rawMatk, isPhysical);
         }
 
@@ -339,14 +331,9 @@ namespace RPG.Network
             dmg        = Mathf.Max(1f, dmg);
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
 
-            Debug.Log($"[NetworkMonster] {monsterDisplayName} tomou {dmg:0} | " +
-                      $"HP:{_currentHP:0}/{_maxHP:0}");
-
             RpcShowDamage(dmg, crit, transform.position);
 
-            // Aggro reativo — quem atacou torna-se o alvo
-            if (_state == State.Idle || _state == State.Patrol)
-                TryAggro();
+            if (_state == State.Idle || _state == State.Patrol) TryAggro();
 
             if (_currentHP <= 0f) ServerDie();
         }
@@ -367,23 +354,34 @@ namespace RPG.Network
 
             Debug.Log($"[NetworkMonster] {monsterDisplayName} morreu!");
 
-            // XP para jogadores próximos
-            foreach (var np in FindObjectsOfType<NetworkPlayer>())
+            // Dá XP para players próximos — CORREÇÃO: usa NetworkPlayer.All
+            foreach (var np in NetworkPlayer.All)
             {
                 float dist = Vector3.Distance(transform.position, np.transform.position);
                 if (dist <= aggroRange * 2f)
                     RpcGrantExp(np.netId, expReward);
             }
 
-            RpcOnDied(transform.position);
-
-            // CORREÇÃO: usa coroutine em vez de Invoke — mais confiável no servidor
-            if (respawnDelay > 0f)
-                StartCoroutine(RespawnAfterDelay());
+            // Inicia sequência de morte no servidor
+            StartCoroutine(ServerDeathSequence());
         }
 
-        private IEnumerator RespawnAfterDelay()
+        [Server]
+        private IEnumerator ServerDeathSequence()
         {
+            // Notifica clientes para mostrar "morto" mas manter visual por hideDelay
+            RpcOnDied(transform.position);
+
+            // Aguarda o corpo ficar visível por hideDelay segundos
+            if (hideDelay > 0f)
+                yield return new WaitForSeconds(hideDelay);
+
+            // Manda clientes esconderem o visual
+            RpcHideVisuals();
+
+            if (respawnDelay <= 0f) yield break; // sem respawn — fica "escondido"
+
+            // Aguarda respawnDelay e reseta
             yield return new WaitForSeconds(respawnDelay);
             if (isServer) ServerReset();
         }
@@ -405,6 +403,45 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcPlayAnim(string trigger)
             => _animator?.SetTrigger(trigger);
+
+        /// <summary>
+        /// Chamado imediatamente após morrer — mob ainda visível (corpo no chão).
+        /// Desativa seleção e painel de alvo.
+        /// </summary>
+        [ClientRpc]
+        private void RpcOnDied(Vector3 pos)
+        {
+            OnDeselected();
+            UIManager.Instance?.ClearTargetPanel();
+            FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
+        }
+
+        /// <summary>
+        /// Chamado após hideDelay — esconde o visual do mob no cliente.
+        /// O prefab permanece na cena, apenas invisível.
+        /// </summary>
+        [ClientRpc]
+        private void RpcHideVisuals()
+        {
+            if (visualRoot != null) visualRoot.SetActive(false);
+            if (selectionIndicator != null) selectionIndicator.SetActive(false);
+            if (healthBarUI != null) healthBarUI.gameObject.SetActive(false);
+        }
+
+        /// <summary>
+        /// Chamado quando o mob respawna — reativa tudo no cliente.
+        /// </summary>
+        [ClientRpc]
+        private void RpcOnRespawned()
+        {
+            if (visualRoot != null) visualRoot.SetActive(true);
+            if (selectionIndicator != null) selectionIndicator.SetActive(false);
+            if (healthBarUI != null)
+            {
+                healthBarUI.gameObject.SetActive(true);
+                healthBarUI.UpdateBar(_currentHP, _maxHP);
+            }
+        }
 
         [ClientRpc]
         private void RpcGrantExp(uint targetNetId, long amount)
@@ -432,41 +469,19 @@ namespace RPG.Network
                 if (leveled)
                 {
                     playerEntity.HealToFull();
-
                     FloatingTextManager.Instance?.Show(
                         "LEVEL UP!",
                         NetworkClient.localPlayer.transform.position + Vector3.up * 2.5f,
                         Color.yellow);
-
-                    // CORREÇÃO: sincroniza o level novo com o servidor
                     netPlayer?.CmdSyncLevel(charData.Level);
                 }
 
-                // Sincroniza HP atual com o servidor
                 netPlayer?.CmdSyncHP(playerEntity.CurrentHP, playerEntity.Stats.MaxHP);
 
-                // Salva localmente
                 var account = RPG.Managers.GameManager.Instance?.CurrentAccount;
                 if (account != null)
                     RPG.Managers.SaveManager.Instance?.SaveCharacter(account, charData);
             }
-        }
-
-        [ClientRpc]
-        private void RpcOnDied(Vector3 pos)
-        {
-            OnDeselected();
-            if (visualRoot != null) visualRoot.SetActive(false);
-            UIManager.Instance?.ClearTargetPanel();
-            FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
-        }
-
-        [ClientRpc]
-        private void RpcOnRespawned()
-        {
-            if (visualRoot != null) visualRoot.SetActive(true);
-            if (selectionIndicator) selectionIndicator.SetActive(false);
-            healthBarUI?.UpdateBar(_currentHP, _maxHP);
         }
 
         // ── SyncVar Hooks ─────────────────────────────────────────────────

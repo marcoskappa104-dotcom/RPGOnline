@@ -5,23 +5,27 @@ using RPG.Data;
 using RPG.UI;
 using RPG.Managers;
 using RPG.Character;
+using System.Collections.Generic;
 
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v5
+    /// NetworkPlayer v6
     ///
-    /// CORREÇÕES:
-    ///   - Update() não roda Commands no servidor dedicado (eliminado spam de CmdSetMoving)
-    ///   - Linha morta de UpdateAnimations removida do Update()
-    ///   - ManagedByNetwork flag para PlayerEntity.Start() não inicializar outros jogadores
-    ///   - RequireComponent NetworkIdentity adicionado
+    /// CORREÇÃO PERFORMANCE:
+    ///   Adicionado NetworkPlayer.All (HashSet estático) para que
+    ///   NetworkMonsterEntity.TryAggro() e ServerDie() não precisem
+    ///   chamar FindObjectsOfType a cada tick da IA.
+    ///   Registro feito em OnStartServer/OnStopServer.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
     [RequireComponent(typeof(NetworkTransformReliable))]
     public class NetworkPlayer : NetworkBehaviour, ITargetable
     {
+        // ── Registro estático — evita FindObjectsOfType nos monstros ─────
+        public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
+
         // ── SyncVars ──────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNameChanged))]
         public string CharacterName = "...";
@@ -48,21 +52,12 @@ namespace RPG.Network
         bool    ITargetable.IsDead      => Dead;
         Vector3 ITargetable.Position    => transform.position;
 
-        public void OnSelected()
-        {
-            if (selectionIndicator) selectionIndicator.SetActive(true);
-        }
+        public void OnSelected()   { if (selectionIndicator) selectionIndicator.SetActive(true);  }
+        public void OnDeselected() { if (selectionIndicator) selectionIndicator.SetActive(false); }
 
-        public void OnDeselected()
-        {
-            if (selectionIndicator) selectionIndicator.SetActive(false);
-        }
-
-        // PvP desabilitado — não aplica dano entre jogadores
+        // PvP desabilitado
         public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
-        {
-            Debug.Log("[NetworkPlayer] PvP não implementado.");
-        }
+            => Debug.Log("[NetworkPlayer] PvP não implementado.");
 
         // ── Componentes ───────────────────────────────────────────────────
         private NavMeshAgent _agent;
@@ -76,7 +71,7 @@ namespace RPG.Network
         [Header("Spawn Points")]
         [SerializeField] private Transform[] spawnPoints;
 
-        // ── Estado local (só cliente dono) ────────────────────────────────
+        // ── Estado local ──────────────────────────────────────────────────
         private CharacterData _charData;
         private PlayerEntity  _playerEntity;
         private bool          _isDead;
@@ -95,8 +90,13 @@ namespace RPG.Network
 
         public override void OnStartServer()
         {
-            // No servidor dedicado o NavMeshAgent é controlado pelo servidor.
-            // Não há input, não há câmera, não há Commands de movimento local.
+            // Registra no HashSet para que os monstros possam encontrar sem FindObjectsOfType
+            All.Add(this);
+        }
+
+        public override void OnStopServer()
+        {
+            All.Remove(this);
         }
 
         public override void OnStartClient()
@@ -112,19 +112,16 @@ namespace RPG.Network
             _charData = GameManager.Instance?.SelectedCharacter;
             if (_charData == null)
             {
-                Debug.LogError("[NetworkPlayer] SelectedCharacter é null! Verifique o GameManager.");
+                Debug.LogError("[NetworkPlayer] SelectedCharacter é null!");
                 return;
             }
 
-            // Marca PlayerEntity para não se auto-inicializar no Start()
             _playerEntity = GetComponent<PlayerEntity>();
             if (_playerEntity != null)
                 _playerEntity.ManagedByNetwork = true;
 
-            // Inicializa PlayerEntity com os dados do personagem
             _playerEntity?.Initialize(_charData);
 
-            // Envia dados ao servidor para sincronizar com todos
             CmdSetCharacterInfo(
                 _charData.CharacterName,
                 _charData.Race.ToString(),
@@ -136,22 +133,19 @@ namespace RPG.Network
 
         private void Update()
         {
-            // CORREÇÃO: servidor dedicado não tem cliente local — nunca processa input aqui
             if (!isLocalPlayer) return;
             if (_isDead)        return;
 
-            // Sincroniza IsMoving com o servidor a cada 0.1s
             _moveCheckTimer += Time.deltaTime;
             if (_moveCheckTimer >= 0.1f)
             {
                 _moveCheckTimer = 0f;
                 bool moving = _agent != null && _agent.velocity.sqrMagnitude > 0.05f;
-                if (moving != IsMoving)
-                    CmdSetMoving(moving);
+                if (moving != IsMoving) CmdSetMoving(moving);
             }
         }
 
-        // ── Commands (Cliente → Servidor) ─────────────────────────────────
+        // ── Commands ──────────────────────────────────────────────────────
 
         [Command]
         private void CmdSetCharacterInfo(string charName, string race, int level, float hp, float maxHp)
@@ -163,41 +157,19 @@ namespace RPG.Network
             MaxHP         = maxHp;
         }
 
-        [Command]
-        public void CmdSetMoving(bool moving) => IsMoving = moving;
-
-        [Command]
-        public void CmdSyncHP(float hp, float maxHp)
-        {
-            CurrentHP = hp;
-            MaxHP     = maxHp;
-        }
-
-        [Command]
-        public void CmdSyncLevel(int newLevel)
-        {
-            Level = newLevel;
-        }
-
-        [Command]
-        public void CmdRequestRespawn() => ServerRespawn();
+        [Command] public void CmdSetMoving(bool moving) => IsMoving = moving;
+        [Command] public void CmdSyncHP(float hp, float maxHp) { CurrentHP = hp; MaxHP = maxHp; }
+        [Command] public void CmdSyncLevel(int newLevel) => Level = newLevel;
+        [Command] public void CmdRequestRespawn() => ServerRespawn();
 
         // ── Server Methods ────────────────────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo NetworkMonsterEntity.ServerAttack() diretamente no servidor.
-        /// [Server] garante que só executa no servidor.
-        /// </summary>
         [Server]
         public void ServerApplyDamage(float dmg)
         {
             if (Dead) return;
-
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
-            Debug.Log($"[NetworkPlayer] {CharacterName} tomou {dmg:0} | HP:{CurrentHP:0}/{MaxHP:0}");
-
-            if (CurrentHP <= 0f)
-                ServerDie();
+            if (CurrentHP <= 0f) ServerDie();
         }
 
         [Server]
@@ -205,8 +177,6 @@ namespace RPG.Network
         {
             CurrentHP = 0f;
             if (_agent != null) _agent.ResetPath();
-
-            Debug.Log($"[NetworkPlayer] {CharacterName} morreu no servidor.");
             RpcPlayerDied();
         }
 
@@ -216,8 +186,6 @@ namespace RPG.Network
             Vector3 pos = GetSpawnPosition();
             transform.position = pos;
             CurrentHP          = MaxHP * 0.5f;
-
-            Debug.Log($"[NetworkPlayer] {CharacterName} respawnou em {pos}.");
             RpcOnRespawned(pos, CurrentHP, MaxHP);
         }
 
@@ -229,61 +197,34 @@ namespace RPG.Network
             return Vector3.zero;
         }
 
-        // ── ClientRpcs (Servidor → Clientes) ─────────────────────────────
+        // ── ClientRpcs ────────────────────────────────────────────────────
 
         [ClientRpc]
         private void RpcPlayerDied()
         {
             if (!isLocalPlayer) return;
-
             _isDead = true;
-
-            if (_agent != null)
-            {
-                _agent.ResetPath();
-                _agent.isStopped = true;
-            }
-
+            if (_agent != null) { _agent.ResetPath(); _agent.isStopped = true; }
             var ctrl = GetComponent<NetworkPlayerController>();
             if (ctrl != null) ctrl.enabled = false;
-
             _playerEntity?.OnNetworkDeath();
-
             DeathScreenUI.Show(this);
-            Debug.Log("[NetworkPlayer] Morte processada no cliente.");
         }
 
         [ClientRpc]
         private void RpcOnRespawned(Vector3 position, float hp, float maxHp)
         {
             if (!isLocalPlayer) return;
-
             _isDead = false;
-
-            if (_agent != null)
-            {
-                _agent.isStopped = false;
-                _agent.Warp(position);
-            }
-
+            if (_agent != null) { _agent.isStopped = false; _agent.Warp(position); }
             var ctrl = GetComponent<NetworkPlayerController>();
             if (ctrl != null) ctrl.enabled = true;
-
-            if (_playerEntity != null)
-            {
-                _playerEntity.ForceSetHP(hp, maxHp);
-                _playerEntity.Respawn(position);
-            }
-
+            if (_playerEntity != null) { _playerEntity.ForceSetHP(hp, maxHp); _playerEntity.Respawn(position); }
             DeathScreenUI.Hide();
-            Debug.Log("[NetworkPlayer] Respawn concluído no cliente.");
         }
 
         [ClientRpc]
-        public void RpcPlayAnimation(string trigger)
-        {
-            _animator?.SetTrigger(trigger);
-        }
+        public void RpcPlayAnimation(string trigger) => _animator?.SetTrigger(trigger);
 
         // ── SyncVar Hooks ─────────────────────────────────────────────────
 
@@ -296,7 +237,6 @@ namespace RPG.Network
 
         private void OnHPChanged(float _, float newHP)
         {
-            // Atualiza mini barra acima da cabeça (visível para todos)
             if (hpBarSlider != null)
             {
                 hpBarSlider.maxValue = MaxHP;
@@ -304,23 +244,14 @@ namespace RPG.Network
                 hpBarSlider.gameObject.SetActive(newHP < MaxHP);
             }
 
-            // Propaga HP para PlayerEntity do cliente dono → UIManager atualiza barra
+            // Propaga para PlayerEntity do cliente dono → UIManager atualiza
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
                 _playerEntity.ForceSetHP(newHP, MaxHP);
         }
 
         private void OnMovingChanged(bool _, bool newVal)
         {
-            // Atualiza animação de outros jogadores (não o local player)
-            if (!isLocalPlayer)
-                UpdateAnimations(newVal);
-        }
-
-        // ── Animações ─────────────────────────────────────────────────────
-
-        private void UpdateAnimations(bool moving)
-        {
-            _animator?.SetBool("IsMoving", moving);
+            if (!isLocalPlayer) _animator?.SetBool("IsMoving", newVal);
         }
     }
 }
