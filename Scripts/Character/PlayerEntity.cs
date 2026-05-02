@@ -7,28 +7,17 @@ using System;
 
 namespace RPG.Character
 {
-    /// <summary>
-    /// PlayerEntity — stats, dano, cura, regen e morte do jogador.
-    ///
-    /// CORREÇÕES v2:
-    ///   - Adicionado OnNetworkDeath() chamado pelo NetworkPlayer quando
-    ///     o servidor confirma morte (evita estado de morto inconsistente)
-    ///   - HealToFull() e ForceSetHP() agora existem nesta versão definitiva
-    ///   - Die() virou private mas OnNetworkDeath() permite trigger externo
-    ///   - Regen não toca Heal() (que tem FloatingText) — chama HealSilent()
-    /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class PlayerEntity : MonoBehaviour
     {
-        // ── Runtime stats ─────────────────────────────────────────────────
         public CharacterData Data        { get; private set; }
         public DerivedStats  Stats       { get; private set; }
         public BuffBonuses   ActiveBuffs { get; private set; } = new BuffBonuses();
 
         public float CurrentHP { get; private set; }
         public float CurrentMP { get; private set; }
-
-        public bool IsInitialized => Data != null && Stats != null;
+        public bool  IsInitialized    => Data != null && Stats != null;
+        public bool  ManagedByNetwork { get; set; } = false;
 
         // ── Eventos ───────────────────────────────────────────────────────
         public event Action<float, float> OnHPChanged;
@@ -36,7 +25,13 @@ namespace RPG.Character
         public event Action<bool>         OnDeathChanged;
         public event Action               OnStatsChanged;
 
-        // ── Componentes ───────────────────────────────────────────────────
+        /// <summary>
+        /// Disparado UMA vez quando Initialize() conclui.
+        /// UIManager assina isso para atualizar o HUD com os valores reais,
+        /// resolvendo o bug de HP/MP mostrando 100/100 ao entrar no jogo.
+        /// </summary>
+        public event Action OnInitialized;
+
         private NavMeshAgent _agent;
         public  NavMeshAgent Agent => _agent;
 
@@ -53,7 +48,7 @@ namespace RPG.Character
 
         private void Start()
         {
-            // Offline: inicializa direto. Online: NetworkPlayer chama Initialize() após spawn.
+            if (ManagedByNetwork) return;
             var charData = GameManager.Instance?.SelectedCharacter;
             if (charData != null && !IsInitialized)
                 Initialize(charData);
@@ -86,6 +81,16 @@ namespace RPG.Character
                 _agent.speed            = Mathf.Clamp(Stats.ASPD * 0.8f, 2f, 10f);
                 _agent.stoppingDistance = 0.5f;
             }
+
+            Debug.Log($"[PlayerEntity] {data.CharacterName} inicializado | " +
+                      $"HP:{CurrentHP:0}/{Stats.MaxHP:0} | MP:{CurrentMP:0}/{Stats.MaxMP:0} | Lv:{data.Level}");
+
+            // Notifica que os dados reais estão prontos — UIManager atualiza HUD aqui
+            OnInitialized?.Invoke();
+
+            // Força eventos de HP/MP para qualquer UI já vinculada
+            OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
+            OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
 
         // ── Stats ─────────────────────────────────────────────────────────
@@ -138,41 +143,45 @@ namespace RPG.Character
         {
             if (!IsInitialized || _isDead) return;
 
-            bool crit = StatsCalculator.RollCrit(Stats.CRIT);
-            bool hit  = StatsCalculator.RollHit(100f, Stats.FLEE);
-
+            bool hit = StatsCalculator.RollHit(100f, Stats.FLEE);
             if (!hit)
             {
-                FloatingTextManager.Instance?.Show("MISS", transform.position, Color.gray);
+                FloatingTextManager.Instance?.Show("MISS", transform.position + Vector3.up * 2f, Color.gray);
                 return;
             }
 
-            float dmg = isPhysical
+            bool  crit = StatsCalculator.RollCrit(Stats.CRIT);
+            float dmg  = isPhysical
                 ? StatsCalculator.CalculatePhysicalDamage(rawAtk, Stats.DEF, crit, Stats.CritDMG)
                 : StatsCalculator.CalculateMagicDamage(rawMatk, Stats.MDEF, crit, Stats.CritDMG);
 
             dmg *= 1f - (Stats.DamageReduction / 100f);
             dmg  = Mathf.Max(1f, dmg);
 
-            CurrentHP = Mathf.Max(0, CurrentHP - dmg);
+            CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
             OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
 
             Color color = crit ? Color.yellow : Color.red;
             FloatingTextManager.Instance?.Show(
-                crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}", transform.position, color);
+                crit ? $"CRÍTICO!\n{dmg:0}" : $"{dmg:0}",
+                transform.position + Vector3.up * 2f,
+                color);
 
-            if (CurrentHP <= 0) Die();
+            if (CurrentHP <= 0f) Die();
         }
 
         public void Heal(float amount)
         {
             if (!IsInitialized || _isDead) return;
-            CurrentHP = Mathf.Min(Stats.MaxHP, CurrentHP + amount);
+            float before = CurrentHP;
+            CurrentHP    = Mathf.Min(Stats.MaxHP, CurrentHP + amount);
+            float healed = CurrentHP - before;
             OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-            FloatingTextManager.Instance?.Show($"+{amount:0}", transform.position, Color.green);
+            if (healed > 0f)
+                FloatingTextManager.Instance?.Show(
+                    $"+{healed:0}", transform.position + Vector3.up * 2f, Color.green);
         }
 
-        /// <summary>Cura silenciosa usada internamente (regen) — sem FloatingText.</summary>
         private void HealSilent(float amount)
         {
             if (!IsInitialized || _isDead) return;
@@ -195,7 +204,6 @@ namespace RPG.Character
             return true;
         }
 
-        /// <summary>Restaura HP e MP ao máximo (usado no level up).</summary>
         public void HealToFull()
         {
             if (!IsInitialized) return;
@@ -205,17 +213,13 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
 
-        /// <summary>
-        /// Força HP a um valor específico (sincronização com servidor).
-        /// Nota: Stats.MaxHP é mutable propositalmente para este caso.
-        /// </summary>
         public void ForceSetHP(float hp, float maxHp)
         {
             if (!IsInitialized) return;
             Stats.MaxHP = maxHp;
             CurrentHP   = Mathf.Clamp(hp, 0f, maxHp);
             OnHPChanged?.Invoke(CurrentHP, maxHp);
-            if (CurrentHP <= 0 && !_isDead) Die();
+            if (CurrentHP <= 0f && !_isDead) Die();
         }
 
         // ── Morte ─────────────────────────────────────────────────────────
@@ -226,13 +230,9 @@ namespace RPG.Character
             _isDead = true;
             _agent?.ResetPath();
             OnDeathChanged?.Invoke(true);
-            Debug.Log($"[PlayerEntity] {Data?.CharacterName} morreu (local/offline).");
+            Debug.Log($"[PlayerEntity] {Data?.CharacterName} morreu.");
         }
 
-        /// <summary>
-        /// Chamado pelo NetworkPlayer.RpcPlayerDied() quando o SERVIDOR confirma a morte.
-        /// Garante que o estado local seja consistente com o servidor.
-        /// </summary>
         public void OnNetworkDeath()
         {
             if (_isDead) return;
@@ -264,7 +264,6 @@ namespace RPG.Character
             if (_regenTimer < REGEN_INTERVAL) return;
             _regenTimer = 0f;
 
-            // Usa HealSilent para evitar FloatingText de regen constante
             if (CurrentHP < Stats.MaxHP) HealSilent(Stats.HPRegen);
             if (CurrentMP < Stats.MaxMP)
             {
@@ -279,13 +278,11 @@ namespace RPG.Character
         {
             if (!IsInitialized) return;
             if (GameManager.Instance?.CurrentAccount == null) return;
-
             Data.CurrentHP = CurrentHP;
             Data.CurrentMP = CurrentMP;
             Data.PosX      = transform.position.x;
             Data.PosY      = transform.position.y;
             Data.PosZ      = transform.position.z;
-
             SaveManager.Instance?.SaveCharacter(GameManager.Instance.CurrentAccount, Data);
         }
 

@@ -6,12 +6,11 @@ using RPG.Managers;
 namespace RPG.Network
 {
     /// <summary>
-    /// RPGNetworkManager — substitui o NetworkManager padrão do Mirror.
+    /// RPGNetworkManager v3
     ///
-    /// SETUP NO INSPECTOR:
-    ///   - Player Prefab        → NetworkPlayerPrefab
-    ///   - Spawnable Prefabs    → arraste TODOS os prefabs de monstro aqui
-    ///   - Spawn Points         → Transforms de spawn do player
+    /// CORREÇÕES:
+    ///   - Removido campo _prefabsRegistered que gerava warning CS0414.
+    ///   - RegisterSpawnablePrefabs() em Start() e OnStartClient().
     /// </summary>
     public class RPGNetworkManager : NetworkManager
     {
@@ -27,11 +26,15 @@ namespace RPG.Network
 
         private readonly Dictionary<int, NetworkPlayer> _connectedPlayers = new();
 
-        // ── Registro de prefabs ───────────────────────────────────────────
-
-        public override void Awake()
+        public override void Start()
         {
-            base.Awake();
+            base.Start();
+            RegisterSpawnablePrefabs();
+        }
+
+        public override void OnStartClient()
+        {
+            base.OnStartClient();
             RegisterSpawnablePrefabs();
         }
 
@@ -44,43 +47,37 @@ namespace RPG.Network
                 var identity = prefab.GetComponent<NetworkIdentity>();
                 if (identity == null)
                 {
-                    Debug.LogError($"[RPGNetworkManager] '{prefab.name}' não tem NetworkIdentity! " +
-                                   "Adicione o componente NetworkIdentity ao prefab.");
+                    Debug.LogError($"[RPGNetworkManager] '{prefab.name}' não tem NetworkIdentity!");
                     continue;
                 }
 
-                // Evita registrar duplicado
                 if (NetworkClient.prefabs.ContainsKey(identity.assetId))
-                {
-                    Debug.Log($"[RPGNetworkManager] '{prefab.name}' já registrado (assetId={identity.assetId}).");
                     continue;
-                }
 
                 NetworkClient.RegisterPrefab(prefab);
-                Debug.Log($"[RPGNetworkManager] Prefab registrado: '{prefab.name}' (assetId={identity.assetId})");
+                Debug.Log($"[RPGNetworkManager] Prefab registrado: '{prefab.name}'");
             }
         }
 
-        // ── Server callbacks ──────────────────────────────────────────────
-
         public override void OnServerAddPlayer(NetworkConnectionToClient conn)
         {
-            Transform spawn = GetSpawnPoint();
-            var playerGO = Instantiate(playerPrefab, spawn.position, spawn.rotation);
+            Transform spawn    = GetSpawnPoint();
+            var       playerGO = Instantiate(playerPrefab, spawn.position, spawn.rotation);
             NetworkServer.AddPlayerForConnection(conn, playerGO);
 
             var netPlayer = playerGO.GetComponent<NetworkPlayer>();
             if (netPlayer != null)
                 _connectedPlayers[conn.connectionId] = netPlayer;
 
-            Debug.Log($"[Server] Player conectado: connId={conn.connectionId} — total={numPlayers}");
+            Debug.Log($"[Server] Player conectado: connId={conn.connectionId} | " +
+                      $"Spawn:{spawn.position} | Total={numPlayers}");
         }
 
         public override void OnServerDisconnect(NetworkConnectionToClient conn)
         {
             _connectedPlayers.Remove(conn.connectionId);
             base.OnServerDisconnect(conn);
-            Debug.Log($"[Server] Player desconectado: connId={conn.connectionId} — total={numPlayers}");
+            Debug.Log($"[Server] Player desconectado: connId={conn.connectionId} | Total={numPlayers}");
         }
 
         private Transform GetSpawnPoint()
@@ -93,8 +90,6 @@ namespace RPG.Network
             }
             return spawnPoints[numPlayers % spawnPoints.Length];
         }
-
-        // ── Client callbacks ──────────────────────────────────────────────
 
         public override void OnClientConnect()
         {

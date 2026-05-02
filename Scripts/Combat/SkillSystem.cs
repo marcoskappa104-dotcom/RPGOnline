@@ -60,7 +60,7 @@ namespace RPG.Combat
                 if (_cooldownTimers[i] > 0) _cooldownTimers[i] -= Time.deltaTime;
         }
 
-        public int       SkillCount   => skills.Count;
+        public int       SkillCount      => skills.Count;
         public SkillData GetSkill(int i) => (i >= 0 && i < skills.Count) ? skills[i] : null;
         public float     GetCooldown(int i) => (i >= 0 && i < _cooldownTimers.Length)
                                                 ? Mathf.Max(0f, _cooldownTimers[i]) : 0f;
@@ -83,10 +83,11 @@ namespace RPG.Combat
 
             var target = _player.CurrentTarget;
 
-            Log($"TryUseSkill({index}) '{skill.Name}' | Alvo:{target?.DisplayName ?? "nenhum"} | " +
+            Log($"TryUseSkill({index}) '{skill.Name}' | Type:{skill.Type} Target:{skill.Target} | " +
+                $"Alvo:{target?.DisplayName ?? "nenhum"} | " +
                 $"CD:{GetCooldown(index):0.0} | MP:{_player.CurrentMP:0}/{_player.Stats?.MaxMP:0}");
 
-            // ── Validações ────────────────────────────────────────────────
+            // ── Validações por tipo de alvo ────────────────────────────────
 
             if (skill.Target == SkillTarget.Enemy)
             {
@@ -123,22 +124,30 @@ namespace RPG.Combat
             // ── Cancela ação anterior ─────────────────────────────────────
             CancelPendingAction();
 
-            // ── Verifica distância ────────────────────────────────────────
+            // Skills de Heal/Self não precisam de alvo nem de range check
+            if (skill.Target == SkillTarget.Self || skill.Type == SkillType.Heal)
+            {
+                Log("Skill de cura/self — executando diretamente.");
+                ExecuteSkill(index, skill, null);
+                return;
+            }
+
+            // ── Verifica distância para skills de inimigo ─────────────────
             float dist = (target != null)
                 ? Vector3.Distance(transform.position, target.Position)
                 : 0f;
 
             Log($"Distância ao alvo: {dist:0.0} | Range da skill: {skill.Range}");
 
-            if (skill.Target == SkillTarget.Enemy && dist > skill.Range)
+            if (dist > skill.Range)
             {
-                Log($"Fora de range. Iniciando walk-to-range.");
+                Log("Fora de range. Iniciando walk-to-range.");
                 _hasPendingAction = true;
                 _pendingCoroutine = StartCoroutine(WalkThenFire(index, skill, target));
             }
             else
             {
-                Log($"Dentro do range. Executando skill diretamente.");
+                Log("Dentro do range. Executando skill diretamente.");
                 ExecuteSkill(index, skill, target);
             }
         }
@@ -178,7 +187,6 @@ namespace RPG.Combat
 
                 float dist = Vector3.Distance(transform.position, target.Position);
 
-                // Log a cada ~60 frames para não spammar
                 if (frames % 60 == 0)
                     Log($"Walk-to-range: dist={dist:0.0} range={skill.Range} timeout={timeout:0.0}");
 
@@ -207,7 +215,7 @@ namespace RPG.Combat
         {
             if (!_player.SpendMP(skill.ManaCost))
             {
-                Log("Falha ao gastar MP (corrida entre execuções?)");
+                Log("Falha ao gastar MP.");
                 return;
             }
 
@@ -217,7 +225,7 @@ namespace RPG.Combat
 
             if (_agent != null) _agent.ResetPath();
 
-            // Vira para o alvo
+            // Vira para o alvo (se tiver)
             if (target != null)
             {
                 Vector3 dir = (target.Position - transform.position);
@@ -237,28 +245,69 @@ namespace RPG.Combat
 
         private IEnumerator CastAndFire(SkillData skill, ITargetable target)
         {
-            float t = skill.CastTime / Mathf.Max(1f, (_player.Stats?.CastSpeed ?? 1f) * 0.1f);
+            float castSpeed = _player.Stats?.CastSpeed ?? 1f;
+            float t = skill.CastTime / Mathf.Max(0.1f, castSpeed * 0.1f);
             Log($"Cast time: {t:0.0}s");
             yield return new WaitForSeconds(t);
-            if (target != null && !target.IsDead) FireSkill(skill, target);
+
+            // Para curas/self sempre dispara; para dano verifica se alvo ainda é válido
+            if (skill.Type == SkillType.Heal || skill.Target == SkillTarget.Self)
+                FireSkill(skill, null);
+            else if (target != null && !target.IsDead)
+                FireSkill(skill, target);
         }
+
+        // ── FireSkill — aqui cada tipo é tratado corretamente ─────────────
 
         private void FireSkill(SkillData skill, ITargetable target)
         {
-            if (target == null || target.IsDead) { Log("FireSkill: alvo inválido."); return; }
-            if (_player.Stats == null)           { Log("FireSkill: Stats null.");    return; }
+            if (_player.Stats == null) { Log("FireSkill: Stats null."); return; }
 
-            float rawATK  = _player.Stats.ATK  * skill.AtkMultiplier;
-            float rawMATK = _player.Stats.MATK * skill.AtkMultiplier;
-            bool  isPhys  = skill.Type == SkillType.Physical;
+            switch (skill.Type)
+            {
+                // ── CURA ──────────────────────────────────────────────────
+                case SkillType.Heal:
+                {
+                    // Usa MATK como base da cura (INT-based); mínimo de 10
+                    float healAmount = Mathf.Max(10f, _player.Stats.MATK * skill.AtkMultiplier);
+                    _player.Heal(healAmount);
+                    Log($"FireSkill '{skill.Name}' → Cura {healAmount:0} HP");
+                    break;
+                }
 
-            Log($"FireSkill '{skill.Name}' → {target.DisplayName} | " +
-                $"RawATK:{rawATK:0} RawMATK:{rawMATK:0} Físico:{isPhys} " +
-                $"Mult:{skill.AtkMultiplier} | Target HP antes:{target.CurrentHP:0}");
+                // ── BUFF ──────────────────────────────────────────────────
+                case SkillType.Buff:
+                {
+                    // Placeholder: expanda conforme adicionar buffs reais
+                    Log($"FireSkill '{skill.Name}' → Buff aplicado (sem efeito por enquanto)");
+                    UIManager.Instance?.ShowMessage($"{skill.Name} ativado!");
+                    break;
+                }
 
-            target.TakeDamage(rawATK, rawMATK, isPhys);
+                // ── DANO FÍSICO / MÁGICO ──────────────────────────────────
+                case SkillType.Physical:
+                case SkillType.Magical:
+                {
+                    if (target == null || target.IsDead)
+                    {
+                        Log("FireSkill: alvo inválido para skill de dano.");
+                        return;
+                    }
 
-            Log($"Target HP depois:{target.CurrentHP:0}");
+                    float rawATK  = _player.Stats.ATK  * skill.AtkMultiplier;
+                    float rawMATK = _player.Stats.MATK * skill.AtkMultiplier;
+                    bool  isPhys  = skill.Type == SkillType.Physical;
+
+                    Log($"FireSkill '{skill.Name}' → {target.DisplayName} | " +
+                        $"RawATK:{rawATK:0} RawMATK:{rawMATK:0} Físico:{isPhys} Mult:{skill.AtkMultiplier} | " +
+                        $"HP antes:{target.CurrentHP:0}");
+
+                    target.TakeDamage(rawATK, rawMATK, isPhys);
+
+                    Log($"HP depois:{target.CurrentHP:0}");
+                    break;
+                }
+            }
         }
 
         private void Log(string msg)

@@ -6,8 +6,32 @@ using TMPro;
 namespace RPG.UI
 {
     /// <summary>
-    /// FloatingTextManager — pool de textos flutuantes (números de dano, XP, etc.)
-    /// Coloque um prefab com TMP_Text que tem Animator para subir e sumir.
+    /// FloatingTextManager v2
+    ///
+    /// CORREÇÃO DO PREFAB:
+    ///   O prefab NÃO deve ter Canvas. Deve ser um GameObject vazio com
+    ///   filho TextMeshPro (não UI, mas o componente 3D world space).
+    ///
+    ///   COMO CRIAR O PREFAB CORRETAMENTE:
+    ///
+    ///   1. Hierarchy → clique direito → Create Empty
+    ///      Renomeie para: FloatingTextPrefab
+    ///
+    ///   2. Com FloatingTextPrefab selecionado:
+    ///      Add Component → TextMeshPro - Text (NÃO o UI Text, o 3D Text)
+    ///      Ou: clique direito no FloatingTextPrefab → 3D Object → Text - TextMeshPro
+    ///
+    ///   3. Configure o TextMeshPro 3D:
+    ///      Font Size:  5
+    ///      Bold:       sim
+    ///      Alignment:  Center
+    ///      Color:      branco
+    ///
+    ///   4. Salve como prefab em Assets/Prefabs/UI/FloatingTextPrefab
+    ///
+    ///   ATENÇÃO: Se criar via UI → Text - TextMeshPro, ele cria um Canvas
+    ///   automaticamente e o texto vai aparecer no canto da tela, não no mundo.
+    ///   Use sempre o 3D Text (TextMeshPro component diretamente no GameObject).
     /// </summary>
     public class FloatingTextManager : MonoBehaviour
     {
@@ -15,7 +39,7 @@ namespace RPG.UI
 
         [SerializeField] private GameObject floatingTextPrefab;
         [SerializeField] private int        poolSize   = 20;
-        [SerializeField] private float      riseSpeed  = 1.5f;
+        [SerializeField] private float      riseSpeed  = 2f;
         [SerializeField] private float      lifetime   = 1.2f;
 
         private Queue<GameObject> _pool = new Queue<GameObject>();
@@ -30,7 +54,13 @@ namespace RPG.UI
 
         private void PrewarmPool()
         {
-            if (floatingTextPrefab == null) return;
+            if (floatingTextPrefab == null)
+            {
+                Debug.LogWarning("[FloatingTextManager] floatingTextPrefab não configurado! " +
+                                 "Arraste o prefab no Inspector.");
+                return;
+            }
+
             for (int i = 0; i < poolSize; i++)
             {
                 var obj = Instantiate(floatingTextPrefab, transform);
@@ -47,29 +77,52 @@ namespace RPG.UI
 
         private IEnumerator ShowCoroutine(string text, Vector3 worldPos, Color color)
         {
-            GameObject obj = _pool.Count > 0 ? _pool.Dequeue() : Instantiate(floatingTextPrefab, transform);
+            // Pega do pool ou instancia novo se o pool estiver vazio
+            GameObject obj = _pool.Count > 0
+                ? _pool.Dequeue()
+                : Instantiate(floatingTextPrefab, transform);
+
+            // Posição inicial: acima do ponto de origem, com offset horizontal aleatório
+            obj.transform.position = worldPos + new Vector3(
+                Random.Range(-0.3f, 0.3f), 0f, 0f);
             obj.SetActive(true);
-            obj.transform.position = worldPos + Vector3.up * 1.5f +
-                                     new Vector3(Random.Range(-0.3f, 0.3f), 0, 0);
 
-            var tmp = obj.GetComponentInChildren<TMP_Text>();
-            if (tmp != null) { tmp.text = text; tmp.color = color; }
+            // Tenta achar o TMP no próprio objeto ou em filhos
+            var tmp = obj.GetComponent<TextMeshPro>();
+            if (tmp == null)
+                tmp = obj.GetComponentInChildren<TextMeshPro>();
 
-            float elapsed = 0f;
+            if (tmp != null)
+            {
+                tmp.text  = text;
+                tmp.color = color;
+            }
+            else
+            {
+                Debug.LogWarning("[FloatingTextManager] Prefab não tem TextMeshPro (3D)! " +
+                                 "Verifique se usou o componente 3D, não o UI.");
+            }
+
+            float   elapsed  = 0f;
             Vector3 startPos = obj.transform.position;
 
             while (elapsed < lifetime)
             {
                 elapsed += Time.deltaTime;
                 float t = elapsed / lifetime;
+
+                // Sobe progressivamente
                 obj.transform.position = startPos + Vector3.up * (riseSpeed * t);
+
+                // Fade out no final
                 if (tmp != null)
                 {
                     var c = tmp.color;
-                    c.a     = 1f - t;
+                    c.a       = 1f - Mathf.Pow(t, 2f); // fade quadrático (mais suave)
                     tmp.color = c;
                 }
-                // Billboard — texto sempre vira para câmera
+
+                // Billboard — texto sempre vira para a câmera
                 if (Camera.main != null)
                     obj.transform.forward = Camera.main.transform.forward;
 

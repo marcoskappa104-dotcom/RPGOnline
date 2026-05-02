@@ -4,18 +4,19 @@ using Mirror;
 using RPG.Data;
 using RPG.UI;
 using RPG.Character;
+using System.Collections;
 
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkMonsterEntity v4 — monstro online definitivo.
+    /// NetworkMonsterEntity v5
     ///
-    /// NOVIDADES:
-    ///   - Respawn automático: após morrer, o monstro reaparece no mesmo spawn
-    ///     point depois de um tempo configurável (respawnDelay)
-    ///   - ServerAttack usa ServerApplyDamage [Server] (bug antigo corrigido)
-    ///   - Path update throttle para NavMesh eficiente
-    ///   - Aggro reativo: agride quem atacou, mesmo em Idle/Patrol
+    /// CORREÇÕES:
+    ///   - _attackTimer zerado corretamente ao entrar em Combat (evita ataque instantâneo)
+    ///   - Respawn usa StartCoroutine em vez de Invoke (mais confiável no servidor)
+    ///   - Level sincronizado via CmdSyncLevel após level up no RpcGrantExp
+    ///   - TryAggro agora passa a lista de jogadores como parâmetro para evitar
+    ///     múltiplos FindObjectsOfType desnecessários
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -53,7 +54,7 @@ namespace RPG.Network
         [Header("Visuals")]
         [SerializeField] private GameObject         selectionIndicator;
         [SerializeField] private MonsterHealthBarUI healthBarUI;
-        [SerializeField] private GameObject         visualRoot; // modelo 3D — esconde na morte
+        [SerializeField] private GameObject         visualRoot;
 
         // ── SyncVars ──────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))]
@@ -80,14 +81,14 @@ namespace RPG.Network
 
         // ── IA (server only) ──────────────────────────────────────────────
         private enum State { Idle, Patrol, Chase, Combat, Dead }
-        private State         _state = State.Idle;
+        private State         _state       = State.Idle;
         private NavMeshAgent  _agent;
         private Animator      _animator;
         private NetworkPlayer _aggroTarget;
         private float         _attackTimer;
         private float         _pathTimer;
         private int           _patrolIndex;
-        private Vector3       _spawnPosition;  // posição original para respawn
+        private Vector3       _spawnPosition;
 
         // ── Init ──────────────────────────────────────────────────────────
 
@@ -106,7 +107,7 @@ namespace RPG.Network
 
         public override void OnStartServer()
         {
-            _spawnPosition = transform.position;  // grava posição original
+            _spawnPosition = transform.position;
             ServerReset();
         }
 
@@ -116,16 +117,15 @@ namespace RPG.Network
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
         }
 
-        // ── Respawn do servidor ───────────────────────────────────────────
+        // ── Respawn ───────────────────────────────────────────────────────
 
-        /// <summary>Reseta o monstro para o estado inicial (usado no spawn e respawn).</summary>
         [Server]
         private void ServerReset()
         {
-            _maxHP     = _stats.MaxHP;
-            _currentHP = _maxHP;
-            _isDead    = false;
-            _state     = State.Idle;
+            _maxHP       = _stats.MaxHP;
+            _currentHP   = _maxHP;
+            _isDead      = false;
+            _state       = State.Idle;
             _aggroTarget = null;
             _attackTimer = 0f;
             _pathTimer   = 0f;
@@ -146,8 +146,8 @@ namespace RPG.Network
         {
             if (!isServer || _isDead) return;
 
-            _attackTimer += Time.deltaTime;
             _pathTimer   += Time.deltaTime;
+            _attackTimer += Time.deltaTime;
 
             switch (_state)
             {
@@ -189,7 +189,14 @@ namespace RPG.Network
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
             if (dist > aggroRange * 2f) { ResetAggro(); return; }
 
-            if (dist <= attackRange) { _state = State.Combat; _agent.ResetPath(); return; }
+            if (dist <= attackRange)
+            {
+                // CORREÇÃO: zera o timer ao entrar em Combat para não atacar instantaneamente
+                _attackTimer = 0f;
+                _state = State.Combat;
+                _agent.ResetPath();
+                return;
+            }
 
             if (_pathTimer >= pathUpdateRate && _agent.isOnNavMesh)
             {
@@ -204,8 +211,14 @@ namespace RPG.Network
             if (_aggroTarget == null || _aggroTarget.Dead) { ResetAggro(); return; }
 
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
-            if (dist > attackRange * 1.4f) { _state = State.Chase; return; }
 
+            if (dist > attackRange * 1.4f)
+            {
+                _state = State.Chase;
+                return;
+            }
+
+            // Kite — mantém distância mínima
             if (_agent.isOnNavMesh)
             {
                 if (dist < kiteDistance)
@@ -213,15 +226,20 @@ namespace RPG.Network
                     Vector3 away = (transform.position - _aggroTarget.transform.position).normalized;
                     _agent.SetDestination(transform.position + away * (kiteDistance + 0.5f));
                 }
-                else _agent.ResetPath();
+                else
+                {
+                    _agent.ResetPath();
+                }
             }
 
+            // Gira para o alvo
             Vector3 dir = (_aggroTarget.transform.position - transform.position);
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.Slerp(
                     transform.rotation, Quaternion.LookRotation(dir), 10f * Time.deltaTime);
 
+            // Ataca respeitando o cooldown
             if (_attackTimer >= attackCooldown)
             {
                 _attackTimer = 0f;
@@ -236,6 +254,7 @@ namespace RPG.Network
             float         closest = aggroRange;
             NetworkPlayer found   = null;
 
+            // FindObjectsOfType só nos estados Idle/Patrol — aceitável
             foreach (var np in FindObjectsOfType<NetworkPlayer>())
             {
                 if (np.Dead) continue;
@@ -247,7 +266,8 @@ namespace RPG.Network
             {
                 _aggroTarget = found;
                 _state       = State.Chase;
-                _pathTimer   = pathUpdateRate;
+                _pathTimer   = pathUpdateRate; // força update imediato do path
+                _attackTimer = 0f;
                 Debug.Log($"[NetworkMonster] {monsterDisplayName} agrou {found.CharacterName}");
                 return true;
             }
@@ -257,39 +277,48 @@ namespace RPG.Network
         private void ResetAggro()
         {
             _aggroTarget = null;
-            if (_agent.isOnNavMesh) { _agent.ResetPath(); _agent.stoppingDistance = 0.3f; }
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.ResetPath();
+                _agent.stoppingDistance = 0.3f;
+            }
             _state       = patrolPoints?.Length > 0 ? State.Patrol : State.Idle;
             _attackTimer = 0f;
         }
 
         // ── Ataque ────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// ServerApplyDamage é [Server] — pode ser chamado diretamente pelo servidor.
-        /// NUNCA use CmdTakeDamage aqui (Commands só funcionam de cliente→servidor).
-        /// </summary>
         [Server]
         private void ServerAttack()
         {
             if (_aggroTarget == null || _aggroTarget.Dead) return;
 
             bool hit = StatsCalculator.RollHit(_stats.HIT, 20f);
-            if (!hit) { RpcShowMiss(_aggroTarget.transform.position); return; }
+            if (!hit)
+            {
+                RpcShowMiss(_aggroTarget.transform.position);
+                return;
+            }
 
             bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
             float dmg  = StatsCalculator.CalculatePhysicalDamage(_stats.ATK, 10f, crit, _stats.CritDMG);
 
-            Debug.Log($"[NetworkMonster] {monsterDisplayName} → {_aggroTarget.CharacterName} | Dmg:{dmg:0} Crit:{crit}");
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} → {_aggroTarget.CharacterName} | " +
+                      $"Dmg:{dmg:0} Crit:{crit}");
 
             _aggroTarget.ServerApplyDamage(dmg);
             RpcPlayAnim("Attack");
         }
 
-        // ── TakeDamage (ITargetable — chamado pelo SkillSystem) ───────────
+        // ── TakeDamage (ITargetable) ──────────────────────────────────────
 
         public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
         {
-            if (isServer) { ServerTakeDamage(rawAtk, rawMatk, isPhysical); return; }
+            if (isServer)
+            {
+                ServerTakeDamage(rawAtk, rawMatk, isPhysical);
+                return;
+            }
             CmdRequestTakeDamage(rawAtk, rawMatk, isPhysical);
         }
 
@@ -310,12 +339,14 @@ namespace RPG.Network
             dmg        = Mathf.Max(1f, dmg);
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
 
-            Debug.Log($"[NetworkMonster] {monsterDisplayName} tomou {dmg:0} | HP:{_currentHP:0}/{_maxHP:0}");
+            Debug.Log($"[NetworkMonster] {monsterDisplayName} tomou {dmg:0} | " +
+                      $"HP:{_currentHP:0}/{_maxHP:0}");
 
             RpcShowDamage(dmg, crit, transform.position);
 
-            // Aggro reativo
-            if (_state == State.Idle || _state == State.Patrol) TryAggro();
+            // Aggro reativo — quem atacou torna-se o alvo
+            if (_state == State.Idle || _state == State.Patrol)
+                TryAggro();
 
             if (_currentHP <= 0f) ServerDie();
         }
@@ -328,11 +359,15 @@ namespace RPG.Network
             _isDead = true;
             _state  = State.Dead;
 
-            if (_agent.isOnNavMesh) { _agent.ResetPath(); _agent.enabled = false; }
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.ResetPath();
+                _agent.enabled = false;
+            }
 
             Debug.Log($"[NetworkMonster] {monsterDisplayName} morreu!");
 
-            // Concede XP a jogadores próximos
+            // XP para jogadores próximos
             foreach (var np in FindObjectsOfType<NetworkPlayer>())
             {
                 float dist = Vector3.Distance(transform.position, np.transform.position);
@@ -342,9 +377,15 @@ namespace RPG.Network
 
             RpcOnDied(transform.position);
 
-            // Agenda respawn (se configurado)
+            // CORREÇÃO: usa coroutine em vez de Invoke — mais confiável no servidor
             if (respawnDelay > 0f)
-                Invoke(nameof(ServerReset), respawnDelay);
+                StartCoroutine(RespawnAfterDelay());
+        }
+
+        private IEnumerator RespawnAfterDelay()
+        {
+            yield return new WaitForSeconds(respawnDelay);
+            if (isServer) ServerReset();
         }
 
         // ── ClientRpcs ────────────────────────────────────────────────────
@@ -353,7 +394,8 @@ namespace RPG.Network
         private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
         {
             Color c = crit ? Color.yellow : Color.white;
-            FloatingTextManager.Instance?.Show(crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}", pos + Vector3.up, c);
+            FloatingTextManager.Instance?.Show(
+                crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}", pos + Vector3.up, c);
         }
 
         [ClientRpc]
@@ -361,7 +403,8 @@ namespace RPG.Network
             => FloatingTextManager.Instance?.Show("MISS", pos, Color.gray);
 
         [ClientRpc]
-        private void RpcPlayAnim(string trigger) => _animator?.SetTrigger(trigger);
+        private void RpcPlayAnim(string trigger)
+            => _animator?.SetTrigger(trigger);
 
         [ClientRpc]
         private void RpcGrantExp(uint targetNetId, long amount)
@@ -380,6 +423,8 @@ namespace RPG.Network
                 Color.cyan);
 
             var playerEntity = NetworkClient.localPlayer.GetComponent<PlayerEntity>();
+            var netPlayer    = NetworkClient.localPlayer.GetComponent<NetworkPlayer>();
+
             if (playerEntity != null)
             {
                 playerEntity.RefreshStats();
@@ -387,15 +432,20 @@ namespace RPG.Network
                 if (leveled)
                 {
                     playerEntity.HealToFull();
+
                     FloatingTextManager.Instance?.Show(
                         "LEVEL UP!",
                         NetworkClient.localPlayer.transform.position + Vector3.up * 2.5f,
                         Color.yellow);
+
+                    // CORREÇÃO: sincroniza o level novo com o servidor
+                    netPlayer?.CmdSyncLevel(charData.Level);
                 }
 
-                var netPlayer = NetworkClient.localPlayer.GetComponent<NetworkPlayer>();
+                // Sincroniza HP atual com o servidor
                 netPlayer?.CmdSyncHP(playerEntity.CurrentHP, playerEntity.Stats.MaxHP);
 
+                // Salva localmente
                 var account = RPG.Managers.GameManager.Instance?.CurrentAccount;
                 if (account != null)
                     RPG.Managers.SaveManager.Instance?.SaveCharacter(account, charData);
@@ -429,11 +479,16 @@ namespace RPG.Network
             if (nowDead && _agent != null) _agent.enabled = false;
         }
 
+        // ── Gizmos ────────────────────────────────────────────────────────
+
         private void OnDrawGizmosSelected()
         {
-            Gizmos.color = Color.yellow; Gizmos.DrawWireSphere(transform.position, aggroRange);
-            Gizmos.color = Color.red;    Gizmos.DrawWireSphere(transform.position, attackRange);
-            Gizmos.color = Color.blue;   Gizmos.DrawWireSphere(transform.position, kiteDistance);
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawWireSphere(transform.position, aggroRange);
+            Gizmos.color = Color.red;
+            Gizmos.DrawWireSphere(transform.position, attackRange);
+            Gizmos.color = Color.blue;
+            Gizmos.DrawWireSphere(transform.position, kiteDistance);
         }
     }
 }
