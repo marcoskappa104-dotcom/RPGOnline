@@ -28,19 +28,24 @@ namespace RPG.Combat
     }
 
     /// <summary>
-    /// SkillSystem — CLIENTE SOLICITA, SERVIDOR EXECUTA.
+    /// SkillSystem — CLIENTE APENAS SOLICITA. SERVIDOR DECIDE E EXECUTA TUDO.
     ///
-    /// ARQUITETURA DE SEGURANÇA:
-    ///   1. Cliente valida apenas condições locais (alvo, cooldown, MP, range).
-    ///   2. MP e cooldown são gastos localmente para feedback imediato (UX),
-    ///      mas o servidor é autoridade no dano e em resultados reais.
-    ///   3. CmdRequestAttack envia apenas (netId do alvo, índice da skill, tipo).
-    ///      NENHUM valor de dano sai do cliente.
-    ///   4. Walk-to-range é cancelado corretamente ao trocar de alvo ou ao morrer.
+    /// ARQUITETURA:
+    ///   - Cliente NÃO gasta MP localmente.
+    ///   - Cliente NÃO inicia cooldown localmente.
+    ///   - Cliente apenas:
+    ///       1. Verifica se há alvo (validação de UX, não de segurança).
+    ///       2. Envia CmdRequestSkill ao servidor com (netId do alvo, índice da skill).
+    ///       3. Aguarda o servidor confirmar via RpcSkillResult (cooldown, MP gasto).
+    ///   - Servidor valida: MP disponível, cooldown, range, alvo vivo.
+    ///   - Servidor retorna o resultado via TargetRpc.
+    ///   - Walk-to-range: cliente se move localmente para UX,
+    ///     mas o servidor só aplica dano se o range for válido no momento do Cmd.
     ///
-    /// FUTURO:
-    ///   - Validar MP no servidor via SyncVar CurrentMP no NetworkPlayer.
-    ///   - Implementar server-side cooldown para anti-hack completo.
+    /// COOLDOWN UI:
+    ///   - Cooldown local é SOMENTE visual (feedback de UX).
+    ///   - O servidor pode rejeitar um Cmd mesmo sem cooldown local
+    ///     (ex: se o jogador estava dessincronizado).
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -51,25 +56,25 @@ namespace RPG.Combat
         [Header("Debug")]
         [SerializeField] private bool debugLogs = true;
 
-        // ── Componentes ───────────────────────────────────────────────────
+        // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity _player;
         private Animator     _animator;
         private NavMeshAgent _agent;
 
-        // ── Estado de cooldown ─────────────────────────────────────────────
+        // ── Cooldown LOCAL — apenas visual, não é autoridade ───────────────
         private const int MAX_SKILLS = 8;
-        private float[] _cooldownTimers = new float[MAX_SKILLS];
+        private float[] _uiCooldownTimers = new float[MAX_SKILLS];
 
-        // ── Estado de ação pendente ────────────────────────────────────────
-        private Coroutine  _pendingCoroutine;
-        private bool       _hasPendingAction;
-        private ITargetable _pendingTarget;   // guarda o alvo para detectar troca
+        // ── Estado de movimento pendente ───────────────────────────────────
+        private Coroutine   _walkCoroutine;
+        private bool        _hasPendingWalk;
+        private ITargetable _pendingTarget;
 
-        // ── Eventos ────────────────────────────────────────────────────────
-        public event Action<int, float> OnCooldownStarted;
+        // ── Eventos para a SkillBar (UI) ───────────────────────────────────
+        public event Action<int, float> OnCooldownStarted; // (índice, duração)
         public event Action<int>        OnSkillFired;
 
-        public bool HasPendingAction => _hasPendingAction;
+        public bool HasPendingAction => _hasPendingWalk;
 
         // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -84,48 +89,41 @@ namespace RPG.Combat
         {
             if (!isLocalPlayer) return;
 
+            // Atualiza timers de cooldown visual
             for (int i = 0; i < MAX_SKILLS; i++)
-                if (_cooldownTimers[i] > 0f)
-                    _cooldownTimers[i] -= Time.deltaTime;
+                if (_uiCooldownTimers[i] > 0f)
+                    _uiCooldownTimers[i] -= Time.deltaTime;
 
-            // Cancela ação pendente se o alvo mudou externamente
-            if (_hasPendingAction && _pendingTarget != _player.CurrentTarget)
-                CancelPendingAction();
+            // Cancela walk se alvo mudou externamente
+            if (_hasPendingWalk && _pendingTarget != _player.CurrentTarget)
+                CancelPendingWalk();
         }
 
-        // ── Propriedades ───────────────────────────────────────────────────
+        // ── Propriedades públicas ──────────────────────────────────────────
 
         public int       SkillCount          => skills.Count;
         public SkillData GetSkill(int i)     => (i >= 0 && i < skills.Count) ? skills[i] : null;
-        public float     GetCooldown(int i)  => (i >= 0 && i < MAX_SKILLS) ? Mathf.Max(0f, _cooldownTimers[i]) : 0f;
-        public bool      IsOnCooldown(int i) => GetCooldown(i) > 0f;
+        public float     GetUICooldown(int i) => (i >= 0 && i < MAX_SKILLS) ? Mathf.Max(0f, _uiCooldownTimers[i]) : 0f;
+        public bool      IsOnUICooldown(int i) => GetUICooldown(i) > 0f;
 
-        // ── TryUseSkill ────────────────────────────────────────────────────
+        // ── TryUseSkill — ponto de entrada do input ────────────────────────
 
         public void TryUseSkill(int index)
         {
-            if (!_player.IsInitialized)
-            {
-                Log("Player não inicializado.");
-                return;
-            }
-
-            if (_player.IsDead)
-            {
-                Log("Player está morto.");
-                return;
-            }
+            if (!isLocalPlayer) return;
+            if (!_player.IsInitialized || _player.IsDead) return;
 
             var skill = GetSkill(index);
-            if (skill == null)
+            if (skill == null) { Log($"Skill {index} não existe."); return; }
+
+            // Validação de UX (não de segurança — o servidor valida de verdade)
+            if (IsOnUICooldown(index))
             {
-                Log($"Skill {index} não existe.");
+                UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(index):0.0}s");
                 return;
             }
 
             var target = _player.CurrentTarget;
-
-            // ── Validações locais ──────────────────────────────────────────
 
             if (skill.Target == SkillTarget.Enemy)
             {
@@ -143,59 +141,42 @@ namespace RPG.Combat
                 }
             }
 
-            if (IsOnCooldown(index))
+            CancelPendingWalk();
+
+            if (skill.Target == SkillTarget.Self || skill.Type == SkillType.Heal || skill.Type == SkillType.Buff)
             {
-                UIManager.Instance?.ShowMessage($"{skill.Name}: {GetCooldown(index):0.0}s");
+                // Self/Heal/Buff: envia diretamente ao servidor
+                SendSkillCmd(index, 0, isPhysical: false);
                 return;
             }
 
-            if (_player.CurrentMP < skill.ManaCost)
-            {
-                UIManager.Instance?.ShowMessage("MP insuficiente!");
-                return;
-            }
-
-            CancelPendingAction();
-
-            // ── Skills de self / heal — executadas localmente ──────────────
-            if (skill.Target == SkillTarget.Self || skill.Type == SkillType.Heal)
-            {
-                ExecuteSelfSkill(index, skill);
-                return;
-            }
-
-            // ── Skills de dano — verifica range ────────────────────────────
-            float dist = target != null
-                ? Vector3.Distance(transform.position, target.Position) : 0f;
+            // Skill de dano: verifica range para UX (walk-to-range se necessário)
+            float dist = target != null ? Vector3.Distance(transform.position, target.Position) : 0f;
 
             if (dist > skill.Range)
             {
-                Log($"Fora de range ({dist:0.1} > {skill.Range}). Movendo até o alvo.");
-                _hasPendingAction = true;
-                _pendingTarget    = target;
-                _pendingCoroutine = StartCoroutine(WalkThenRequestAttack(index, skill, target));
+                Log($"Fora de range ({dist:0.1} > {skill.Range}). Caminhando...");
+                _hasPendingWalk = true;
+                _pendingTarget  = target;
+                _walkCoroutine  = StartCoroutine(WalkThenSendCmd(index, skill, target));
             }
             else
             {
-                ExecuteAttackLocally(index, skill, target);
+                SendSkillCmd(index, (target as NetworkBehaviour)?.netId ?? 0, skill.Type == SkillType.Physical);
             }
         }
 
-        public void CancelPendingAction()
+        public void CancelPendingWalk()
         {
-            if (_pendingCoroutine != null)
-            {
-                StopCoroutine(_pendingCoroutine);
-                _pendingCoroutine = null;
-            }
-            _hasPendingAction = false;
-            _pendingTarget    = null;
+            if (_walkCoroutine != null) { StopCoroutine(_walkCoroutine); _walkCoroutine = null; }
+            _hasPendingWalk = false;
+            _pendingTarget  = null;
             if (_agent != null) _agent.stoppingDistance = 0.5f;
         }
 
         // ── Walk-to-range ──────────────────────────────────────────────────
 
-        private IEnumerator WalkThenRequestAttack(int index, SkillData skill, ITargetable target)
+        private IEnumerator WalkThenSendCmd(int index, SkillData skill, ITargetable target)
         {
             _agent.stoppingDistance = skill.Range * 0.85f;
             float timeout = 20f;
@@ -206,150 +187,103 @@ namespace RPG.Combat
 
                 if (target == null || target.IsDead)
                 {
-                    Log("Alvo morreu durante walk-to-range.");
                     _player.ClearTarget();
                     UIManager.Instance?.ClearTargetPanel();
                     break;
                 }
 
-                // Alvo foi trocado externamente
-                if (_player.CurrentTarget != target)
-                {
-                    Log("Alvo mudou durante walk-to-range — cancelando.");
-                    break;
-                }
+                if (_player.CurrentTarget != target) break;
 
                 float dist = Vector3.Distance(transform.position, target.Position);
 
                 if (dist <= skill.Range)
                 {
                     _agent.stoppingDistance = 0.5f;
-                    _hasPendingAction       = false;
-                    _pendingTarget          = null;
-                    Log("Chegou no range. Enviando requisição ao servidor.");
-                    ExecuteAttackLocally(index, skill, target);
+                    _hasPendingWalk = false;
+                    _pendingTarget  = null;
+
+                    var targetNB = target as NetworkBehaviour;
+                    SendSkillCmd(index, targetNB?.netId ?? 0, skill.Type == SkillType.Physical);
                     yield break;
                 }
 
-                _player.MoveTo(target.Position);
+                // Movimento local apenas para UX — o servidor vai re-validar o range
+                if (_agent.isOnNavMesh)
+                    _agent.SetDestination(target.Position);
+
                 yield return null;
             }
 
-            // Timeout ou cancelamento
             _agent.stoppingDistance = 0.5f;
-            _hasPendingAction       = false;
-            _pendingTarget          = null;
-            _pendingCoroutine       = null;
+            _hasPendingWalk = false;
+            _pendingTarget  = null;
+            _walkCoroutine  = null;
         }
 
-        // ── Execução local (feedback) + envio ao servidor ──────────────────
+        // ── Envio do Command ao servidor ───────────────────────────────────
 
-        /// <summary>
-        /// Aplica feedback local imediato (MP, cooldown, animação)
-        /// e envia o Command ao servidor.
-        /// </summary>
-        private void ExecuteAttackLocally(int index, SkillData skill, ITargetable target)
+        private void SendSkillCmd(int skillIndex, uint targetNetId, bool isPhysical)
         {
-            // Gasta MP localmente
-            if (!_player.SpendMP(skill.ManaCost))
-            {
-                Log("Falha ao gastar MP.");
-                return;
-            }
+            // Animação local (feedback visual imediato — servidor vai confirmar)
+            var skill = GetSkill(skillIndex);
+            if (_animator != null && skill != null && !string.IsNullOrEmpty(skill.AnimTrigger))
+                _animator.SetTrigger(skill.AnimTrigger);
 
-            // Inicia cooldown local
-            _cooldownTimers[index] = skill.Cooldown;
-            OnCooldownStarted?.Invoke(index, skill.Cooldown);
-            OnSkillFired?.Invoke(index);
-
-            // Para movimento e vira para o alvo
-            _agent?.ResetPath();
-            if (target != null)
+            // Vira para o alvo localmente (visual)
+            if (targetNetId != 0 && NetworkClient.spawned.TryGetValue(targetNetId, out var id))
             {
-                Vector3 dir = target.Position - transform.position;
+                Vector3 dir = id.transform.position - transform.position;
                 dir.y = 0f;
                 if (dir.sqrMagnitude > 0.01f)
                     transform.rotation = Quaternion.LookRotation(dir);
             }
 
-            // Animação
-            if (_animator != null && !string.IsNullOrEmpty(skill.AnimTrigger))
-                _animator.SetTrigger(skill.AnimTrigger);
-
-            // Resolve netId do alvo (deve ser NetworkBehaviour)
-            var targetNB = target as NetworkBehaviour;
-            if (targetNB == null)
-            {
-                Log("Alvo não é NetworkBehaviour — inválido para ataque online.");
-                return;
-            }
-
-            uint targetNetId = targetNB.netId;
-            bool isPhysical  = skill.Type == SkillType.Physical;
-
-            if (skill.CastTime > 0f)
-                StartCoroutine(CastThenSendCmd(skill, targetNetId, index, isPhysical));
-            else
-                SendAttackCmd(targetNetId, index, isPhysical);
-        }
-
-        private IEnumerator CastThenSendCmd(SkillData skill, uint targetNetId, int skillIndex, bool isPhysical)
-        {
-            float castSpeed = _player.Stats?.CastSpeed ?? 1f;
-            float castTime  = skill.CastTime / Mathf.Max(0.1f, castSpeed * 0.1f);
-            Log($"Cast time: {castTime:0.0}s");
-            yield return new WaitForSeconds(castTime);
-            SendAttackCmd(targetNetId, skillIndex, isPhysical);
-        }
-
-        private void SendAttackCmd(uint targetNetId, int skillIndex, bool isPhysical)
-        {
-            if (!NetworkClient.spawned.TryGetValue(targetNetId, out var identity))
-            {
-                Log($"Alvo netId:{targetNetId} não encontrado nos spawned objects.");
-                return;
-            }
-
-            var monster = identity.GetComponent<RPG.Network.NetworkMonsterEntity>();
-            if (monster == null)
-            {
-                Log("Alvo não é NetworkMonsterEntity.");
-                return;
-            }
-
+            // Envia apenas o pedido — ZERO dados de dano ou stats
             uint attackerNetId = GetComponent<NetworkIdentity>().netId;
-            monster.CmdRequestAttack(attackerNetId, skillIndex, isPhysical);
-            Log($"CmdRequestAttack enviado → monstro netId:{targetNetId} | skill:{skillIndex}");
+
+            if (!NetworkClient.spawned.TryGetValue(targetNetId, out var targetIdentity) && targetNetId != 0)
+            {
+                Log($"Alvo netId:{targetNetId} não encontrado.");
+                return;
+            }
+
+            var monster = targetIdentity?.GetComponent<RPG.Network.NetworkMonsterEntity>();
+            if (monster != null)
+            {
+                monster.CmdRequestSkill(attackerNetId, skillIndex, isPhysical);
+                Log($"CmdRequestSkill → monstro netId:{targetNetId} skill:{skillIndex}");
+            }
+            else if (targetNetId == 0)
+            {
+                // Self skill (heal/buff) — envia para o próprio NetworkPlayer
+                var netPlayer = GetComponent<RPG.Network.NetworkPlayer>();
+                netPlayer?.CmdRequestSelfSkill(skillIndex);
+                Log($"CmdRequestSelfSkill skill:{skillIndex}");
+            }
         }
 
-        // ── Skills de self/heal ────────────────────────────────────────────
+        // ── Resultado vindo do servidor ────────────────────────────────────
 
-        private void ExecuteSelfSkill(int index, SkillData skill)
+        /// <summary>
+        /// Chamado pelo NetworkPlayer via TargetRpc após o servidor processar a skill.
+        /// Inicia o cooldown visual e dispara o evento para a SkillBar.
+        /// </summary>
+        public void OnServerSkillConfirmed(int skillIndex, float cooldownDuration)
         {
-            if (!_player.SpendMP(skill.ManaCost)) return;
+            if (skillIndex < 0 || skillIndex >= MAX_SKILLS) return;
+            _uiCooldownTimers[skillIndex] = cooldownDuration;
+            OnCooldownStarted?.Invoke(skillIndex, cooldownDuration);
+            OnSkillFired?.Invoke(skillIndex);
+            Log($"Skill {skillIndex} confirmada pelo servidor. Cooldown: {cooldownDuration:0.0}s");
+        }
 
-            _cooldownTimers[index] = skill.Cooldown;
-            OnCooldownStarted?.Invoke(index, skill.Cooldown);
-            OnSkillFired?.Invoke(index);
-
-            _agent?.ResetPath();
-            if (_animator != null && !string.IsNullOrEmpty(skill.AnimTrigger))
-                _animator.SetTrigger(skill.AnimTrigger);
-
-            switch (skill.Type)
-            {
-                case SkillType.Heal:
-                {
-                    float healAmount = Mathf.Max(10f, (_player.Stats?.MATK ?? 10f) * skill.AtkMultiplier);
-                    _player.Heal(healAmount);
-                    Log($"ExecuteSelfSkill '{skill.Name}' → Cura {healAmount:0} HP");
-                    break;
-                }
-                case SkillType.Buff:
-                    Log($"ExecuteSelfSkill '{skill.Name}' → Buff (placeholder)");
-                    UIManager.Instance?.ShowMessage($"{skill.Name} ativado!");
-                    break;
-            }
+        /// <summary>
+        /// Chamado pelo NetworkPlayer via TargetRpc quando o servidor rejeita a skill.
+        /// </summary>
+        public void OnServerSkillRejected(int skillIndex, string reason)
+        {
+            UIManager.Instance?.ShowMessage(reason);
+            Log($"Skill {skillIndex} rejeitada: {reason}");
         }
 
         // ── Helpers ────────────────────────────────────────────────────────

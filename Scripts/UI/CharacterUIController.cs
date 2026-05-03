@@ -3,30 +3,18 @@ using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 using RPG.Data;
-using RPG.Managers;
+using RPG.Network;
 
 namespace RPG.UI
 {
     /// <summary>
-    /// CharacterUIController — tela de Criação e Seleção de Personagens.
+    /// CharacterUIController v2 — Server-Authoritative
     ///
-    /// Hierarquia sugerida:
-    ///   Canvas
-    ///     SelectionPanel
-    ///       TitleText
-    ///       CharacterListContent (Layout Group com CharacterSlot prefabs)
-    ///       CreateNewButton
-    ///       LogoutButton
-    ///     CreationPanel
-    ///       TitleText
-    ///       NameInput
-    ///       RaceDropdown
-    ///       RaceInfoText
-    ///       CreateButton
-    ///       BackButton
-    ///       ErrorText
-    ///
-    /// Prefab CharacterSlot: Button com filho TMP_Text (CharacterNameText)
+    /// MUDANÇAS:
+    ///   - A lista de personagens vem do servidor via ClientAuthHandler.OnCharacterListReceived.
+    ///   - Criação de personagem envia apenas nome + raça ao servidor.
+    ///   - Seleção de personagem envia o CharacterId ao servidor.
+    ///   - Sem acesso a SaveManager, GameManager.CurrentAccount ou CharacterData local.
     /// </summary>
     public class CharacterUIController : MonoBehaviour
     {
@@ -35,10 +23,11 @@ namespace RPG.UI
         [SerializeField] private GameObject creationPanel;
 
         [Header("Selection Panel")]
-        [SerializeField] private Transform  characterListContent;   // pai dos slots
-        [SerializeField] private GameObject characterSlotPrefab;    // prefab do botão
+        [SerializeField] private Transform  characterListContent;
+        [SerializeField] private GameObject characterSlotPrefab;
         [SerializeField] private Button     createNewButton;
         [SerializeField] private Button     logoutButton;
+        [SerializeField] private TMP_Text   selectionStatusText;
 
         [Header("Creation Panel")]
         [SerializeField] private TMP_InputField nameInput;
@@ -48,69 +37,152 @@ namespace RPG.UI
         [SerializeField] private Button         backButton;
         [SerializeField] private TMP_Text       errorText;
 
+        private List<CharacterSummary> _cachedCharacters = new();
+
         private CharacterRace SelectedRace => (CharacterRace)raceDropdown.value;
 
         private void Start()
         {
             createNewButton.onClick.AddListener(ShowCreationPanel);
-            logoutButton.onClick.AddListener(() => GameManager.Instance.Logout());
+            logoutButton.onClick.AddListener(OnLogout);
             createButton.onClick.AddListener(OnCreateCharacter);
             backButton.onClick.AddListener(ShowSelectionPanel);
             raceDropdown.onValueChanged.AddListener(_ => UpdateRaceInfo());
 
             PopulateRaceDropdown();
             ShowSelectionPanel();
+
+            // Vincula eventos
+            if (ClientAuthHandler.Instance != null)
+            {
+                ClientAuthHandler.Instance.OnCharacterListReceived  += HandleCharacterList;
+                ClientAuthHandler.Instance.OnCreateCharacterResult  += HandleCreateCharacterResult;
+                ClientAuthHandler.Instance.OnSelectCharacterResult  += HandleSelectCharacterResult;
+            }
+            else
+            {
+                Debug.LogWarning("[CharacterUI] ClientAuthHandler não encontrado!");
+            }
         }
 
-        // ── Seleção ───────────────────────────────────────────────────────
+        private void OnDestroy()
+        {
+            if (ClientAuthHandler.Instance != null)
+            {
+                ClientAuthHandler.Instance.OnCharacterListReceived  -= HandleCharacterList;
+                ClientAuthHandler.Instance.OnCreateCharacterResult  -= HandleCreateCharacterResult;
+                ClientAuthHandler.Instance.OnSelectCharacterResult  -= HandleSelectCharacterResult;
+            }
+        }
+
+        // ── Seleção ───────────────────────────────────────────────────
 
         private void ShowSelectionPanel()
         {
             selectionPanel.SetActive(true);
             creationPanel.SetActive(false);
-            PopulateCharacterList();
+            SetSelectionStatus("Carregando personagens...");
+
+            // Pede lista atualizada ao servidor
+            ClientAuthHandler.Instance?.SendRequestCharacterList();
         }
 
-        private void PopulateCharacterList()
+        private void HandleCharacterList(List<CharacterSummary> characters)
         {
-            // Limpa slots anteriores
+            _cachedCharacters = characters ?? new List<CharacterSummary>();
+            RefreshCharacterList();
+            SetSelectionStatus("");
+        }
+
+        private void RefreshCharacterList()
+        {
             foreach (Transform child in characterListContent)
                 Destroy(child.gameObject);
 
-            var account = GameManager.Instance.CurrentAccount;
-            if (account == null) return;
-
-            foreach (var ch in account.Characters)
+            if (_cachedCharacters.Count == 0)
             {
-                var slot      = Instantiate(characterSlotPrefab, characterListContent);
-                var nameText  = slot.GetComponentInChildren<TMP_Text>();
-                var btn       = slot.GetComponent<Button>();
+                SetSelectionStatus("Nenhum personagem. Crie um novo!");
+                return;
+            }
+
+            foreach (var ch in _cachedCharacters)
+            {
+                var slot     = Instantiate(characterSlotPrefab, characterListContent);
+                var nameText = slot.GetComponentInChildren<TMP_Text>();
+                var btn      = slot.GetComponent<Button>();
 
                 if (nameText != null)
                     nameText.text = $"{ch.CharacterName}  |  {ch.Race}  |  Lv {ch.Level}";
 
-                var charRef = ch; // closure
-                btn.onClick.AddListener(() => SelectCharacter(charRef));
+                var charId = ch.CharacterId;
+                btn.onClick.AddListener(() => SelectCharacter(charId));
             }
         }
 
-        private void SelectCharacter(CharacterData character)
+        private void SelectCharacter(string characterId)
         {
-            GameManager.Instance.SetSelectedCharacter(character);
-            GameManager.Instance.GoToGameplay();
+            SetSelectionStatus("Entrando no jogo...");
+            foreach (Transform child in characterListContent)
+                child.GetComponent<Button>()?.SetInteractable(false);
+
+            ClientAuthHandler.Instance?.SendSelectCharacter(characterId);
         }
 
-        // ── Criação ───────────────────────────────────────────────────────
+        private void HandleSelectCharacterResult(bool success, string error)
+        {
+            if (!success)
+            {
+                SetSelectionStatus($"Erro: {error}");
+                // Reativa botões
+                foreach (Transform child in characterListContent)
+                    child.GetComponent<Button>()?.SetInteractable(true);
+            }
+            // Se success, ClientAuthHandler já carregou a cena de gameplay
+        }
+
+        // ── Criação ───────────────────────────────────────────────────
 
         private void ShowCreationPanel()
         {
             selectionPanel.SetActive(false);
             creationPanel.SetActive(true);
-            nameInput.text  = "";
-            errorText.text  = "";
+            nameInput.text     = "";
+            errorText.text     = "";
             raceDropdown.value = 0;
             UpdateRaceInfo();
         }
+
+        private void OnCreateCharacter()
+        {
+            errorText.text = "";
+            string charName = nameInput.text.Trim();
+
+            if (charName.Length < 2)
+            {
+                errorText.text = "Nome deve ter ao menos 2 caracteres.";
+                return;
+            }
+
+            createButton.interactable = false;
+            ClientAuthHandler.Instance?.SendCreateCharacter(charName, raceDropdown.value);
+        }
+
+        private void HandleCreateCharacterResult(bool success, string error, List<CharacterSummary> updatedList)
+        {
+            createButton.interactable = true;
+
+            if (!success)
+            {
+                errorText.text = error ?? "Erro ao criar personagem.";
+                return;
+            }
+
+            // Atualiza lista e volta para seleção
+            if (updatedList != null) _cachedCharacters = updatedList;
+            ShowSelectionPanel();
+        }
+
+        // ── Race Dropdown ─────────────────────────────────────────────
 
         private void PopulateRaceDropdown()
         {
@@ -126,35 +198,36 @@ namespace RPG.UI
             var bonus = StatsCalculator.GetRaceBonus(SelectedRace);
             raceInfoText.text = SelectedRace switch
             {
-                CharacterRace.Human  => $"<b>Humano</b> — Equilibrado em tudo.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
-                CharacterRace.Elf    => $"<b>Elfo</b> — Mestre em magia e agilidade.\n+{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
+                CharacterRace.Human  => $"<b>Humano</b> — Equilibrado.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
+                CharacterRace.Elf    => $"<b>Elfo</b> — Magia e agilidade.\n+{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
                 CharacterRace.Dwarf  => $"<b>Anão</b> — Resistente e forte.\n+{bonus.STR} STR +{bonus.VIT} VIT",
-                CharacterRace.Orc    => $"<b>Orc</b> — Força bruta máxima.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT",
+                CharacterRace.Orc    => $"<b>Orc</b> — Força bruta.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT",
                 CharacterRace.Undead => $"<b>Morto-Vivo</b> — Mago sombrio.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT",
                 _ => ""
             };
         }
 
-        private void OnCreateCharacter()
+        // ── Logout ────────────────────────────────────────────────────
+
+        private void OnLogout()
         {
-            errorText.text = "";
-            string charName = nameInput.text.Trim();
+            Managers.GameManager.Instance?.Logout();
+        }
 
-            string error = SaveManager.Instance.TryCreateCharacter(
-                GameManager.Instance.CurrentAccount, charName, SelectedRace);
+        // ── Helpers ───────────────────────────────────────────────────
 
-            if (error != null)
-            {
-                errorText.text = error;
-                return;
-            }
+        private void SetSelectionStatus(string msg)
+        {
+            if (selectionStatusText != null) selectionStatusText.text = msg;
+        }
+    }
 
-            // Recarrega conta do disco para pegar o personagem novo
-            var refreshed = SaveManager.Instance.LoadAccount(
-                GameManager.Instance.CurrentAccount.Username);
-            GameManager.Instance.SetAccount(refreshed);
-
-            ShowSelectionPanel();
+    // Extensão para compatibilidade
+    public static class ButtonExtensions
+    {
+        public static void SetInteractable(this Button btn, bool value)
+        {
+            if (btn != null) btn.interactable = value;
         }
     }
 }

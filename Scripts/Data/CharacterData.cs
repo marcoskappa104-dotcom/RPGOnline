@@ -1,3 +1,8 @@
+// ═══════════════════════════════════════════════════════
+// CharacterData.cs — ADIÇÃO: campo RaceInt para serialização de rede
+// Substitua o arquivo Scripts/Data/CharacterData.cs pelo conteúdo abaixo.
+// ═══════════════════════════════════════════════════════
+
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -11,12 +16,22 @@ namespace RPG.Data
         public string        CharacterId;
         public string        CharacterName;
         public CharacterRace Race;
+
+        /// <summary>
+        /// Inteiro da raça — necessário para serialização em SyncVars de rede.
+        /// Mantido sincronizado com Race.
+        /// </summary>
+        public int RaceInt
+        {
+            get => (int)Race;
+            set => Race = (CharacterRace)value;
+        }
+
         public int           Level                  = 1;
         public long          Experience             = 0;
         public long          ExperienceToNextLevel  = 100;
 
-        // Atributos base (sem raça, sem alocados — apenas o ponto de partida fixo)
-        // Estes NUNCA são modificados após a criação do personagem.
+        // Atributos base fixos (definidos na criação, nunca mudam)
         public BaseAttributes    BaseAttributes   = new BaseAttributes();
         public EquipmentBonuses  EquipmentBonuses = new EquipmentBonuses();
 
@@ -28,16 +43,15 @@ namespace RPG.Data
         public float CurrentHP;
         public float CurrentMP;
 
-        // Pontos livres para distribuir
+        // Pontos de atributo livres
         public int FreeAttributePoints = 0;
 
-        // Atributos alocados manualmente pelo jogador
+        // Atributos alocados pelo jogador
         public int AllocatedSTR, AllocatedAGI, AllocatedVIT;
         public int AllocatedDEX, AllocatedINT, AllocatedLUK;
 
         /// <summary>
-        /// Calcula stats derivados SEM modificar este objeto.
-        /// Seguro para chamar múltiplas vezes.
+        /// Calcula stats derivados SEM modificar este objeto (sem side-effects).
         /// </summary>
         public DerivedStats GetDerivedStats(BuffBonuses buff = null)
         {
@@ -57,33 +71,31 @@ namespace RPG.Data
         }
 
         /// <summary>
-        /// Adiciona experiência e processa level-ups.
-        /// Retorna true se houve pelo menos um level-up.
+        /// Adiciona XP e processa level-ups. Retorna true se houve level-up.
+        /// Usado APENAS no servidor.
         /// </summary>
         public bool AddExperience(long amount)
         {
             Experience += amount;
-            bool leveledUp = false;
-
+            bool leveled = false;
             while (Experience >= ExperienceToNextLevel)
             {
                 Experience            -= ExperienceToNextLevel;
                 Level++;
                 FreeAttributePoints   += 5;
                 ExperienceToNextLevel  = GetExperienceForLevel(Level);
-                leveledUp              = true;
+                leveled                = true;
             }
-
-            return leveledUp;
+            return leveled;
         }
     }
 
     [Serializable]
     public class AccountData
     {
-        public string            Username;
-        public string            PasswordHash;
+        public string              Username;
+        public string              PasswordHash;
         public List<CharacterData> Characters = new List<CharacterData>();
-        public string            LastLogin;
+        public string              LastLogin;
     }
 }

@@ -2,31 +2,18 @@ using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 using RPG.Managers;
-using RPG.Data;
+using RPG.Network;
 
 namespace RPG.UI
 {
     /// <summary>
-    /// LoginUIController — gerencia a tela de Login e Criação de Conta.
-    /// 
-    /// Hierarquia esperada no Canvas:
-    ///   Canvas
-    ///     LoginPanel
-    ///       TitleText (TMP)
-    ///       UsernameInput (TMP_InputField)
-    ///       PasswordInput (TMP_InputField)
-    ///       LoginButton (Button)
-    ///       CreateAccountButton (Button)
-    ///       ErrorText (TMP)
-    ///     CreateAccountPanel
-    ///       TitleText (TMP)
-    ///       UsernameInput (TMP_InputField)
-    ///       PasswordInput (TMP_InputField)
-    ///       ConfirmPasswordInput (TMP_InputField)
-    ///       SubmitButton (Button)
-    ///       BackButton (Button)
-    ///       ErrorText (TMP)
-    ///       SuccessText (TMP)
+    /// LoginUIController v2 — Server-Authoritative
+    ///
+    /// MUDANÇAS:
+    ///   - Não acessa SaveManager diretamente — tudo via ClientAuthHandler.
+    ///   - Ao fazer login com sucesso, o servidor envia a lista de personagens
+    ///     e o GameManager navega para CharacterScene.
+    ///   - Ao criar conta, mostra sucesso e volta ao painel de login.
     /// </summary>
     public class LoginUIController : MonoBehaviour
     {
@@ -40,6 +27,7 @@ namespace RPG.UI
         [SerializeField] private Button         loginButton;
         [SerializeField] private Button         openCreateAccountButton;
         [SerializeField] private TMP_Text       loginErrorText;
+        [SerializeField] private TMP_Text       loginStatusText; // "Conectando..."
 
         [Header("Create Account Fields")]
         [SerializeField] private TMP_InputField createUsernameInput;
@@ -52,27 +40,47 @@ namespace RPG.UI
 
         private void Start()
         {
-            // Garante que só o painel de login aparece no início
             ShowLoginPanel();
 
-            // Bind de eventos
             loginButton.onClick.AddListener(OnLoginClicked);
             openCreateAccountButton.onClick.AddListener(ShowCreateAccountPanel);
             submitCreateButton.onClick.AddListener(OnCreateAccountClicked);
             backToLoginButton.onClick.AddListener(ShowLoginPanel);
 
-            // Permite usar Enter nos campos
             loginUsernameInput.onSubmit.AddListener(_ => OnLoginClicked());
             loginPasswordInput.onSubmit.AddListener(_ => OnLoginClicked());
+
+            // Vincula aos eventos do ClientAuthHandler
+            if (ClientAuthHandler.Instance != null)
+            {
+                ClientAuthHandler.Instance.OnLoginResult        += HandleLoginResult;
+                ClientAuthHandler.Instance.OnCreateAccountResult += HandleCreateAccountResult;
+            }
+            else
+            {
+                Debug.LogWarning("[LoginUI] ClientAuthHandler não encontrado na cena!");
+            }
+
+            SetStatus("");
         }
 
-        // ── Navegação entre painéis ───────────────────────────────────────
+        private void OnDestroy()
+        {
+            if (ClientAuthHandler.Instance != null)
+            {
+                ClientAuthHandler.Instance.OnLoginResult        -= HandleLoginResult;
+                ClientAuthHandler.Instance.OnCreateAccountResult -= HandleCreateAccountResult;
+            }
+        }
+
+        // ── Painéis ───────────────────────────────────────────────────
 
         private void ShowLoginPanel()
         {
             loginPanel.SetActive(true);
             createAccountPanel.SetActive(false);
             loginErrorText.text = "";
+            SetStatus("");
             ClearLoginFields();
         }
 
@@ -85,7 +93,7 @@ namespace RPG.UI
             ClearCreateFields();
         }
 
-        // ── Ações ─────────────────────────────────────────────────────────
+        // ── Ações ─────────────────────────────────────────────────────
 
         private void OnLoginClicked()
         {
@@ -99,15 +107,9 @@ namespace RPG.UI
                 return;
             }
 
-            var account = SaveManager.Instance.TryLogin(user, pass);
-            if (account == null)
-            {
-                loginErrorText.text = "Usuário ou senha incorretos.";
-                return;
-            }
-
-            GameManager.Instance.SetAccount(account);
-            GameManager.Instance.GoToCharacterSelect();
+            SetStatus("Autenticando...");
+            SetInputsInteractable(false);
+            ClientAuthHandler.Instance?.SendLogin(user, pass);
         }
 
         private void OnCreateAccountClicked()
@@ -119,7 +121,6 @@ namespace RPG.UI
             string pass    = createPasswordInput.text;
             string confirm = createConfirmPasswordInput.text;
 
-            // Validações locais
             if (user.Length < 4)
             {
                 createErrorText.text = "Username deve ter ao menos 4 caracteres.";
@@ -136,19 +137,59 @@ namespace RPG.UI
                 return;
             }
 
-            string error = SaveManager.Instance.TryCreateAccount(user, pass);
-            if (error != null)
-            {
-                createErrorText.text = error;
-                return;
-            }
-
-            createSuccessText.text = "Conta criada! Faça login.";
-            ClearCreateFields();
-            Invoke(nameof(ShowLoginPanel), 1.5f);
+            submitCreateButton.interactable = false;
+            ClientAuthHandler.Instance?.SendCreateAccount(user, pass);
         }
 
-        // ── Helpers ───────────────────────────────────────────────────────
+        // ── Handlers de resposta ──────────────────────────────────────
+
+        private void HandleLoginResult(bool success, string error)
+        {
+            SetInputsInteractable(true);
+            SetStatus("");
+
+            if (success)
+            {
+                // Servidor confirmou login e enviará lista de personagens automaticamente.
+                // CharacterScene é carregada pelo ClientAuthHandler.OnCharacterListReceived
+                // via GameManager.GoToCharacterSelect() chamado pela CharacterUIController.
+                GameManager.Instance?.GoToCharacterSelect();
+            }
+            else
+            {
+                loginErrorText.text = error ?? "Erro de login.";
+            }
+        }
+
+        private void HandleCreateAccountResult(bool success, string error)
+        {
+            submitCreateButton.interactable = true;
+            if (success)
+            {
+                createSuccessText.text = "Conta criada com sucesso! Faça login.";
+                ClearCreateFields();
+                Invoke(nameof(ShowLoginPanel), 1.5f);
+            }
+            else
+            {
+                createErrorText.text = error ?? "Erro ao criar conta.";
+            }
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────
+
+        private void SetStatus(string msg)
+        {
+            if (loginStatusText != null) loginStatusText.text = msg;
+        }
+
+        private void SetInputsInteractable(bool value)
+        {
+            loginButton.interactable             = value;
+            openCreateAccountButton.interactable = value;
+            loginUsernameInput.interactable      = value;
+            loginPasswordInput.interactable      = value;
+        }
 
         private void ClearLoginFields()
         {
