@@ -7,27 +7,16 @@ using RPG.Combat;
 namespace RPG.UI
 {
     /// <summary>
-    /// UIManager v5
+    /// UIManager v6
     ///
-    /// CORREÇÃO BUG HP/MP 100/100 NA ENTRADA:
-    ///
-    ///   CAUSA RAIZ:
-    ///     Os Sliders do Unity nascem com maxValue=1 e value=1.
-    ///     Quando o UIManager se vincula ao PlayerEntity antes de Initialize()
-    ///     terminar, OnHPChanged nunca é chamado com os valores reais — então
-    ///     o Slider mostra 1/1. O texto formatava isso como "100/100" porque
-    ///     usava Stats.MaxHP que ainda era 0, fazendo Mathf.Max(1f,0)=1.
-    ///
-    ///   SOLUÇÃO (3 partes):
-    ///     1. PlayerEntity.Initialize() dispara OnInitialized após ter Data+Stats.
-    ///     2. UIManager assina OnInitialized → chama ForceRefreshAll() com valores reais.
-    ///     3. ForceRefreshAll() seta maxValue dos Sliders ANTES de value — ordem importa.
-    ///        Se você setar value antes de maxValue, o Unity clampeia value em 1.
-    ///
-    ///   CORREÇÃO BUG NULL REF AO MATAR MOB:
-    ///     UpdateTargetHP() acessava CurrentTarget.CurrentHP em um UnityEngine.Object
-    ///     destruído (mob com Destroy(go, 3s)). Adicionado null-check via operador
-    ///     de comparação do Unity (que detecta objetos destruídos).
+    /// MUDANÇAS DESTA VERSÃO:
+    ///   - RefreshLevel(int) adicionado: chamado pelo hook OnLevelChanged
+    ///     do NetworkPlayer quando o servidor confirma o novo nível.
+    ///   - HP/MP agora chegam exclusivamente via eventos do PlayerEntity,
+    ///     que por sua vez são alimentados pelos SyncVar hooks do NetworkPlayer.
+    ///     Não há mais chamada a ForceSetHP de múltiplos caminhos.
+    ///   - UpdateExpBar() lê os valores do NetworkPlayer se disponível,
+    ///     garantindo que XP exibido é o confirmado pelo servidor.
     /// </summary>
     public class UIManager : MonoBehaviour
     {
@@ -61,13 +50,14 @@ namespace RPG.UI
         [SerializeField] private Slider   expBar;
         [SerializeField] private TMP_Text expText;
 
-		[Header("Attribute Window")]
-		[SerializeField] private AttributeWindowUI attributeWindow;
-		[SerializeField] private Button            attributeWindowButton;
-		
-        private PlayerEntity _player;
-        private SkillSystem  _skills;
-        private float        _messageTimer;
+        [Header("Attribute Window")]
+        [SerializeField] private AttributeWindowUI attributeWindow;
+        [SerializeField] private Button            attributeWindowButton;
+
+        private PlayerEntity              _player;
+        private SkillSystem               _skills;
+        private RPG.Network.NetworkPlayer _netPlayer; // para ler XP/Level via SyncVars
+        private float                     _messageTimer;
 
         private void Awake()
         {
@@ -79,11 +69,11 @@ namespace RPG.UI
         {
             ClearTargetPanel();
             if (messageText != null) messageText.text = "";
-			
-			if (attributeWindowButton != null)	
-			attributeWindowButton.onClick.AddListener(() => attributeWindow?.Toggle());
-            
-			// Modo offline: tenta vincular se o player já existe e está inicializado
+
+            if (attributeWindowButton != null)
+                attributeWindowButton.onClick.AddListener(() => attributeWindow?.Toggle());
+
+            // Modo offline
             var player = FindObjectOfType<PlayerEntity>();
             if (player != null && player.IsInitialized)
                 BindLocalPlayer(player);
@@ -91,35 +81,18 @@ namespace RPG.UI
 
         // ── Vinculação ────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Vincula o HUD ao PlayerEntity local.
-        /// Pode ser chamado múltiplas vezes — ignora duplicatas para o mesmo player.
-        ///
-        /// ORDEM DE EVENTOS (modo online):
-        ///   1. NetworkPlayerController.OnStartLocalPlayer() → chama BindLocalPlayer()
-        ///      Neste momento PlayerEntity.IsInitialized pode ainda ser false.
-        ///      UIManager assina OnInitialized e aguarda.
-        ///   2. PlayerEntity.Initialize() é chamado → seta Data e Stats → dispara OnInitialized.
-        ///   3. UIManager.OnPlayerInitialized() é chamado → ForceRefreshAll() com valores reais.
-        ///
-        /// ORDEM DE EVENTOS (modo offline):
-        ///   1. PlayerEntity.Start() → Initialize() → IsInitialized=true → dispara OnInitialized.
-        ///   2. UIManager.Start() → BindLocalPlayer() → player já inicializado → ForceRefreshAll() imediato.
-        /// </summary>
         public void BindLocalPlayer(PlayerEntity player)
         {
             if (player == null) return;
 
-            // Ignora chamadas duplicadas para o mesmo player
             if (_player == player)
             {
-				attributeWindow?.BindPlayer(player);
-                Debug.Log($"[UIManager] BindLocalPlayer duplicado ignorado — {player.Data?.CharacterName}");
+                attributeWindow?.BindPlayer(player);
                 if (player.IsInitialized) ForceRefreshAll();
                 return;
             }
 
-            // Desvincula player anterior
+            // Desvincula anterior
             if (_player != null)
             {
                 _player.OnHPChanged    -= UpdateHP;
@@ -128,19 +101,15 @@ namespace RPG.UI
                 _player.OnInitialized  -= OnPlayerInitialized;
             }
 
-            _player = player;
-            _skills = player.GetComponent<SkillSystem>();
+            _player    = player;
+            _skills    = player.GetComponent<SkillSystem>();
+            _netPlayer = player.GetComponent<RPG.Network.NetworkPlayer>();
 
-            // Vincula eventos
             _player.OnHPChanged    += UpdateHP;
             _player.OnMPChanged    += UpdateMP;
             _player.OnStatsChanged += OnStatsChangedHandler;
+            _player.OnInitialized  += OnPlayerInitialized;
 
-            // Assina OnInitialized — garante que a UI atualiza quando os dados reais chegarem.
-            // Em modo online, Initialize() pode não ter rodado ainda neste momento.
-            _player.OnInitialized += OnPlayerInitialized;
-
-            // Vincula cooldowns das skills
             if (_skills != null)
             {
                 _skills.OnCooldownStarted -= OnSkillCooldown;
@@ -148,34 +117,15 @@ namespace RPG.UI
                 InitSkillBar();
             }
 
-            // Se já inicializado (modo offline ou bind tardio), atualiza agora
+            attributeWindow?.BindPlayer(player);
+
             if (player.IsInitialized)
-            {
                 ForceRefreshAll();
-                Debug.Log($"[UIManager] HUD vinculado e atualizado: {player.Data?.CharacterName} | " +
-                          $"HP:{player.CurrentHP:0}/{player.Stats?.MaxHP:0}");
-            }
             else
-            {
                 Debug.Log("[UIManager] HUD vinculado — aguardando Initialize()");
-            }
         }
 
-        /// <summary>
-        /// Chamado por PlayerEntity.OnInitialized quando Initialize() conclui.
-        /// Este é o ponto garantido onde HP/MP reais estão disponíveis.
-        ///
-        /// CORREÇÃO BUG 100/100:
-        ///   ForceRefreshAll() seta maxValue ANTES de value em cada Slider.
-        ///   Se value for setado antes, o Unity clampeia em maxValue=1 (padrão).
-        /// </summary>
-        private void OnPlayerInitialized()
-        {
-            Debug.Log($"[UIManager] OnPlayerInitialized → " +
-                      $"HP:{_player?.CurrentHP:0}/{_player?.Stats?.MaxHP:0} | " +
-                      $"MP:{_player?.CurrentMP:0}/{_player?.Stats?.MaxMP:0}");
-            ForceRefreshAll();
-        }
+        private void OnPlayerInitialized() => ForceRefreshAll();
 
         private void OnSkillCooldown(int index, float duration)
         {
@@ -186,8 +136,8 @@ namespace RPG.UI
         private void OnStatsChangedHandler()
         {
             if (_player == null || !_player.IsInitialized) return;
-            if (levelText != null)
-                levelText.text = $"Lv {_player.Data?.Level ?? 1}";
+            int level = _netPlayer != null ? _netPlayer.Level : (_player.Data?.Level ?? 1);
+            if (levelText != null) levelText.text = $"Lv {level}";
         }
 
         private void InitSkillBar()
@@ -219,18 +169,12 @@ namespace RPG.UI
 
         // ── HP / MP ───────────────────────────────────────────────────────
 
-        /// <summary>
-        /// CORREÇÃO BUG 100/100:
-        ///   Seta maxValue ANTES de value. O Slider do Unity clampeia value
-        ///   em [0, maxValue] na hora da atribuição. Se maxValue ainda for 1
-        ///   (padrão) quando você seta value=500, o Slider fica em 1.
-        /// </summary>
         private void UpdateHP(float current, float max)
         {
             if (hpBar != null)
             {
-                hpBar.maxValue = Mathf.Max(1f, max); // maxValue PRIMEIRO
-                hpBar.value    = current;             // value DEPOIS
+                hpBar.maxValue = Mathf.Max(1f, max);
+                hpBar.value    = current;
             }
             if (hpText != null) hpText.text = $"{current:0}/{max:0}";
         }
@@ -239,16 +183,12 @@ namespace RPG.UI
         {
             if (mpBar != null)
             {
-                mpBar.maxValue = Mathf.Max(1f, max); // maxValue PRIMEIRO
-                mpBar.value    = current;             // value DEPOIS
+                mpBar.maxValue = Mathf.Max(1f, max);
+                mpBar.value    = current;
             }
             if (mpText != null) mpText.text = $"{current:0}/{max:0}";
         }
 
-        /// <summary>
-        /// Atualiza todos os campos do HUD com os valores atuais do player.
-        /// IMPORTANTE: deve ser chamado APÓS Initialize() ter rodado.
-        /// </summary>
         private void ForceRefreshAll()
         {
             if (_player == null) return;
@@ -258,16 +198,23 @@ namespace RPG.UI
             float mp    = _player.CurrentMP;
             float maxMp = _player.Stats?.MaxMP ?? 1f;
 
-            // Atualiza HP e MP (ordem maxValue → value garantida dentro de UpdateHP/MP)
             UpdateHP(hp, maxHp);
             UpdateMP(mp, maxMp);
 
             if (playerNameText != null)
                 playerNameText.text = _player.Data?.CharacterName ?? "Player";
-            if (levelText != null)
-                levelText.text = $"Lv {_player.Data?.Level ?? 1}";
 
-            Debug.Log($"[UIManager] ForceRefreshAll — HP:{hp:0}/{maxHp:0} MP:{mp:0}/{maxMp:0}");
+            int level = _netPlayer != null ? _netPlayer.Level : (_player.Data?.Level ?? 1);
+            if (levelText != null) levelText.text = $"Lv {level}";
+        }
+
+        /// <summary>
+        /// Chamado pelo hook OnLevelChanged do NetworkPlayer
+        /// quando o servidor confirma o level up.
+        /// </summary>
+        public void RefreshLevel(int newLevel)
+        {
+            if (levelText != null) levelText.text = $"Lv {newLevel}";
         }
 
         // ── Target Panel ──────────────────────────────────────────────────
@@ -286,13 +233,6 @@ namespace RPG.UI
                 targetHPText.text = $"{target.CurrentHP:0}/{target.MaxHP:0}";
         }
 
-        /// <summary>
-        /// CORREÇÃO NULL REF AO MATAR MOB:
-        ///   Quando um mob morre, Destroy(gameObject, Xs) é chamado. Durante esses X
-        ///   segundos, CurrentTarget ainda aponta para o objeto. O operador == do
-        ///   Unity retorna true para objetos destruídos comparados a null — usamos
-        ///   isso para detectar o objeto destruído e limpar o painel.
-        /// </summary>
         private void UpdateTargetHP()
         {
             if (_player == null || targetPanel == null || !targetPanel.activeSelf) return;
@@ -300,8 +240,6 @@ namespace RPG.UI
             var t = _player.CurrentTarget;
             if (t == null) return;
 
-            // Verifica se o UnityEngine.Object foi destruído
-            // (o operador == do Unity detecta objetos destruídos como null)
             if (t is UnityEngine.Object unityObj && unityObj == null)
             {
                 _player.ClearTarget();
@@ -333,11 +271,17 @@ namespace RPG.UI
 
         private void UpdateExpBar()
         {
-            if (_player?.Data == null || expBar == null || !_player.IsInitialized) return;
-            expBar.maxValue = Mathf.Max(1f, _player.Data.ExperienceToNextLevel);
-            expBar.value    = _player.Data.Experience;
+            if (_player == null || expBar == null || !_player.IsInitialized) return;
+
+            // Prioriza SyncVars do NetworkPlayer (confirmados pelo servidor)
+            long exp      = _netPlayer != null ? _netPlayer.Experience            : (_player.Data?.Experience ?? 0);
+            long expToNxt = _netPlayer != null ? _netPlayer.ExperienceToNextLevel : (_player.Data?.ExperienceToNextLevel ?? 100);
+
+            expBar.maxValue = Mathf.Max(1f, expToNxt);
+            expBar.value    = exp;
+
             if (expText != null)
-                expText.text = $"{_player.Data.Experience}/{_player.Data.ExperienceToNextLevel}";
+                expText.text = $"{exp}/{expToNxt}";
         }
 
         // ── Message ───────────────────────────────────────────────────────

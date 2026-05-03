@@ -5,55 +5,32 @@ using RPG.Data;
 using RPG.UI;
 using RPG.Character;
 using System.Collections;
+using System.Collections.Generic;
 
 namespace RPG.Network
 {
-    // ── Disposição — define como o mob reage ao player ────────────────────
-    /// <summary>
-    /// Passive  → Nunca ataca. Foge quando sofre dano.
-    ///            Exemplos: animais, aldeões, criaturas inofensivas.
-    ///
-    /// Neutral  → Ignora o player. Mas se for atacado, reage e persegue.
-    ///            Exemplos: ursos, lobos descansando, mobs de recurso.
-    ///
-    /// Aggressive → Ataca qualquer player que entre no aggroRange.
-    ///              Comportamento padrão (igual ao sistema anterior).
-    /// </summary>
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v7
+    /// NetworkMonsterEntity v8 — SERVIDOR É AUTORIDADE
     ///
-    /// NOVIDADES em relação à v6:
+    /// CORREÇÕES DESTA VERSÃO:
     ///
-    ///   1. DISPOSIÇÃO (Passive / Neutral / Aggressive)
-    ///      - Passive: foge ao ser atacado, nunca inicia combate.
-    ///      - Neutral: ignora o player mas contra-ataca se for agredido.
-    ///      - Aggressive: persegue e ataca (comportamento original).
+    ///   1. TakeDamage() — dano calculado no servidor.
+    ///      CmdRequestTakeDamage era chamado com rawAtk já calculado pelo cliente.
+    ///      Agora o cliente envia apenas CmdRequestAttack(netId do monstro, índice da skill).
+    ///      O servidor busca os stats do atacante via NetworkPlayer.ServerStats e
+    ///      calcula hit/crit/dano ele mesmo. Nenhum valor de dano vem do cliente.
     ///
-    ///   2. PATROL POR ÁREA
-    ///      - Ao invés de waypoints fixos, o mob escolhe pontos aleatórios
-    ///        dentro de _patrolRadius ao redor de _homePosition.
-    ///      - patrolRadius é configurado pelo NetworkMonsterSpawner.
-    ///      - Waypoints fixos (patrolPoints) continuam funcionando se
-    ///        usePatrolPoints = true.
+    ///   2. XP — distribuído via NetworkPlayer.ServerGrantExp().
+    ///      RpcGrantExp foi removido. O servidor chama ServerGrantExp() diretamente
+    ///      no(s) NetworkPlayer(s) que participaram do combate.
+    ///      Sistema de damage log: somente quem causou dano recebe XP.
     ///
-    ///   3. LEASH (coleira)
-    ///      - Se o mob perseguir o player além de leashRange, ele abandona
-    ///        o combate e retorna para home (estado ReturnHome).
-    ///      - Ao retornar, recupera HP gradualmente.
+    ///   3. Participação em combate rastreada por _damageLog (netId → dano total).
+    ///      XP distribuído proporcionalmente entre participantes.
     ///
-    ///   4. ESTADO FLEE (fuga — só Passive)
-    ///      - Mob foge na direção oposta ao atacante por fleeDuration segundos.
-    ///      - Depois retorna para home.
-    ///
-    ///   5. ESTADO RETURN HOME
-    ///      - Mob retorna à homePosition após leash break ou após fugir.
-    ///      - Regenera HP enquanto volta.
-    ///
-    ///   6. SetSpawnData(Vector3 home, float patrolRadius)
-    ///      - Chamado pelo NetworkMonsterSpawner logo após o spawn.
-    ///      - Define homePosition e patrolRadius dinamicamente.
+    ///   4. Disposição, patrulha, leash, fuga e retorno para home mantidos da v7.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -67,9 +44,6 @@ namespace RPG.Network
 
         // ── Config — Disposição ───────────────────────────────────────────
         [Header("Comportamento")]
-        [Tooltip("Passive = foge ao ser atacado.\n" +
-                 "Neutral = ignora player, contra-ataca se agredido.\n" +
-                 "Aggressive = ataca qualquer player no alcance.")]
         [SerializeField] private MonsterDisposition disposition = MonsterDisposition.Aggressive;
 
         // ── Config — Atributos ────────────────────────────────────────────
@@ -83,43 +57,28 @@ namespace RPG.Network
 
         // ── Config — Ranges ───────────────────────────────────────────────
         [Header("Ranges de IA")]
-        [Tooltip("Aggressive: raio de detecção do player.\n" +
-                 "Neutral: raio de ameaça (menor que o aggro normal).")]
         [SerializeField] private float aggroRange     = 10f;
         [SerializeField] private float attackRange    = 2.5f;
-        [Tooltip("Distância mínima que o mob mantém do player durante o combate.")]
         [SerializeField] private float kiteDistance   = 1.8f;
         [SerializeField] private float attackCooldown = 2f;
-        [Tooltip("Raio máximo de perseguição. Se o player fugir além disso, o mob volta para casa.")]
         [SerializeField] private float leashRange     = 30f;
-        [Tooltip("Velocidade de atualização do caminho (segundos entre recalculos).")]
         [SerializeField] private float pathUpdateRate = 0.2f;
 
         // ── Config — Patrulha ─────────────────────────────────────────────
         [Header("Patrulha")]
-        [Tooltip("TRUE = usa os waypoints do array abaixo.\n" +
-                 "FALSE = patrulha aleatória dentro de patrolRadius (configurado pelo Spawner).")]
         [SerializeField] private bool        usePatrolPoints = false;
         [SerializeField] private Transform[] patrolPoints;
+        [SerializeField] private float       patrolWaitTime  = 2f;
+        [SerializeField] private float       patrolRadius    = 12f;
 
-        [Tooltip("Tempo de espera (segundos) em cada destino de patrulha.")]
-        [SerializeField] private float patrolWaitTime   = 2f;
-
-        [Tooltip("Raio de patrulha aleatória. Sobrescrito pelo NetworkMonsterSpawner.SetSpawnData().")]
-        [SerializeField] private float patrolRadius     = 12f;
-
-        // ── Config — Fuga (Passive) ───────────────────────────────────────
+        // ── Config — Fuga ─────────────────────────────────────────────────
         [Header("Fuga (apenas Passive)")]
-        [Tooltip("Segundos fugindo antes de voltar para casa.")]
-        [SerializeField] private float fleeDuration = 6f;
-        [Tooltip("Multiplicador de velocidade durante a fuga.")]
+        [SerializeField] private float fleeDuration  = 6f;
         [SerializeField] private float fleeSpeedMult = 1.5f;
 
         // ── Config — Morte e Respawn ──────────────────────────────────────
         [Header("Morte e Respawn")]
-        [Tooltip("Segundos que o corpo fica visível após morrer.")]
         [SerializeField] private float hideDelay    = 3f;
-        [Tooltip("Segundos até renascer. 0 = sem respawn.")]
         [SerializeField] private float respawnDelay = 15f;
 
         [Header("Recompensa")]
@@ -154,6 +113,10 @@ namespace RPG.Network
         // ── Stats ─────────────────────────────────────────────────────────
         private DerivedStats _stats;
 
+        // ── Damage log — rastrea quem causou dano para distribuição de XP ─
+        // Chave: netId do NetworkPlayer | Valor: dano total causado
+        private Dictionary<uint, float> _damageLog = new Dictionary<uint, float>();
+
         // ── IA (server only) ──────────────────────────────────────────────
         private enum State { Idle, Patrol, Chase, Combat, Flee, ReturnHome, Dead }
 
@@ -170,16 +133,15 @@ namespace RPG.Network
 
         private int     _patrolIndex;
         private bool    _waitingAtPatrolPoint;
-        private bool    _wasAttacked;          // para Neutral: torna agressivo se atacado
-        private Vector3 _currentPatrolTarget;  // destino atual de patrulha aleatória
+        private bool    _wasAttacked;
+        private Vector3 _currentPatrolTarget;
         private bool    _patrolTargetSet;
 
-        // Spawn data (configurado pelo NetworkMonsterSpawner)
         private Vector3 _homePosition;
-        private float   _patrolRadiusRuntime;  // sobrescreve patrolRadius do Inspector
+        private float   _patrolRadiusRuntime;
 
         private const float REGEN_INTERVAL = 3f;
-        private const float REGEN_PERCENT  = 0.05f; // 5% do MaxHP por tick ao voltar para casa
+        private const float REGEN_PERCENT  = 0.05f;
 
         // ── Init ──────────────────────────────────────────────────────────
 
@@ -209,12 +171,8 @@ namespace RPG.Network
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
         }
 
-        // ── Spawn Data — chamado pelo NetworkMonsterSpawner ───────────────
+        // ── Spawn Data ────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Configura home e raio de patrulha após o spawn via spawner.
-        /// Chamado apenas no servidor.
-        /// </summary>
         [Server]
         public void SetSpawnData(Vector3 homePosition, float newPatrolRadius)
         {
@@ -242,6 +200,7 @@ namespace RPG.Network
             _patrolIndex    = 0;
             _waitingAtPatrolPoint = false;
             _patrolTargetSet      = false;
+            _damageLog.Clear();
 
             transform.position = _homePosition;
 
@@ -253,9 +212,6 @@ namespace RPG.Network
             }
 
             RpcOnRespawned();
-            Debug.Log($"[NetworkMonster] {monsterDisplayName} (re)spawnado | " +
-                      $"HP:{_maxHP:0} | Disposição:{disposition} | " +
-                      $"Home:{_homePosition} | PatrolR:{_patrolRadiusRuntime}");
         }
 
         // ── Update ────────────────────────────────────────────────────────
@@ -277,14 +233,29 @@ namespace RPG.Network
                 case State.ReturnHome: ServerReturnHome(); break;
             }
         }
+public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+{
+    // Compatibilidade com ITargetable
+    // Sistema real usa CmdRequestAttack
 
+    if (!isServer) return;
+
+    float dmg = isPhysical ? rawAtk : rawMatk;
+    dmg = Mathf.Max(1f, dmg);
+
+    _currentHP = Mathf.Max(0f, _currentHP - dmg);
+
+    RpcShowDamage(dmg, false, transform.position);
+
+    if (_currentHP <= 0f)
+        ServerDie();
+}
         // ── Estados de IA ─────────────────────────────────────────────────
 
         private void ServerIdle()
         {
             if (TryAggro()) return;
 
-            // Transition to patrol if we have a patrol area or points
             bool hasPatrolArea   = _patrolRadiusRuntime > 0.5f && !usePatrolPoints;
             bool hasPatrolPoints = usePatrolPoints && patrolPoints != null && patrolPoints.Length > 0;
 
@@ -301,8 +272,8 @@ namespace RPG.Network
             else
                 PatrolInArea();
         }
+		
 
-        // Patrulha por waypoints fixos (comportamento original)
         private void PatrolWithWaypoints()
         {
             if (!_agent.isOnNavMesh) return;
@@ -327,12 +298,10 @@ namespace RPG.Network
             }
         }
 
-        // Patrulha aleatória dentro da área (novo comportamento)
         private void PatrolInArea()
         {
             if (!_agent.isOnNavMesh) return;
 
-            // Precisa de um novo destino?
             bool arrived = !_agent.pathPending && _agent.remainingDistance < 0.6f;
 
             if (_waitingAtPatrolPoint)
@@ -341,7 +310,7 @@ namespace RPG.Network
                 if (_patrolWaitTimer >= patrolWaitTime)
                 {
                     _waitingAtPatrolPoint = false;
-                    _patrolTargetSet      = false; // força escolher novo ponto
+                    _patrolTargetSet      = false;
                 }
                 return;
             }
@@ -355,8 +324,7 @@ namespace RPG.Network
                     return;
                 }
 
-                if (TryGetRandomAreaPoint(_homePosition, _patrolRadiusRuntime,
-                                          out Vector3 dest))
+                if (TryGetRandomAreaPoint(_homePosition, _patrolRadiusRuntime, out Vector3 dest))
                 {
                     _agent.SetDestination(dest);
                     _currentPatrolTarget = dest;
@@ -369,17 +337,10 @@ namespace RPG.Network
         {
             if (_aggroTarget == null || _aggroTarget.Dead) { ResetAggro(); return; }
 
-            // Leash — muito longe de casa?
             float distFromHome = Vector3.Distance(transform.position, _homePosition);
-            if (distFromHome > leashRange)
-            {
-                ResetAggro();
-                EnterReturnHome();
-                return;
-            }
+            if (distFromHome > leashRange) { ResetAggro(); EnterReturnHome(); return; }
 
-            float distToTarget = Vector3.Distance(transform.position,
-                                                   _aggroTarget.transform.position);
+            float distToTarget = Vector3.Distance(transform.position, _aggroTarget.transform.position);
             if (distToTarget > aggroRange * 2.5f) { ResetAggro(); return; }
 
             if (distToTarget <= attackRange)
@@ -402,7 +363,6 @@ namespace RPG.Network
         {
             if (_aggroTarget == null || _aggroTarget.Dead) { ResetAggro(); return; }
 
-            // Leash
             float distFromHome = Vector3.Distance(transform.position, _homePosition);
             if (distFromHome > leashRange) { ResetAggro(); EnterReturnHome(); return; }
 
@@ -410,7 +370,6 @@ namespace RPG.Network
 
             if (dist > attackRange * 1.4f) { _state = State.Chase; return; }
 
-            // Kite — não gruda demais
             if (_agent.isOnNavMesh)
             {
                 if (dist < kiteDistance)
@@ -422,7 +381,6 @@ namespace RPG.Network
                     _agent.ResetPath();
             }
 
-            // Vira para o alvo
             Vector3 dir = (_aggroTarget.transform.position - transform.position);
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
@@ -442,17 +400,16 @@ namespace RPG.Network
 
             if (_fleeTimer >= fleeDuration || !_agent.isOnNavMesh)
             {
-                _agent.speed = _stats.ASPD; // restaura velocidade normal
+                _agent.speed = _stats.ASPD;
                 EnterReturnHome();
                 return;
             }
 
-            // Atualiza destino de fuga periodicamente (para longe do atacante)
             if (_pathTimer >= pathUpdateRate * 2f && _aggroTarget != null)
             {
                 _pathTimer = 0f;
-                Vector3 fleeDir  = (transform.position - _aggroTarget.transform.position).normalized;
-                Vector3 fleePos  = transform.position + fleeDir * (aggroRange * 1.5f);
+                Vector3 fleeDir = (transform.position - _aggroTarget.transform.position).normalized;
+                Vector3 fleePos = transform.position + fleeDir * (aggroRange * 1.5f);
 
                 if (NavMesh.SamplePosition(fleePos, out NavMeshHit hit, 5f, NavMesh.AllAreas))
                     _agent.SetDestination(hit.position);
@@ -461,13 +418,11 @@ namespace RPG.Network
 
         private void ServerReturnHome()
         {
-            // Regenera HP ao voltar para casa
             _regenTimer += Time.deltaTime;
             if (_regenTimer >= REGEN_INTERVAL)
             {
                 _regenTimer = 0f;
-                float regen = _maxHP * REGEN_PERCENT;
-                _currentHP  = Mathf.Min(_maxHP, _currentHP + regen);
+                _currentHP  = Mathf.Min(_maxHP, _currentHP + _maxHP * REGEN_PERCENT);
             }
 
             if (!_agent.isOnNavMesh) return;
@@ -479,32 +434,26 @@ namespace RPG.Network
                 _agent.SetDestination(_homePosition);
             }
 
-            float distToHome = Vector3.Distance(transform.position, _homePosition);
-            if (distToHome < 1.5f)
+            if (Vector3.Distance(transform.position, _homePosition) < 1.5f)
             {
                 _agent.ResetPath();
                 _wasAttacked     = false;
                 _patrolTargetSet = false;
-                _state           = State.Idle;
+                _damageLog.Clear(); // limpa log ao voltar para casa
+                _state = State.Idle;
             }
         }
 
         private void EnterReturnHome()
         {
-            _state              = State.ReturnHome;
-            _aggroTarget        = null;
-            _regenTimer         = 0f;
+            _state          = State.ReturnHome;
+            _aggroTarget    = null;
+            _regenTimer     = 0f;
             _agent.stoppingDistance = 0.5f;
         }
 
         // ── Aggro ─────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Tenta agredir um player próximo de acordo com a disposição:
-        ///   - Passive:    nunca agride.
-        ///   - Neutral:    agride SOMENTE se foi atacado (_wasAttacked).
-        ///   - Aggressive: agride qualquer player dentro de aggroRange.
-        /// </summary>
         private bool TryAggro()
         {
             if (disposition == MonsterDisposition.Passive) return false;
@@ -544,7 +493,6 @@ namespace RPG.Network
             _attackTimer     = 0f;
             _patrolTargetSet = false;
 
-            // Só volta a patrulhar se estiver perto de casa
             float distToHome = Vector3.Distance(transform.position, _homePosition);
             if (distToHome > leashRange * 0.5f)
                 EnterReturnHome();
@@ -552,97 +500,124 @@ namespace RPG.Network
                 _state = State.Idle;
         }
 
-        // ── Ataque ────────────────────────────────────────────────────────
+        // ── Ataque do monstro → jogador ───────────────────────────────────
 
         [Server]
         private void ServerAttack()
         {
             if (_aggroTarget == null || _aggroTarget.Dead) return;
 
-            bool hit = StatsCalculator.RollHit(_stats.HIT, 20f);
+            // Pega FLEE do jogador via ServerStats (calculado no servidor)
+            float playerFlee = _aggroTarget.ServerStats?.FLEE ?? 20f;
+
+            bool hit = StatsCalculator.RollHit(_stats.HIT, playerFlee);
             if (!hit) { RpcShowMiss(_aggroTarget.transform.position); return; }
 
             bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
-            float dmg  = StatsCalculator.CalculatePhysicalDamage(
-                             _stats.ATK, 10f, crit, _stats.CritDMG);
+
+            // Pega DEF do jogador via ServerStats
+            float playerDEF = _aggroTarget.ServerStats?.DEF ?? 10f;
+            float dmg = StatsCalculator.CalculatePhysicalDamage(
+                            _stats.ATK, playerDEF, crit, _stats.CritDMG);
 
             _aggroTarget.ServerApplyDamage(dmg);
             RpcPlayAnim("Attack");
         }
 
-        // ── TakeDamage ────────────────────────────────────────────────────
+        // ── TakeDamage — requisição vinda do cliente ──────────────────────
 
-        public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
-        {
-            if (isServer) { ServerTakeDamage(rawAtk, rawMatk, isPhysical); return; }
-            CmdRequestTakeDamage(rawAtk, rawMatk, isPhysical);
-        }
-
+        /// <summary>
+        /// Chamado pelo SkillSystem do cliente via Command.
+        /// Recebe apenas o índice da skill e o netId do atacante.
+        /// O servidor busca os stats do atacante e calcula tudo.
+        /// NENHUM valor de dano vem do cliente.
+        /// </summary>
         [Command(requiresAuthority = false)]
-        private void CmdRequestTakeDamage(float rawAtk, float rawMatk, bool isPhysical)
-            => ServerTakeDamage(rawAtk, rawMatk, isPhysical);
-
-        [Server]
-        private void ServerTakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+        public void CmdRequestAttack(uint attackerNetId, int skillIndex, bool isPhysical)
         {
+            // Encontra o NetworkPlayer atacante pelo netId
+            NetworkPlayer attacker = null;
+            foreach (var np in NetworkPlayer.All)
+            {
+                if (np.netId == attackerNetId) { attacker = np; break; }
+            }
+
+            if (attacker == null || attacker.Dead) return;
             if (_isDead) return;
 
-            bool  crit = StatsCalculator.RollCrit(5f);
-            float dmg  = isPhysical
-                ? StatsCalculator.CalculatePhysicalDamage(rawAtk, _stats.DEF, crit, _stats.CritDMG)
-                : StatsCalculator.CalculateMagicDamage(rawMatk, _stats.MDEF, crit, _stats.CritDMG);
+            // Busca stats do atacante calculados no servidor
+            var atkStats = attacker.ServerStats;
+            if (atkStats == null) return;
 
-            dmg        = Mathf.Max(1f, dmg);
+            ServerTakeDamageFromPlayer(attacker, atkStats, skillIndex, isPhysical);
+        }
+
+        [Server]
+        private void ServerTakeDamageFromPlayer(
+            NetworkPlayer attacker, DerivedStats atkStats,
+            int skillIndex, bool isPhysical)
+        {
+            // Hit roll: HIT do atacante vs FLEE do monstro
+            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
+            if (!hit)
+            {
+                RpcShowMiss(transform.position);
+                return;
+            }
+
+            bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
+            float dmg  = isPhysical
+                ? StatsCalculator.CalculatePhysicalDamage(atkStats.ATK, _stats.DEF, crit, atkStats.CritDMG)
+                : StatsCalculator.CalculateMagicDamage(atkStats.MATK, _stats.MDEF, crit, atkStats.CritDMG);
+
+            dmg = Mathf.Max(1f, dmg);
+
+            // Registra dano no log para distribuição de XP
+            if (!_damageLog.ContainsKey(attacker.netId))
+                _damageLog[attacker.netId] = 0f;
+            _damageLog[attacker.netId] += dmg;
+
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
 
             RpcShowDamage(dmg, crit, transform.position);
 
-            // Reage ao dano de acordo com a disposição
+            // Reage ao dano conforme disposição
             switch (disposition)
             {
                 case MonsterDisposition.Passive:
-                    // Foge — encontra o agressor mais próximo para fugir
                     if (_state != State.Flee && _state != State.ReturnHome && _state != State.Dead)
                     {
-                        FindClosestAttacker();
+                        _aggroTarget   = attacker;
                         _fleeTimer     = 0f;
                         _state         = State.Flee;
                         _agent.speed   = _stats.ASPD * fleeSpeedMult;
-                        _pathTimer     = pathUpdateRate; // força update imediato
+                        _pathTimer     = pathUpdateRate;
                     }
                     break;
 
                 case MonsterDisposition.Neutral:
-                    // Marca como atacado e entra em combate se ainda não estava
                     _wasAttacked = true;
                     if (_state == State.Idle || _state == State.Patrol || _state == State.ReturnHome)
-                        TryAggro();
+                    {
+                        _aggroTarget = attacker;
+                        _state       = State.Chase;
+                        _pathTimer   = pathUpdateRate;
+                        _attackTimer = 0f;
+                    }
                     break;
 
                 case MonsterDisposition.Aggressive:
-                    // Já está em combate normalmente; se estava patrulhando, agride
                     if (_state == State.Idle || _state == State.Patrol)
-                        TryAggro();
+                    {
+                        _aggroTarget = attacker;
+                        _state       = State.Chase;
+                        _pathTimer   = pathUpdateRate;
+                        _attackTimer = 0f;
+                    }
                     break;
             }
 
             if (_currentHP <= 0f) ServerDie();
-        }
-
-        /// <summary>Acha o NetworkPlayer mais próximo como referência para fugir.</summary>
-        private void FindClosestAttacker()
-        {
-            float         closest = float.MaxValue;
-            NetworkPlayer found   = null;
-
-            foreach (var np in NetworkPlayer.All)
-            {
-                if (np.Dead) continue;
-                float d = Vector3.Distance(transform.position, np.transform.position);
-                if (d < closest) { closest = d; found = np; }
-            }
-
-            _aggroTarget = found;
         }
 
         // ── Morte e Respawn ───────────────────────────────────────────────
@@ -661,14 +636,46 @@ namespace RPG.Network
 
             Debug.Log($"[NetworkMonster] {monsterDisplayName} morreu!");
 
-            foreach (var np in NetworkPlayer.All)
-            {
-                float dist = Vector3.Distance(transform.position, np.transform.position);
-                if (dist <= aggroRange * 2f)
-                    RpcGrantExp(np.netId, expReward);
-            }
+            // Distribui XP apenas para quem participou do combate
+            ServerDistributeExp();
 
             StartCoroutine(ServerDeathSequence());
+        }
+
+        /// <summary>
+        /// Distribui XP proporcionalmente entre todos os jogadores que causaram dano.
+        /// Cada um recebe (sua_parcela_de_dano / dano_total) * expReward.
+        /// Mínimo de 1 XP por participação.
+        /// </summary>
+        [Server]
+        private void ServerDistributeExp()
+        {
+            if (_damageLog.Count == 0) return;
+
+            float totalDamage = 0f;
+            foreach (var kv in _damageLog)
+                totalDamage += kv.Value;
+
+            if (totalDamage <= 0f) return;
+
+            foreach (var kv in _damageLog)
+            {
+                uint attackerNetId = kv.Key;
+                float proportion   = kv.Value / totalDamage;
+                long  xpShare      = Mathf.Max(1, (int)(expReward * proportion));
+
+                // Encontra o NetworkPlayer e concede XP no servidor
+                foreach (var np in NetworkPlayer.All)
+                {
+                    if (np.netId == attackerNetId)
+                    {
+                        np.ServerGrantExp(xpShare);
+                        break;
+                    }
+                }
+            }
+
+            _damageLog.Clear();
         }
 
         [Server]
@@ -689,10 +696,6 @@ namespace RPG.Network
 
         // ── NavMesh Helper ────────────────────────────────────────────────
 
-        /// <summary>
-        /// Escolhe um ponto aleatório no NavMesh dentro do raio especificado
-        /// ao redor de center. Faz até 15 tentativas.
-        /// </summary>
         private bool TryGetRandomAreaPoint(Vector3 center, float radius, out Vector3 result)
         {
             for (int i = 0; i < 15; i++)
@@ -757,47 +760,6 @@ namespace RPG.Network
             }
         }
 
-        [ClientRpc]
-        private void RpcGrantExp(uint targetNetId, long amount)
-        {
-            if (NetworkClient.localPlayer == null) return;
-            if (NetworkClient.localPlayer.netId != targetNetId) return;
-
-            var charData = RPG.Managers.GameManager.Instance?.SelectedCharacter;
-            if (charData == null) return;
-
-            bool leveled = charData.AddExperience(amount);
-
-            FloatingTextManager.Instance?.Show(
-                $"+{amount} XP",
-                NetworkClient.localPlayer.transform.position + Vector3.up * 2f,
-                Color.cyan);
-
-            var playerEntity = NetworkClient.localPlayer.GetComponent<RPG.Character.PlayerEntity>();
-            var netPlayer    = NetworkClient.localPlayer.GetComponent<NetworkPlayer>();
-
-            if (playerEntity != null)
-            {
-                playerEntity.RefreshStats();
-
-                if (leveled)
-                {
-                    playerEntity.HealToFull();
-                    FloatingTextManager.Instance?.Show(
-                        "LEVEL UP!",
-                        NetworkClient.localPlayer.transform.position + Vector3.up * 2.5f,
-                        Color.yellow);
-                    netPlayer?.CmdSyncLevel(charData.Level);
-                }
-
-                netPlayer?.CmdSyncHP(playerEntity.CurrentHP, playerEntity.Stats.MaxHP);
-
-                var account = RPG.Managers.GameManager.Instance?.CurrentAccount;
-                if (account != null)
-                    RPG.Managers.SaveManager.Instance?.SaveCharacter(account, charData);
-            }
-        }
-
         // ── SyncVar Hooks ─────────────────────────────────────────────────
 
         private void OnCurrentHPChanged(float _, float newVal)
@@ -812,7 +774,6 @@ namespace RPG.Network
 
         private void OnDrawGizmosSelected()
         {
-            // Aggro range — vermelho/amarelo dependendo da disposição
             Color aggroColor = disposition switch
             {
                 MonsterDisposition.Passive    => Color.green,
@@ -824,19 +785,15 @@ namespace RPG.Network
             Gizmos.color = aggroColor;
             Gizmos.DrawWireSphere(transform.position, aggroRange);
 
-            // Attack range — vermelho
             Gizmos.color = new Color(1f, 0.3f, 0.3f);
             Gizmos.DrawWireSphere(transform.position, attackRange);
 
-            // Kite distance — azul
             Gizmos.color = Color.blue;
             Gizmos.DrawWireSphere(transform.position, kiteDistance);
 
-            // Leash range — branco
             Gizmos.color = new Color(1f, 1f, 1f, 0.4f);
             Gizmos.DrawWireSphere(transform.position, leashRange);
 
-            // Home + patrol radius (runtime)
             if (Application.isPlaying)
             {
                 Gizmos.color = new Color(1f, 0.8f, 0f, 0.5f);
@@ -844,7 +801,6 @@ namespace RPG.Network
                 Gizmos.color = Color.cyan;
                 Gizmos.DrawSphere(_homePosition, 0.3f);
 
-                // Destino atual de patrulha
                 if (_patrolTargetSet)
                 {
                     Gizmos.color = Color.magenta;
@@ -854,7 +810,6 @@ namespace RPG.Network
             }
             else
             {
-                // No editor (antes de jogar), mostra patrol radius do Inspector
                 Gizmos.color = new Color(1f, 0.8f, 0f, 0.3f);
                 Gizmos.DrawWireSphere(transform.position, patrolRadius);
             }

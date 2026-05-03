@@ -4,6 +4,7 @@ using TMPro;
 using RPG.Character;
 using RPG.Data;
 using RPG.Managers;
+using NetworkPlayer = RPG.Network.NetworkPlayer;
 
 namespace RPG.UI
 {
@@ -401,5 +402,21 @@ namespace RPG.UI
                 _ => race.ToString()
             };
         }
+		public void OnFreePointsUpdated(int newPoints)
+{
+    if (_player == null || !_player.IsInitialized) return;
+
+    // Atualiza só o necessário (leve e eficiente)
+    var data = _player.Data;
+    if (data == null) return;
+
+    data.FreeAttributePoints = newPoints;
+
+    RefreshFreePointsBanner(data);
+    RefreshPlusButtons(data);
+
+    Debug.Log($"[AttributeWindowUI] FreePoints atualizado: {newPoints}");
+}
     }
+	
 }
