@@ -37,10 +37,10 @@ namespace RPG.Network
         public int Level = 1;
 
         [SyncVar(hook = nameof(OnHPChanged))]
-        public float CurrentHP = 100f;
+        public float CurrentHP = 0f;
 
         [SyncVar]
-        public float MaxHP = 100f;
+        public float MaxHP = 0f;
 
         [SyncVar(hook = nameof(OnMovingChanged))]
         public bool IsMoving = false;
@@ -235,23 +235,25 @@ namespace RPG.Network
 
         private void OnRaceChanged(string _, string newRace) { }
 
-        private void OnHPChanged(float _, float newHP)
-        {
-            if (hpBarSlider != null)
-            {
-                hpBarSlider.maxValue = MaxHP;
-                hpBarSlider.value    = newHP;
-                hpBarSlider.gameObject.SetActive(newHP < MaxHP);
-            }
-
-            // Propaga para PlayerEntity do cliente dono → UIManager atualiza
-            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-                _playerEntity.ForceSetHP(newHP, MaxHP);
-        }
-
-        private void OnMovingChanged(bool _, bool newVal)
-        {
-            if (!isLocalPlayer) _animator?.SetBool("IsMoving", newVal);
-        }
-    }
-}
+		private void OnHPChanged(float _, float newHP)
+		{
+			if (hpBarSlider != null)
+			{
+				hpBarSlider.maxValue = MaxHP;
+				hpBarSlider.value    = newHP;
+				hpBarSlider.gameObject.SetActive(newHP < MaxHP);
+			}
+		
+			if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+			{
+				if (MaxHP >= _playerEntity.Stats.MaxHP)
+					_playerEntity.ForceSetHP(newHP, MaxHP);
+			}
+		}
+	
+			private void OnMovingChanged(bool _, bool newVal)
+			{
+				if (!isLocalPlayer) _animator?.SetBool("IsMoving", newVal);
+			}
+		}
+	}

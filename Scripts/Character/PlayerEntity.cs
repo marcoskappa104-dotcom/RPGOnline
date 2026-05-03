@@ -130,7 +130,15 @@ namespace RPG.Character
             Stats = Data.GetDerivedStats(ActiveBuffs);
             if (_agent != null)
                 _agent.speed = Mathf.Clamp(Stats.ASPD * 0.8f, 2f, 10f);
-            OnStatsChanged?.Invoke();
+			
+			    // ADIÇÃO: garante que HP/MP não excedam o novo máximo
+				if (CurrentHP > Stats.MaxHP) CurrentHP = Stats.MaxHP;
+				if (CurrentMP > Stats.MaxMP) CurrentMP = Stats.MaxMP;
+	
+				OnStatsChanged?.Invoke();
+			
+			    OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
+				OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
 
         // ── Movimento ─────────────────────────────────────────────────────

@@ -61,6 +61,10 @@ namespace RPG.UI
         [SerializeField] private Slider   expBar;
         [SerializeField] private TMP_Text expText;
 
+		[Header("Attribute Window")]
+		[SerializeField] private AttributeWindowUI attributeWindow;
+		[SerializeField] private Button            attributeWindowButton;
+		
         private PlayerEntity _player;
         private SkillSystem  _skills;
         private float        _messageTimer;
@@ -75,8 +79,11 @@ namespace RPG.UI
         {
             ClearTargetPanel();
             if (messageText != null) messageText.text = "";
-
-            // Modo offline: tenta vincular se o player já existe e está inicializado
+			
+			if (attributeWindowButton != null)	
+			attributeWindowButton.onClick.AddListener(() => attributeWindow?.Toggle());
+            
+			// Modo offline: tenta vincular se o player já existe e está inicializado
             var player = FindObjectOfType<PlayerEntity>();
             if (player != null && player.IsInitialized)
                 BindLocalPlayer(player);
@@ -106,6 +113,7 @@ namespace RPG.UI
             // Ignora chamadas duplicadas para o mesmo player
             if (_player == player)
             {
+				attributeWindow?.BindPlayer(player);
                 Debug.Log($"[UIManager] BindLocalPlayer duplicado ignorado — {player.Data?.CharacterName}");
                 if (player.IsInitialized) ForceRefreshAll();
                 return;

@@ -182,6 +182,8 @@ namespace RPG.Network
             if (Input.GetKeyDown(KeyCode.W)) UseSkill(1);
             if (Input.GetKeyDown(KeyCode.E)) UseSkill(2);
             if (Input.GetKeyDown(KeyCode.R)) UseSkill(3);
+			if (Input.GetKeyDown(KeyCode.C))
+			 AttributeWindowUI.Instance?.Toggle();
         }
 
         private void UseSkill(int index)
