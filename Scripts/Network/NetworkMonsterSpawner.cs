@@ -6,77 +6,56 @@ using System.Collections.Generic;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkMonsterSpawner v2 — Sistema de spawn por área e por ponto fixo.
+    /// NetworkMonsterSpawner — sistema de spawn por zona ou por pontos fixos.
     ///
-    /// DOIS MODOS de spawn por grupo:
+    /// MODOS:
+    ///   ZONA  (useFixedPoints = false): spawna N monstros em posições aleatórias
+    ///         dentro de zoneRadius ao redor de zoneCenter.
+    ///   FIXO  (useFixedPoints = true):  spawna 1 monstro em cada fixedSpawnPoint.
     ///
-    ///   1. ZONA (useFixedPoints = false)
-    ///      Spawna N monstros em posições aleatórias dentro de um raio ao redor
-    ///      de zoneCenter. Ideal para campos de mobs comuns.
-    ///      Os monstros patrulham dentro de patrolRadius (normalmente = zoneRadius).
-    ///
-    ///   2. PONTOS FIXOS (useFixedPoints = true)
-    ///      Spawna um monstro em cada ponto da lista fixedSpawnPoints.
-    ///      Ideal para bosses, mobs nomeados, mobs em posições específicas.
-    ///      Cada mob patrulha dentro de patrolRadius ao redor do seu ponto de spawn.
-    ///
-    /// CONFIGURAÇÃO NO UNITY:
-    ///   1. Adicione este script a um GameObject vazio chamado "MonsterSpawner"
-    ///   2. Para zonas:
-    ///      - Crie um Empty chamado "ZoneCenter_Floresta" e posicione no mapa
-    ///      - Configure zoneRadius (ex: 15), spawnCount (ex: 5), patrolRadius (ex: 12)
-    ///   3. Para pontos fixos:
-    ///      - Marque useFixedPoints = true
-    ///      - Crie Empties "SpawnPoint_1", "SpawnPoint_2" etc. e arraste aqui
-    ///
-    /// GIZMOS:
-    ///   Selecione o spawner no Editor para visualizar as áreas de spawn (azul)
-    ///   e patrulha (amarelo) no Scene View.
+    /// CADA monstro recebe SetSpawnData(homePosition, patrolRadius) para
+    /// configurar sua área de patrulha individualmente.
     /// </summary>
     public class NetworkMonsterSpawner : MonoBehaviour
     {
         [System.Serializable]
         public class SpawnGroup
         {
-            [Header("Prefab (deve ter NetworkIdentity + NetworkMonsterEntity)")]
+            [Header("Prefab")]
+            [Tooltip("Deve ter NetworkIdentity + NetworkMonsterEntity.")]
             public GameObject monsterPrefab;
 
-            [Header("─── MODO ZONA (spawn aleatório na área) ───")]
-            [Tooltip("Marque TRUE para usar pontos fixos em vez de área.")]
-            public bool useFixedPoints = false;
-
-            [Tooltip("Centro da área de spawn. Crie um Empty e arraste aqui.")]
+            [Header("─── MODO ZONA ───")]
+            public bool      useFixedPoints = false;
             public Transform zoneCenter;
+            public float     zoneRadius     = 15f;
+            public int       spawnCount     = 3;
 
-            [Tooltip("Raio da área em que os monstros são criados.")]
-            public float zoneRadius = 15f;
-
-            [Tooltip("Quantos monstros spawnar nesta zona.")]
-            public int spawnCount = 3;
-
-            [Header("─── MODO PONTOS FIXOS (bosses / mobs específicos) ───")]
-            [Tooltip("Spawna 1 mob por ponto. Só usado se useFixedPoints = true.")]
+            [Header("─── MODO PONTOS FIXOS ───")]
             public Transform[] fixedSpawnPoints;
 
             [Header("─── PATRULHA ───")]
-            [Tooltip("Raio de patrulha ao redor do ponto de spawn de cada mob.\n" +
-                     "0 = mob fica parado (tipo sentinela).")]
+            [Tooltip("Raio de patrulha por mob. 0 = sentinela (parado).")]
             public float patrolRadius = 12f;
 
-            [Tooltip("Rótulo para identificação nos logs e Gizmos.")]
+            [Tooltip("Rótulo usado nos logs e Gizmos.")]
             public string groupLabel = "Grupo";
         }
 
         [SerializeField] private SpawnGroup[] spawnGroups;
         [SerializeField] private bool         logSpawns = true;
 
-        // ── Tentativas máximas para achar posição válida no NavMesh ──────
-        private const int NAVMESH_ATTEMPTS = 20;
+        private const int   NAVMESH_ATTEMPTS      = 20;
         private const float NAVMESH_SAMPLE_RADIUS = 3f;
 
         private void Start()
         {
             if (!NetworkServer.active) return;
+            if (spawnGroups == null || spawnGroups.Length == 0)
+            {
+                Debug.LogWarning("[NetworkMonsterSpawner] Nenhum SpawnGroup configurado.");
+                return;
+            }
             SpawnAll();
         }
 
@@ -86,56 +65,55 @@ namespace RPG.Network
 
             foreach (var group in spawnGroups)
             {
+                if (group == null) continue;
                 if (!ValidateGroup(group)) continue;
 
-                if (group.useFixedPoints)
-                    totalSpawned += SpawnAtFixedPoints(group);
-                else
-                    totalSpawned += SpawnInZone(group);
+                totalSpawned += group.useFixedPoints
+                    ? SpawnAtFixedPoints(group)
+                    : SpawnInZone(group);
             }
 
             Debug.Log($"[NetworkMonsterSpawner] Total spawnado: {totalSpawned} monstros.");
         }
 
-        // ── Spawn por pontos fixos ────────────────────────────────────────
+        // ── Spawn por pontos fixos ─────────────────────────────────────────
 
         private int SpawnAtFixedPoints(SpawnGroup group)
         {
+            if (group.fixedSpawnPoints == null) return 0;
+
             int count = 0;
             foreach (var point in group.fixedSpawnPoints)
             {
                 if (point == null) continue;
-
-                // Para pontos fixos tentamos achar posição no NavMesh próxima ao ponto
-                Vector3 spawnPos = SnapToNavMesh(point.position);
-                SpawnMonster(group, spawnPos);
+                SpawnMonster(group, SnapToNavMesh(point.position));
                 count++;
             }
             return count;
         }
 
-        // ── Spawn por zona ────────────────────────────────────────────────
+        // ── Spawn por zona ─────────────────────────────────────────────────
 
         private int SpawnInZone(SpawnGroup group)
         {
             if (group.zoneCenter == null)
             {
-                Debug.LogWarning($"[NetworkMonsterSpawner] Grupo '{group.groupLabel}': " +
-                                 "zoneCenter não configurado!");
+                Debug.LogWarning($"[NetworkMonsterSpawner] Grupo '{group.groupLabel}': zoneCenter não configurado!");
                 return 0;
             }
 
-            int count = 0;
+            int count         = 0;
             var usedPositions = new List<Vector3>();
 
             for (int i = 0; i < group.spawnCount; i++)
             {
-                Vector3? pos = FindSpawnPositionInZone(group.zoneCenter.position,
-                                                        group.zoneRadius, usedPositions);
+                Vector3? pos = FindSpawnPositionInZone(
+                    group.zoneCenter.position, group.zoneRadius, usedPositions);
+
                 if (pos == null)
                 {
                     Debug.LogWarning($"[NetworkMonsterSpawner] Grupo '{group.groupLabel}': " +
-                                     $"não foi possível achar posição para mob {i + 1}/{group.spawnCount}.");
+                                     $"posição não encontrada para mob {i + 1}/{group.spawnCount}.");
                     continue;
                 }
 
@@ -147,42 +125,36 @@ namespace RPG.Network
             return count;
         }
 
-        // ── Spawn individual ──────────────────────────────────────────────
+        // ── Spawn individual ───────────────────────────────────────────────
 
         private void SpawnMonster(SpawnGroup group, Vector3 position)
         {
             var mob = Instantiate(group.monsterPrefab, position, Quaternion.identity);
             NetworkServer.Spawn(mob);
 
-            // Passa os dados de área para o mob configurar sua patrulha
             var entity = mob.GetComponent<NetworkMonsterEntity>();
-            if (entity != null)
-                entity.SetSpawnData(position, group.patrolRadius);
+            entity?.SetSpawnData(position, group.patrolRadius);
 
             if (logSpawns)
                 Debug.Log($"[NetworkMonsterSpawner] [{group.groupLabel}] " +
                           $"{mob.name} em {position} | PatrolR:{group.patrolRadius}");
         }
 
-        // ── Helpers de NavMesh ────────────────────────────────────────────
+        // ── NavMesh Helpers ────────────────────────────────────────────────
 
-        /// <summary>
-        /// Encontra uma posição válida no NavMesh dentro do raio da zona,
-        /// tentando evitar empilhamento com posições já usadas (minDist = 2m).
-        /// </summary>
-        private Vector3? FindSpawnPositionInZone(Vector3 center, float radius,
-                                                  List<Vector3> usedPositions)
+        private Vector3? FindSpawnPositionInZone(
+            Vector3 center, float radius, List<Vector3> usedPositions)
         {
             const float MIN_DIST_BETWEEN_MOBS = 2f;
 
             for (int attempt = 0; attempt < NAVMESH_ATTEMPTS; attempt++)
             {
-                // Ponto aleatório dentro do círculo (distribuição uniforme)
-                Vector2 rand2D = Random.insideUnitCircle * radius;
+                Vector2 rand2D    = Random.insideUnitCircle * radius;
                 Vector3 candidate = center + new Vector3(rand2D.x, 0f, rand2D.y);
 
-                // Ajusta Y para o terreno
-                if (Physics.Raycast(candidate + Vector3.up * 20f, Vector3.down, out RaycastHit hit, 40f))
+                // Ajuste de altura pelo terreno
+                if (Physics.Raycast(candidate + Vector3.up * 20f, Vector3.down,
+                                    out RaycastHit hit, 40f))
                     candidate = hit.point;
 
                 if (!NavMesh.SamplePosition(candidate, out NavMeshHit navHit,
@@ -191,15 +163,11 @@ namespace RPG.Network
 
                 Vector3 pos = navHit.position;
 
-                // Verifica se não está muito perto de outro mob já spawnado
                 bool tooClose = false;
                 foreach (var used in usedPositions)
                 {
                     if (Vector3.Distance(pos, used) < MIN_DIST_BETWEEN_MOBS)
-                    {
-                        tooClose = true;
-                        break;
-                    }
+                    { tooClose = true; break; }
                 }
 
                 if (!tooClose) return pos;
@@ -216,7 +184,7 @@ namespace RPG.Network
             return position;
         }
 
-        // ── Validação ─────────────────────────────────────────────────────
+        // ── Validação ──────────────────────────────────────────────────────
 
         private bool ValidateGroup(SpawnGroup group)
         {
@@ -227,20 +195,18 @@ namespace RPG.Network
             }
             if (group.monsterPrefab.GetComponent<NetworkIdentity>() == null)
             {
-                Debug.LogError($"[NetworkMonsterSpawner] '{group.monsterPrefab.name}' " +
-                               "não tem NetworkIdentity!");
+                Debug.LogError($"[NetworkMonsterSpawner] '{group.monsterPrefab.name}' não tem NetworkIdentity!");
                 return false;
             }
             if (group.monsterPrefab.GetComponent<NetworkMonsterEntity>() == null)
             {
-                Debug.LogError($"[NetworkMonsterSpawner] '{group.monsterPrefab.name}' " +
-                               "não tem NetworkMonsterEntity!");
+                Debug.LogError($"[NetworkMonsterSpawner] '{group.monsterPrefab.name}' não tem NetworkMonsterEntity!");
                 return false;
             }
             return true;
         }
 
-        // ── Gizmos ────────────────────────────────────────────────────────
+        // ── Gizmos ─────────────────────────────────────────────────────────
 
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
@@ -253,7 +219,6 @@ namespace RPG.Network
 
                 if (!group.useFixedPoints && group.zoneCenter != null)
                 {
-                    // Área de spawn — azul
                     UnityEditor.Handles.color = new Color(0.2f, 0.5f, 1f, 0.15f);
                     UnityEditor.Handles.DrawSolidDisc(
                         group.zoneCenter.position, Vector3.up, group.zoneRadius);
@@ -262,7 +227,6 @@ namespace RPG.Network
                     UnityEditor.Handles.DrawWireDisc(
                         group.zoneCenter.position, Vector3.up, group.zoneRadius);
 
-                    // Área de patrulha — amarelo (ligeiramente menor que spawn)
                     UnityEditor.Handles.color = new Color(1f, 0.85f, 0f, 0.08f);
                     UnityEditor.Handles.DrawSolidDisc(
                         group.zoneCenter.position, Vector3.up, group.patrolRadius);
@@ -271,23 +235,18 @@ namespace RPG.Network
                     UnityEditor.Handles.DrawWireDisc(
                         group.zoneCenter.position, Vector3.up, group.patrolRadius);
 
-                    // Label
-                    Gizmos.color = Color.white;
                     UnityEditor.Handles.Label(
                         group.zoneCenter.position + Vector3.up * 0.5f,
-                        $"{group.groupLabel}\n×{group.spawnCount}");
+                        $"{group.groupLabel} ×{group.spawnCount}");
                 }
                 else if (group.useFixedPoints && group.fixedSpawnPoints != null)
                 {
                     foreach (var pt in group.fixedSpawnPoints)
                     {
                         if (pt == null) continue;
-
-                        // Ponto fixo — vermelho
                         Gizmos.color = new Color(1f, 0.3f, 0.3f, 0.8f);
                         Gizmos.DrawSphere(pt.position, 0.4f);
 
-                        // Raio de patrulha ao redor do ponto fixo — amarelo
                         if (group.patrolRadius > 0f)
                         {
                             UnityEditor.Handles.color = new Color(1f, 0.85f, 0f, 0.5f);
@@ -295,8 +254,7 @@ namespace RPG.Network
                                 pt.position, Vector3.up, group.patrolRadius);
                         }
 
-                        UnityEditor.Handles.Label(
-                            pt.position + Vector3.up * 0.6f, group.groupLabel);
+                        UnityEditor.Handles.Label(pt.position + Vector3.up * 0.6f, group.groupLabel);
                     }
                 }
             }

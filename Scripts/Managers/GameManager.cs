@@ -5,24 +5,22 @@ using RPG.Data;
 namespace RPG.Managers
 {
     /// <summary>
-    /// GameManager — singleton que persiste entre cenas.
-    /// Guarda referências globais: conta logada, personagem selecionado, etc.
+    /// GameManager — singleton persistente entre cenas.
+    /// Guarda a sessão atual: conta logada e personagem selecionado.
     /// </summary>
     public class GameManager : MonoBehaviour
     {
         public static GameManager Instance { get; private set; }
 
-        // ── Dados da sessão atual ──────────────────────────────────────────
-        public AccountData   CurrentAccount   { get; private set; }
+        // ── Sessão atual ───────────────────────────────────────────────────
+        public AccountData   CurrentAccount    { get; private set; }
         public CharacterData SelectedCharacter { get; private set; }
 
-        // ── Constantes de cenas ───────────────────────────────────────────
+        // ── Constantes de cenas ────────────────────────────────────────────
         public const string SCENE_LOGIN     = "LoginScene";
         public const string SCENE_CHARACTER = "CharacterScene";
         public const string SCENE_GAMEPLAY  = "GameplayScene";
-
-        // ── Versão do jogo ────────────────────────────────────────────────
-        public const string GAME_VERSION = "0.1.0-alpha";
+        public const string GAME_VERSION    = "0.1.0-alpha";
 
         private void Awake()
         {
@@ -36,22 +34,29 @@ namespace RPG.Managers
             Debug.Log($"[GameManager] Iniciado — versão {GAME_VERSION}");
         }
 
-        // ── Fluxo de navegação ────────────────────────────────────────────
+        // ── Sessão ─────────────────────────────────────────────────────────
 
         public void SetAccount(AccountData account)
         {
             CurrentAccount = account;
-            Debug.Log($"[GameManager] Conta setada: {account.Username}");
+            Debug.Log($"[GameManager] Conta setada: {account?.Username}");
         }
 
         public void SetSelectedCharacter(CharacterData character)
         {
             SelectedCharacter = character;
-            Debug.Log($"[GameManager] Personagem selecionado: {character.CharacterName}");
+            Debug.Log($"[GameManager] Personagem selecionado: {character?.CharacterName}");
         }
+
+        // ── Navegação ──────────────────────────────────────────────────────
 
         public void GoToCharacterSelect()
         {
+            if (CurrentAccount == null)
+            {
+                Debug.LogError("[GameManager] GoToCharacterSelect sem conta logada!");
+                return;
+            }
             SceneManager.LoadScene(SCENE_CHARACTER);
         }
 
@@ -59,7 +64,7 @@ namespace RPG.Managers
         {
             if (SelectedCharacter == null)
             {
-                Debug.LogError("[GameManager] Nenhum personagem selecionado!");
+                Debug.LogError("[GameManager] GoToGameplay sem personagem selecionado!");
                 return;
             }
             SceneManager.LoadScene(SCENE_GAMEPLAY);
@@ -72,14 +77,18 @@ namespace RPG.Managers
             SceneManager.LoadScene(SCENE_LOGIN);
         }
 
-        // ── Utilidades ────────────────────────────────────────────────────
+        // ── Hash de senha ──────────────────────────────────────────────────
 
-        /// <summary>Hash MD5 simples para senha (use bcrypt em produção)</summary>
+        /// <summary>
+        /// Hash SHA-256 da senha para armazenamento local.
+        /// ATENÇÃO: Em produção com banco de dados real, use bcrypt/Argon2
+        /// com salt no servidor — nunca armazene senhas em texto puro ou MD5.
+        /// </summary>
         public static string HashPassword(string password)
         {
-            using var md5 = System.Security.Cryptography.MD5.Create();
-            byte[] bytes  = System.Text.Encoding.UTF8.GetBytes(password);
-            byte[] hash   = md5.ComputeHash(bytes);
+            using var sha256 = System.Security.Cryptography.SHA256.Create();
+            byte[] bytes     = System.Text.Encoding.UTF8.GetBytes(password);
+            byte[] hash      = sha256.ComputeHash(bytes);
             return System.BitConverter.ToString(hash).Replace("-", "").ToLower();
         }
     }

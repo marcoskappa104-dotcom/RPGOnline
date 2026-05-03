@@ -9,25 +9,20 @@ using System.Collections.Generic;
 namespace RPG.Character
 {
     /// <summary>
-    /// PlayerEntity v2 — CLIENTE LOCAL
+    /// PlayerEntity — representação local do personagem no cliente.
     ///
-    /// RESPONSABILIDADES DESTA VERSÃO:
-    ///   - Representação local do personagem: movimento, animação, efeitos visuais.
-    ///   - HP/MP mantidos localmente MAS sempre sincronizados via NetworkPlayer.
+    /// RESPONSABILIDADES:
+    ///   - Movimento e animação via NavMeshAgent.
+    ///   - HP/MP mantidos localmente, sincronizados via NetworkPlayer (SyncVar hooks).
     ///
-    /// O QUE FOI REMOVIDO:
-    ///   - ForceSetHP() que era chamado de múltiplos lugares.
-    ///   - TakeDamage() direto: em multiplayer, dano vem do servidor via OnHPChanged.
-    ///   - SaveToData() direto: save é feito no servidor pelo NetworkPlayer.
+    /// REGRAS EM MODO MULTIPLAYER (ManagedByNetwork = true):
+    ///   - HP/MP só mudam via SetHPFromNetwork / SetMPFromNetwork.
+    ///   - TakeDamage() local é ignorado.
+    ///   - SaveToData() é ignorado (servidor salva).
+    ///   - Regen é ignorada (servidor controla).
     ///
-    /// NOVOS MÉTODOS:
-    ///   - SetHPFromNetwork(hp, maxHp): chamado pelo hook OnHPChanged do NetworkPlayer.
-    ///   - SetMPFromNetwork(mp, maxMp): chamado pelo hook OnMPChanged do NetworkPlayer.
-    ///   - ForceSetHP / ForceSetMP mantidos para respawn (também vindo do servidor).
-    ///
-    /// EM MODO OFFLINE (sem Mirror):
-    ///   - TakeDamage() local ainda funciona para testes sem servidor.
-    ///   - SaveToData() ainda funciona normalmente.
+    /// REGRAS EM MODO OFFLINE (ManagedByNetwork = false):
+    ///   - TakeDamage(), Heal(), regen e SaveToData() funcionam normalmente.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class PlayerEntity : MonoBehaviour
@@ -35,11 +30,11 @@ namespace RPG.Character
         // ── Registro estático ──────────────────────────────────────────────
         public static readonly HashSet<PlayerEntity> All = new HashSet<PlayerEntity>();
 
+        // ── Propriedades públicas ──────────────────────────────────────────
         public CharacterData Data        { get; private set; }
         public DerivedStats  Stats       { get; private set; }
         public BuffBonuses   ActiveBuffs { get; private set; } = new BuffBonuses();
 
-        // HP/MP locais — sempre espelham as SyncVars do NetworkPlayer em modo online
         public float CurrentHP { get; private set; }
         public float CurrentMP { get; private set; }
 
@@ -53,16 +48,19 @@ namespace RPG.Character
         public event Action               OnStatsChanged;
         public event Action               OnInitialized;
 
+        // ── Componentes ───────────────────────────────────────────────────
         private NavMeshAgent _agent;
         public  NavMeshAgent Agent => _agent;
 
+        // ── Estado interno ─────────────────────────────────────────────────
         private bool  _isDead;
         private float _regenTimer;
         private const float REGEN_INTERVAL = 5f;
 
-        public ITargetable CurrentTarget { get; private set; }
+        public bool         IsDead        => _isDead;
+        public ITargetable  CurrentTarget { get; private set; }
 
-        // ── Registro ──────────────────────────────────────────────────────
+        // ── Lifecycle ──────────────────────────────────────────────────────
         private void OnEnable()  => All.Add(this);
         private void OnDisable() => All.Remove(this);
 
@@ -73,9 +71,7 @@ namespace RPG.Character
 
         private void Start()
         {
-            // Em modo offline (sem Mirror), inicializa com o personagem selecionado.
-            // Em modo online, ManagedByNetwork=true e a inicialização vem via
-            // RpcInitializeLocalPlayer → Initialize().
+            // Em modo online, inicialização vem via RpcInitializeLocalPlayer.
             if (ManagedByNetwork) return;
 
             var charData = GameManager.Instance?.SelectedCharacter;
@@ -86,32 +82,32 @@ namespace RPG.Character
         private void Update()
         {
             if (!IsInitialized || _isDead) return;
-            // Regen só roda em modo offline; em modo online o servidor gerencia HP/MP
             if (!ManagedByNetwork)
                 HandleRegen();
         }
 
-        // ── Inicialização ─────────────────────────────────────────────────
+        // ── Inicialização ──────────────────────────────────────────────────
 
         public void Initialize(CharacterData data)
         {
             if (data == null)
             {
-                Debug.LogWarning("[PlayerEntity] Initialize com data null — ignorado.");
+                Debug.LogWarning("[PlayerEntity] Initialize chamado com data null — ignorado.");
                 return;
             }
 
             Data = data;
             RefreshStats();
 
-            CurrentHP = data.CurrentHP > 0 ? data.CurrentHP : Stats.MaxHP;
-            CurrentMP = data.CurrentMP > 0 ? data.CurrentMP : Stats.MaxMP;
+            // HP/MP: usa o valor salvo se válido, caso contrário começa cheio
+            CurrentHP = (data.CurrentHP > 0f && data.CurrentHP <= Stats.MaxHP)
+                ? data.CurrentHP : Stats.MaxHP;
+            CurrentMP = (data.CurrentMP > 0f && data.CurrentMP <= Stats.MaxMP)
+                ? data.CurrentMP : Stats.MaxMP;
 
-            if (_agent != null)
-            {
-                _agent.speed            = Mathf.Clamp(Stats.ASPD * 0.8f, 2f, 10f);
-                _agent.stoppingDistance = 0.5f;
-            }
+            _isDead = CurrentHP <= 0f;
+
+            ConfigureAgent();
 
             Debug.Log($"[PlayerEntity] {data.CharacterName} inicializado | " +
                       $"HP:{CurrentHP:0}/{Stats.MaxHP:0} | MP:{CurrentMP:0}/{Stats.MaxMP:0} | Lv:{data.Level}");
@@ -121,49 +117,59 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
 
-        // ── Stats ─────────────────────────────────────────────────────────
+        // ── Stats ──────────────────────────────────────────────────────────
 
         public void RefreshStats()
         {
             if (Data == null) return;
-            Stats = Data.GetDerivedStats(ActiveBuffs);
-            if (_agent != null)
-                _agent.speed = Mathf.Clamp(Stats.ASPD * 0.8f, 2f, 10f);
 
-            if (CurrentHP > Stats.MaxHP) CurrentHP = Stats.MaxHP;
-            if (CurrentMP > Stats.MaxMP) CurrentMP = Stats.MaxMP;
+            // GetDerivedStats NÃO modifica Data (sem side-effects)
+            Stats = Data.GetDerivedStats(ActiveBuffs);
+
+            ConfigureAgent();
+
+            // Clamp: HP/MP nunca excedem o novo máximo
+            if (IsInitialized)
+            {
+                CurrentHP = Mathf.Min(CurrentHP, Stats.MaxHP);
+                CurrentMP = Mathf.Min(CurrentMP, Stats.MaxMP);
+            }
 
             OnStatsChanged?.Invoke();
             OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
             OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
 
-        // ── Sincronização de rede (chamado pelos hooks do NetworkPlayer) ──
+        private void ConfigureAgent()
+        {
+            if (_agent == null || Stats == null) return;
+            _agent.speed            = Mathf.Clamp(Stats.MoveSpeed, 2f, 10f);
+            _agent.stoppingDistance = 0.5f;
+        }
+
+        // ── Sincronização de rede ──────────────────────────────────────────
 
         /// <summary>
         /// Chamado exclusivamente pelo hook OnHPChanged/OnMaxHPChanged do NetworkPlayer.
-        /// Atualiza o estado local sem disparar saves ou lógica de servidor.
+        /// Única forma de alterar HP em modo multiplayer.
         /// </summary>
         public void SetHPFromNetwork(float hp, float maxHp)
         {
             if (!IsInitialized) return;
 
             bool wasDead = _isDead;
+
             Stats.MaxHP = maxHp;
             CurrentHP   = Mathf.Clamp(hp, 0f, maxHp);
 
             OnHPChanged?.Invoke(CurrentHP, maxHp);
 
-            if (CurrentHP <= 0f && !wasDead)
+            bool nowDead = CurrentHP <= 0f;
+            if (nowDead != wasDead)
             {
-                _isDead = true;
-                _agent?.ResetPath();
-                OnDeathChanged?.Invoke(true);
-            }
-            else if (CurrentHP > 0f && wasDead)
-            {
-                _isDead = false;
-                OnDeathChanged?.Invoke(false);
+                _isDead = nowDead;
+                if (_isDead) _agent?.ResetPath();
+                OnDeathChanged?.Invoke(_isDead);
             }
         }
 
@@ -178,7 +184,7 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, maxMp);
         }
 
-        // ── Movimento ─────────────────────────────────────────────────────
+        // ── Movimento ──────────────────────────────────────────────────────
 
         public void MoveTo(Vector3 destination)
         {
@@ -190,13 +196,13 @@ namespace RPG.Character
 
         public bool HasReachedDestination()
         {
-            if (_agent == null) return false;
+            if (_agent == null) return true;
             return !_agent.pathPending
                 && _agent.remainingDistance <= _agent.stoppingDistance
                 && (!_agent.hasPath || _agent.velocity.sqrMagnitude < 0.01f);
         }
 
-        // ── Alvo ──────────────────────────────────────────────────────────
+        // ── Alvo ───────────────────────────────────────────────────────────
 
         public void SetTarget(ITargetable target)
         {
@@ -211,9 +217,7 @@ namespace RPG.Character
             CurrentTarget = null;
         }
 
-        // ── Dano & Cura (MODO OFFLINE apenas) ────────────────────────────
-        // Em modo online, o HP vem do servidor via SetHPFromNetwork().
-        // Estes métodos são mantidos para testes sem servidor.
+        // ── Dano & Cura (MODO OFFLINE apenas) ─────────────────────────────
 
         public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
         {
@@ -242,17 +246,18 @@ namespace RPG.Character
                 crit ? $"CRÍTICO!\n{dmg:0}" : $"{dmg:0}",
                 transform.position + Vector3.up * 2f, color);
 
-            if (CurrentHP <= 0f) DieOffline();
+            if (CurrentHP <= 0f) DieLocal();
         }
 
         public void Heal(float amount)
         {
             if (!IsInitialized || _isDead) return;
-            float before  = CurrentHP;
-            CurrentHP     = Mathf.Min(Stats.MaxHP, CurrentHP + amount);
-            float healed  = CurrentHP - before;
+            float before = CurrentHP;
+            CurrentHP    = Mathf.Min(Stats.MaxHP, CurrentHP + amount);
+            float healed = CurrentHP - before;
             OnHPChanged?.Invoke(CurrentHP, Stats.MaxHP);
-            if (healed > 0f)
+
+            if (healed > 0.1f)
                 FloatingTextManager.Instance?.Show(
                     $"+{healed:0}", transform.position + Vector3.up * 2f, Color.green);
         }
@@ -279,15 +284,17 @@ namespace RPG.Character
             return true;
         }
 
-        // ── HP/MP forçados — usados no respawn (dados vêm do servidor) ────
+        // ── Respawn (dados vêm do servidor) ────────────────────────────────
 
+        /// <summary>
+        /// Força HP e MP — usado no respawn após servidor confirmar novos valores.
+        /// </summary>
         public void ForceSetHP(float hp, float maxHp)
         {
             if (!IsInitialized) return;
             Stats.MaxHP = maxHp;
             CurrentHP   = Mathf.Clamp(hp, 0f, maxHp);
             OnHPChanged?.Invoke(CurrentHP, maxHp);
-            if (CurrentHP <= 0f && !_isDead) DieOffline();
         }
 
         public void ForceSetMP(float mp, float maxMp)
@@ -307,9 +314,9 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, Stats.MaxMP);
         }
 
-        // ── Morte ─────────────────────────────────────────────────────────
+        // ── Morte ──────────────────────────────────────────────────────────
 
-        private void DieOffline()
+        private void DieLocal()
         {
             if (_isDead) return;
             _isDead = true;
@@ -333,13 +340,13 @@ namespace RPG.Character
         public void Respawn(Vector3 position)
         {
             if (!IsInitialized) return;
-            _isDead = false;
+            _isDead            = false;
             transform.position = position;
-            // HP/MP já foram setados via ForceSetHP/ForceSetMP antes de Respawn()
+            _agent?.Warp(position);
             OnDeathChanged?.Invoke(false);
         }
 
-        // ── Regen (modo offline) ──────────────────────────────────────────
+        // ── Regen (modo offline) ───────────────────────────────────────────
 
         private void HandleRegen()
         {
@@ -355,17 +362,19 @@ namespace RPG.Character
             }
         }
 
-        // ── Save (modo offline apenas) ────────────────────────────────────
+        // ── Save (modo offline apenas) ─────────────────────────────────────
 
         public void SaveToData()
         {
             if (!IsInitialized || ManagedByNetwork) return;
             if (GameManager.Instance?.CurrentAccount == null) return;
+
             Data.CurrentHP = CurrentHP;
             Data.CurrentMP = CurrentMP;
             Data.PosX      = transform.position.x;
             Data.PosY      = transform.position.y;
             Data.PosZ      = transform.position.z;
+
             SaveManager.Instance?.SaveCharacter(GameManager.Instance.CurrentAccount, Data);
         }
 
