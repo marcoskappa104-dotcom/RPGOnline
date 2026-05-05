@@ -448,63 +448,53 @@ namespace RPG.Network
         /// NENHUM dado de dano ou stats vem do cliente.
         /// Servidor valida tudo: existência, vida, MP, cooldown, range, aplica dano.
         /// </summary>
-        [Command(requiresAuthority = false)]
-        public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
-        {
-            if (_isDead) return;
+[Command(requiresAuthority = false)]
+public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
+{
+    if (_isDead) return;
 
-            // Encontra o atacante
-            NetworkPlayer attacker = null;
-            foreach (var np in NetworkPlayer.All)
-                if (np != null && np.netId == attackerNetId) { attacker = np; break; }
+    NetworkPlayer attacker = null;
+    foreach (var np in NetworkPlayer.All)
+        if (np != null && np.netId == attackerNetId) { attacker = np; break; }
 
-            if (attacker == null || attacker.Dead) return;
+    if (attacker == null || attacker.Dead) return;
 
-            var atkStats = attacker.ServerStats;
-            if (atkStats == null) return;
+    var atkStats = attacker.ServerStats;
+    if (atkStats == null) return;
 
-            // Busca dados da skill
-            var skill = attacker.GetComponent<SkillSystem>()?.GetSkill(skillIndex);
-            if (skill == null)
-            {
-                attacker.RpcSkillRejected(attacker.connectionToClient, skillIndex, "Skill inválida.");
-                return;
-            }
+    var skill = attacker.GetComponent<SkillSystem>()?.GetSkill(skillIndex);
+    if (skill == null)
+    {
+        // CORREÇÃO: sem NetworkConnection no overload
+        attacker.RpcSkillRejected(skillIndex, "Skill inválida.");
+        return;
+    }
 
-            // Valida e registra cooldown no servidor
-            if (!attacker.ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
-            {
-                attacker.RpcSkillRejected(attacker.connectionToClient, skillIndex,
-                    $"{skill.Name}: ainda em cooldown.");
-                return;
-            }
+    if (!attacker.ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
+    {
+        attacker.RpcSkillRejected(skillIndex, $"{skill.Name}: ainda em cooldown.");
+        return;
+    }
 
-            // Valida MP
-            if (attacker.CurrentMP < skill.ManaCost)
-            {
-                attacker.RpcSkillRejected(attacker.connectionToClient, skillIndex, "MP insuficiente!");
-                return;
-            }
+    if (attacker.CurrentMP < skill.ManaCost)
+    {
+        attacker.RpcSkillRejected(skillIndex, "MP insuficiente!");
+        return;
+    }
 
-            // Valida range (com tolerância de lag)
-            float dist = Vector3.Distance(attacker.transform.position, transform.position);
-            if (dist > skill.Range + SKILL_RANGE_TOLERANCE)
-            {
-                Debug.LogWarning($"[Server] {attacker.CharacterName} range suspeito: " +
-                                 $"dist={dist:0.1} range={skill.Range}");
-                // Para anti-cheat rigoroso descomente:
-                // attacker.RpcSkillRejected(...); return;
-            }
+    float dist = Vector3.Distance(attacker.transform.position, transform.position);
+    if (dist > skill.Range + SKILL_RANGE_TOLERANCE)
+    {
+        Debug.LogWarning($"[Server] {attacker.CharacterName} range suspeito: " +
+                         $"dist={dist:0.1} range={skill.Range}");
+    }
 
-            // Consome MP no servidor
-            attacker.ServerConsumeMP(skill.ManaCost);
+    attacker.ServerConsumeMP(skill.ManaCost);
+    ServerTakeDamageFromPlayer(attacker, atkStats, skillIndex, isPhysical, skill);
 
-            // Calcula e aplica dano
-            ServerTakeDamageFromPlayer(attacker, atkStats, skillIndex, isPhysical, skill);
-
-            // Confirma para o cliente (inicia cooldown visual)
-            attacker.RpcSkillConfirmed(attacker.connectionToClient, skillIndex, skill.Cooldown);
-        }
+    // CORREÇÃO: sem NetworkConnection no overload
+    attacker.RpcSkillConfirmed(skillIndex, skill.Cooldown);
+}
 
         [Server]
         private void ServerTakeDamageFromPlayer(

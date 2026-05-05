@@ -8,20 +8,22 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// ClientAuthHandler v3
+    /// ClientAuthHandler v4
     ///
-    /// CORREÇÕES:
-    ///   - OnSelectCharacterResponse: carrega GameplayScene diretamente aqui
-    ///     após confirmação do servidor (era responsabilidade de ninguém antes).
-    ///   - Aguarda a GameplayScene carregar completamente antes de permitir
-    ///     que o Mirror processe SpawnMessages de monstros/players.
-    ///     Isso resolve "Failed to create agent because there is no valid NavMesh".
+    /// CORREÇÃO PRINCIPAL:
+    ///   Após carregar a GameplayScene, aguarda o carregamento completar via
+    ///   SceneManager.sceneLoaded e então envia MsgClientSceneReady ao servidor.
+    ///   O servidor só spawna o player após receber essa confirmação.
+    ///
+    ///   Isso resolve definitivamente:
+    ///     - "Failed to create agent because there is no valid NavMesh"
+    ///     - Player e monstros não aparecendo no cliente
+    ///     - "Did not find target for sync message"
     /// </summary>
     public class ClientAuthHandler : MonoBehaviour
     {
         public static ClientAuthHandler Instance { get; private set; }
 
-        // ── Eventos para as UIs ────────────────────────────────────────────
         public event Action<bool, string>                         OnLoginResult;
         public event Action<bool, string>                         OnCreateAccountResult;
         public event Action<List<CharacterSummary>>               OnCharacterListReceived;
@@ -30,6 +32,7 @@ namespace RPG.Network
         public event Action                                       OnServerDisconnected;
 
         private bool _handlersRegistered = false;
+        private bool _waitingForSceneToLoad = false;
 
         private void Awake()
         {
@@ -48,6 +51,7 @@ namespace RPG.Network
         {
             NetworkClient.OnConnectedEvent    -= OnClientConnected;
             NetworkClient.OnDisconnectedEvent -= OnClientDisconnectedEvent;
+            SceneManager.sceneLoaded          -= OnSceneLoaded;
         }
 
         private void OnClientConnected()
@@ -66,7 +70,9 @@ namespace RPG.Network
 
         private void OnClientDisconnectedEvent()
         {
-            _handlersRegistered = false;
+            _handlersRegistered   = false;
+            _waitingForSceneToLoad = false;
+            SceneManager.sceneLoaded -= OnSceneLoaded;
         }
 
         public void OnDisconnectedFromServer()
@@ -140,15 +146,53 @@ namespace RPG.Network
 
         private void OnSelectCharacterResponse(MsgSelectCharacterResponse msg)
         {
-            // Notifica a UI (para esconder botões, etc.)
             OnSelectCharacterResult?.Invoke(msg.Success, msg.Error);
 
             if (!msg.Success) return;
 
-            // CORREÇÃO PRINCIPAL: carrega a GameplayScene aqui.
-            // O servidor já spawnará o player quando a cena estiver pronta.
             Debug.Log("[ClientAuthHandler] Personagem selecionado. Carregando GameplayScene...");
+
+            // Registra callback ANTES de carregar a cena
+            _waitingForSceneToLoad = true;
+            SceneManager.sceneLoaded += OnSceneLoaded;
+
             SceneManager.LoadScene(Managers.GameManager.SCENE_GAMEPLAY);
+        }
+
+        /// <summary>
+        /// Chamado pelo Unity quando qualquer cena termina de carregar.
+        /// Quando for a GameplayScene, envia confirmação ao servidor.
+        /// </summary>
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            if (!_waitingForSceneToLoad) return;
+            if (scene.name != Managers.GameManager.SCENE_GAMEPLAY) return;
+
+            // Remove o listener para não disparar em cenas futuras
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+            _waitingForSceneToLoad    = false;
+
+            Debug.Log("[ClientAuthHandler] GameplayScene carregada. Notificando servidor...");
+
+            // Pequeno delay para garantir que todos os Awake/Start da cena rodaram
+            StartCoroutine(SendReadyAfterFrame());
+        }
+
+        private System.Collections.IEnumerator SendReadyAfterFrame()
+        {
+            // Aguarda 2 frames para garantir que NavMesh e todos os scripts iniciaram
+            yield return null;
+            yield return null;
+
+            if (NetworkClient.isConnected)
+            {
+                NetworkClient.Send(new MsgClientSceneReady());
+                Debug.Log("[ClientAuthHandler] MsgClientSceneReady enviado ao servidor.");
+            }
+            else
+            {
+                Debug.LogWarning("[ClientAuthHandler] Sem conexão ao tentar enviar MsgClientSceneReady.");
+            }
         }
     }
 }

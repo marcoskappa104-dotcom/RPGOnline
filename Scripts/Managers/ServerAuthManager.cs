@@ -7,7 +7,12 @@ using System.Collections.Generic;
 namespace RPG.Network
 {
     /// <summary>
-    /// ServerAuthManager v3 — corrige CS1503: assinatura errada em RequireAuth.
+    /// ServerAuthManager v4
+    ///
+    /// MUDANÇA EM RELAÇÃO À v3:
+    ///   OnSelectCharacter NÃO envia mais MsgSelectCharacterResponse diretamente.
+    ///   Delega para RPGNetworkManager.SpawnPlayerForConnection, que envia a resposta
+    ///   após colocar o spawn na fila (aguardando confirmação do cliente).
     /// </summary>
     public class ServerAuthManager : MonoBehaviour
     {
@@ -71,7 +76,6 @@ namespace RPG.Network
             var account = SaveManager.Instance?.LoadAccount(msg.Username);
             if (account == null || account.PasswordHash != msg.PasswordHash)
             {
-                Debug.Log($"[ServerAuth] Login falhou para '{msg.Username}'");
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Usuário ou senha incorretos." });
                 return;
             }
@@ -88,7 +92,6 @@ namespace RPG.Network
 
         private void OnCreateAccountRequest(NetworkConnectionToClient conn, MsgCreateAccountRequest msg)
         {
-            Debug.Log($"[ServerAuth] Criar conta: '{msg.Username}'");
             var error = SaveManager.Instance?.TryCreateAccount(msg.Username, msg.PasswordHash, alreadyHashed: true);
             if (error != null)
             {
@@ -103,9 +106,7 @@ namespace RPG.Network
 
         private void OnRequestCharacterList(NetworkConnectionToClient conn, MsgRequestCharacterList msg)
         {
-            // CORREÇÃO: RequireAuth agora recebe apenas ConnData e AccountData
-            // — sem o parâmetro da mensagem que causava o CS1503.
-            if (!RequireAuth(conn, out var session, out var account)) return;
+            if (!RequireAuth(conn, out _, out var account)) return;
             SendCharacterList(conn, account);
         }
 
@@ -136,7 +137,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Recarrega para pegar o personagem recém-criado
             account = SaveManager.Instance?.LoadAccount(session.Username);
             var list = new List<CharacterSummary>();
             if (account != null)
@@ -174,20 +174,20 @@ namespace RPG.Network
             session.State       = ConnState.InGame;
             session.CharacterId = msg.CharacterId;
 
-            conn.Send(new MsgSelectCharacterResponse { Success = true });
+            // MUDANÇA v4: NÃO envia MsgSelectCharacterResponse aqui.
+            // RPGNetworkManager.SpawnPlayerForConnection envia a resposta após
+            // colocar o spawn na fila, aguardando MsgClientSceneReady do cliente.
             RPGNetworkManager.singleton?.SpawnPlayerForConnection(conn, charData, session.Username);
-            Debug.Log($"[ServerAuth] {charData.CharacterName} entrou no jogo (conn:{conn.connectionId})");
+
+            Debug.Log($"[ServerAuth] {charData.CharacterName} ({charData.Race}) entrou no jogo (conn:{conn.connectionId})");
         }
 
-        // ── RequireAuth — CORRIGIDO ────────────────────────────────────────
-        // Assinatura correta: apenas ConnData e AccountData como out.
-        // O erro CS1503 acontecia porque estava usando o tipo da mensagem
-        // (MsgRequestCharacterList) no lugar de ConnData.
+        // ── RequireAuth ────────────────────────────────────────────────────
 
         private bool RequireAuth(
             NetworkConnectionToClient conn,
-            out ConnData              session,
-            out AccountData           account)
+            out ConnData  session,
+            out AccountData account)
         {
             account = null;
 
