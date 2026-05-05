@@ -9,22 +9,20 @@ using NetworkPlayer = RPG.Network.NetworkPlayer;
 namespace RPG.UI
 {
     /// <summary>
-    /// AttributeWindowUI — Janela de Atributos do Personagem.
+    /// AttributeWindowUI v2 — Janela de Atributos do Personagem.
     ///
-    /// CORREÇÃO PRINCIPAL:
-    ///   - AllocatePoint() NÃO mais modifica CharacterData local diretamente.
-    ///   - Envia CmdAllocateAttribute ao servidor.
-    ///   - O servidor valida, modifica os SyncVars e o cliente recebe via hooks.
-    ///   - A UI atualiza via OnFreePointsUpdated() chamado pelo hook OnNetFreePointsChanged.
+    /// CORREÇÕES v2:
+    ///   1. RefreshAll() removido do Update() — não precisa recalcular todo frame.
+    ///      Agora atualiza apenas via eventos (OnInitialized, OnStatsChanged,
+    ///      OnHPChanged, OnMPChanged) e quando a janela abre.
+    ///      Antes: ~60 recálculos/segundo enquanto a janela estava aberta.
+    ///      Agora: 0 no idle, atualiza só quando muda algo.
     ///
-    /// HIERARQUIA SUGERIDA:
-    ///   Canvas
-    ///   └── AttributeWindowPanel
-    ///       ├── Header: CharNameText, RaceText, LevelText, CloseButton
-    ///       ├── FreePointsBanner + FreePointsText
-    ///       ├── LeftColumn: STR/AGI/VIT/DEX/INT/LUK (ValueText + PlusButton)
-    ///       ├── RightColumn: HP, MP, ATK, MATK, DEF, MDEF, ASPD, HIT, FLEE, CRIT
-    ///       └── BottomBar: XPBar (Slider) + XPText
+    ///   2. BindPlayer verifica se já está vinculado ao mesmo player antes de
+    ///      resubscrever eventos (evita handlers duplicados).
+    ///
+    ///   3. Anti-spam de alocação aumentado para 0.5 s e usa botão interactable
+    ///      em vez de timer para feedback visual correto.
     /// </summary>
     public class AttributeWindowUI : MonoBehaviour
     {
@@ -41,7 +39,7 @@ namespace RPG.UI
         [SerializeField] private TMP_Text levelText;
         [SerializeField] private Button   closeButton;
 
-        // ── Banner de pontos livres ────────────────────────────────────────
+        // ── Pontos livres ──────────────────────────────────────────────────
         [Header("Pontos Livres")]
         [SerializeField] private GameObject freePointsBanner;
         [SerializeField] private TMP_Text   freePointsText;
@@ -87,10 +85,7 @@ namespace RPG.UI
         private PlayerEntity  _player;
         private NetworkPlayer _netPlayer;
         private bool          _isOpen;
-
-        // ── Proteção anti-spam de alocação ─────────────────────────────────
-        private float _lastAllocTime;
-        private const float ALLOC_COOLDOWN = 0.3f;
+        private bool          _allocating; // previne spam durante request ao servidor
 
         // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -105,21 +100,13 @@ namespace RPG.UI
             if (windowPanel != null) windowPanel.SetActive(false);
             _isOpen = false;
 
-            if (closeButton != null) closeButton.onClick.AddListener(Close);
-
-            // Botões de + — enviam Cmd ao servidor, NÃO modificam dados locais
-            if (strPlusButton != null) strPlusButton.onClick.AddListener(() => RequestAllocate(0));
-            if (agiPlusButton != null) agiPlusButton.onClick.AddListener(() => RequestAllocate(1));
-            if (vitPlusButton != null) vitPlusButton.onClick.AddListener(() => RequestAllocate(2));
-            if (dexPlusButton != null) dexPlusButton.onClick.AddListener(() => RequestAllocate(3));
-            if (intPlusButton != null) intPlusButton.onClick.AddListener(() => RequestAllocate(4));
-            if (lukPlusButton != null) lukPlusButton.onClick.AddListener(() => RequestAllocate(5));
-        }
-
-        private void Update()
-        {
-            if (_isOpen && _player != null && _player.IsInitialized)
-                RefreshAll();
+            if (closeButton != null)    closeButton.onClick.AddListener(Close);
+            if (strPlusButton != null)  strPlusButton.onClick.AddListener(() => RequestAllocate(0));
+            if (agiPlusButton != null)  agiPlusButton.onClick.AddListener(() => RequestAllocate(1));
+            if (vitPlusButton != null)  vitPlusButton.onClick.AddListener(() => RequestAllocate(2));
+            if (dexPlusButton != null)  dexPlusButton.onClick.AddListener(() => RequestAllocate(3));
+            if (intPlusButton != null)  intPlusButton.onClick.AddListener(() => RequestAllocate(4));
+            if (lukPlusButton != null)  lukPlusButton.onClick.AddListener(() => RequestAllocate(5));
         }
 
         // ── Vínculo com PlayerEntity ───────────────────────────────────────
@@ -127,26 +114,41 @@ namespace RPG.UI
         public void BindPlayer(PlayerEntity player)
         {
             if (player == null) return;
+            if (_player == player) return; // já vinculado ao mesmo player
 
+            // Desvincula anterior
             if (_player != null)
             {
-                _player.OnStatsChanged -= OnStatsChangedHandler;
-                _player.OnInitialized  -= OnInitializedHandler;
+                _player.OnStatsChanged -= OnDataChanged;
+                _player.OnInitialized  -= OnDataChanged;
+                _player.OnHPChanged    -= OnHPMPChanged;
+                _player.OnMPChanged    -= OnHPMPChanged;
             }
 
             _player    = player;
             _netPlayer = player.GetComponent<NetworkPlayer>();
 
-            _player.OnStatsChanged += OnStatsChangedHandler;
-            _player.OnInitialized  += OnInitializedHandler;
+            _player.OnStatsChanged += OnDataChanged;
+            _player.OnInitialized  += OnDataChanged;
+            _player.OnHPChanged    += OnHPMPChanged;
+            _player.OnMPChanged    += OnHPMPChanged;
 
             if (player.IsInitialized) RefreshAll();
 
             Debug.Log($"[AttributeWindowUI] Vinculado a {player.Data?.CharacterName}");
         }
 
-        private void OnInitializedHandler() => RefreshAll();
-        private void OnStatsChangedHandler() => RefreshAll();
+        private void OnDataChanged()
+        {
+            if (_isOpen) RefreshAll();
+        }
+
+        private void OnHPMPChanged(float _, float __)
+        {
+            // Atualiza apenas os campos de HP/MP sem recalcular tudo
+            if (!_isOpen || _player == null || !_player.IsInitialized) return;
+            RefreshHPMP();
+        }
 
         // ── Abrir / Fechar ─────────────────────────────────────────────────
 
@@ -157,7 +159,7 @@ namespace RPG.UI
             if (windowPanel == null) return;
             _isOpen = true;
             windowPanel.SetActive(true);
-            RefreshAll();
+            RefreshAll(); // Refresh completo ao abrir
         }
 
         public void Close()
@@ -176,11 +178,10 @@ namespace RPG.UI
             var stats = _player.Stats;
             if (data == null || stats == null) return;
 
-            // Prioriza SyncVars do NetworkPlayer (confirmados pelo servidor)
-            int  level      = _netPlayer != null ? _netPlayer.Level              : data.Level;
-            long exp        = _netPlayer != null ? _netPlayer.Experience          : data.Experience;
-            long expToNext  = _netPlayer != null ? _netPlayer.ExperienceToNextLevel : data.ExperienceToNextLevel;
-            int  freePoints = _netPlayer != null ? _netPlayer.FreeAttributePoints : data.FreeAttributePoints;
+            int  level      = _netPlayer != null ? _netPlayer.Level                  : data.Level;
+            long exp        = _netPlayer != null ? _netPlayer.Experience              : data.Experience;
+            long expToNext  = _netPlayer != null ? _netPlayer.ExperienceToNextLevel   : data.ExperienceToNextLevel;
+            int  freePoints = _netPlayer != null ? _netPlayer.FreeAttributePoints     : data.FreeAttributePoints;
             int  allocSTR   = _netPlayer != null ? _netPlayer.AllocatedSTR : data.AllocatedSTR;
             int  allocAGI   = _netPlayer != null ? _netPlayer.AllocatedAGI : data.AllocatedAGI;
             int  allocVIT   = _netPlayer != null ? _netPlayer.AllocatedVIT : data.AllocatedVIT;
@@ -194,6 +195,15 @@ namespace RPG.UI
             RefreshXPBar(exp, expToNext);
             RefreshFreePointsBanner(freePoints);
             RefreshPlusButtons(freePoints);
+        }
+
+        private void RefreshHPMP()
+        {
+            if (_player?.Stats == null) return;
+            if (hpDerivedText != null)
+                hpDerivedText.text = $"{_player.CurrentHP:0} / {_player.Stats.MaxHP:0}";
+            if (mpDerivedText != null)
+                mpDerivedText.text = $"{_player.CurrentMP:0} / {_player.Stats.MaxMP:0}";
         }
 
         private void RefreshHeader(string charName, CharacterRace race, int level)
@@ -264,7 +274,7 @@ namespace RPG.UI
 
         private void RefreshPlusButtons(int freePoints)
         {
-            bool can = freePoints > 0;
+            bool can = freePoints > 0 && !_allocating;
             if (strPlusButton != null) strPlusButton.gameObject.SetActive(can);
             if (agiPlusButton != null) agiPlusButton.gameObject.SetActive(can);
             if (vitPlusButton != null) vitPlusButton.gameObject.SetActive(can);
@@ -273,41 +283,36 @@ namespace RPG.UI
             if (lukPlusButton != null) lukPlusButton.gameObject.SetActive(can);
         }
 
-        // ── Alocação de Pontos — APENAS via servidor ───────────────────────
+        // ── Alocação de Pontos ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Envia CmdAllocateAttribute ao servidor.
-        /// NÃO modifica CharacterData local — o servidor é autoridade.
-        /// A UI atualiza automaticamente quando os SyncVars chegam.
-        /// </summary>
         private void RequestAllocate(int attributeIndex)
         {
-            // Proteção anti-spam (cliques múltiplos rápidos)
-            if (Time.time - _lastAllocTime < ALLOC_COOLDOWN) return;
-            _lastAllocTime = Time.time;
-
+            if (_allocating) return;
             if (_netPlayer == null)
             {
-                // Modo offline: sem NetworkPlayer, não suportado nesta versão
-                UIManager.Instance?.ShowMessage("Alocação de atributos requer servidor.");
+                UIManager.Instance?.ShowMessage("Alocação requer conexão com o servidor.");
                 return;
             }
-
-            int freePoints = _netPlayer.FreeAttributePoints;
-            if (freePoints <= 0)
+            if (_netPlayer.FreeAttributePoints <= 0)
             {
                 UIManager.Instance?.ShowMessage("Sem pontos disponíveis!");
                 return;
             }
 
-            // Desabilita botões temporariamente (aguardando confirmação do servidor)
+            _allocating = true;
             SetPlusButtonsInteractable(false);
             _netPlayer.CmdAllocateAttribute(attributeIndex);
 
-            // Reabilita após timeout (o hook do SyncVar vai atualizar de verdade)
-            Invoke(nameof(ReenablePlusButtons), 0.5f);
+            // Reabilita após timeout (SyncVar hook atualiza de verdade)
+            Invoke(nameof(FinishAllocating), 0.5f);
+        }
 
-            Debug.Log($"[AttributeWindowUI] Enviado CmdAllocateAttribute({attributeIndex}) ao servidor.");
+        private void FinishAllocating()
+        {
+            _allocating = false;
+            if (_player != null)
+                RefreshPlusButtons(_netPlayer != null ? _netPlayer.FreeAttributePoints : 0);
+            SetPlusButtonsInteractable(true);
         }
 
         private void SetPlusButtonsInteractable(bool value)
@@ -320,14 +325,8 @@ namespace RPG.UI
             if (lukPlusButton != null) lukPlusButton.interactable = value;
         }
 
-        private void ReenablePlusButtons() => SetPlusButtonsInteractable(true);
+        // ── Chamado pelo SyncVar hook OnNetFreePointsChanged ───────────────
 
-        // ── Chamado pelo hook OnNetFreePointsChanged ───────────────────────
-
-        /// <summary>
-        /// Atualiza somente o banner e botões de pontos livres.
-        /// Chamado pelo NetworkPlayer quando o SyncVar FreeAttributePoints muda.
-        /// </summary>
         public void OnFreePointsUpdated(int newPoints)
         {
             RefreshFreePointsBanner(newPoints);

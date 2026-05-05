@@ -6,35 +6,71 @@ using RPG.Character;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkUIConnector — conecta o UIManager e o DeathScreenUI ao player local
-    /// após o spawn na rede.
+    /// NetworkUIConnector v3 — conecta UIManager ao player local.
     ///
-    /// CORREÇÃO: aguarda tanto o PlayerEntity quanto o NetworkPlayer estarem prontos
-    /// antes de tentar conectar o HUD, evitando NullReferenceException no startup.
+    /// CORREÇÃO v3:
+    ///   - Removido NetworkClient.OnSpawnedObject (não existe no Mirror)
+    ///   - Mantido fluxo simples e seguro usando TryConnect + retry leve
     /// </summary>
     public class NetworkUIConnector : MonoBehaviour
     {
-        private bool  _connected;
+        private bool _connected;
         private float _retryTimer;
-        private const float RETRY_INTERVAL = 0.2f;
+
+        private void Start()
+        {
+            TryConnect();
+        }
 
         private void Update()
         {
             if (_connected) return;
 
+            // retry leve (sem custo alto)
             _retryTimer += Time.deltaTime;
-            if (_retryTimer < RETRY_INTERVAL) return;
-            _retryTimer = 0f;
+            if (_retryTimer >= 0.5f)
+            {
+                _retryTimer = 0f;
+                TryConnect();
+            }
+        }
 
+        private void TryConnect()
+        {
+            if (_connected) return;
             if (!NetworkClient.active) return;
             if (NetworkClient.localPlayer == null) return;
 
             var playerEntity = NetworkClient.localPlayer.GetComponent<PlayerEntity>();
-            if (playerEntity == null || !playerEntity.IsInitialized) return;
+            if (playerEntity == null) return;
 
-            UIManager.Instance?.BindLocalPlayer(playerEntity);
+            if (playerEntity.IsInitialized)
+            {
+                BindUI(playerEntity);
+            }
+            else
+            {
+                // evita múltiplos binds
+                playerEntity.OnInitialized -= OnPlayerInitialized;
+                playerEntity.OnInitialized += OnPlayerInitialized;
+            }
+        }
+
+        private void OnPlayerInitialized()
+        {
+            if (_connected) return;
+
+            var playerEntity = NetworkClient.localPlayer.GetComponent<PlayerEntity>();
+            if (playerEntity != null)
+                BindUI(playerEntity);
+        }
+
+        private void BindUI(PlayerEntity playerEntity)
+        {
+            if (_connected) return;
             _connected = true;
 
+            UIManager.Instance?.BindLocalPlayer(playerEntity);
             Debug.Log("[NetworkUIConnector] HUD conectado ao player local.");
         }
     }
