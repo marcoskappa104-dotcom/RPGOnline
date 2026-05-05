@@ -8,13 +8,13 @@ using RPG.Combat;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController v4 — Server-Authoritative
+    /// NetworkPlayerController v5 — Server-Authoritative
     ///
-    /// MUDANÇAS:
-    ///   - SetEnabled() exposto publicamente para NetworkPlayer ativar/desativar
-    ///     no respawn e na morte.
-    ///   - Cursor nunca some.
-    ///   - Movimento local (predição) + CmdMoveTo no servidor.
+    /// CORREÇÃO v5:
+    ///   - Usa CancelPendingWalk() em vez de CancelPendingAction()
+    ///     (renomeado no SkillSystem novo).
+    ///   - SetEnabled() público para NetworkPlayer usar na morte/respawn.
+    ///   - Cursor nunca some (sem CursorLockMode.Locked).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
@@ -35,7 +35,6 @@ namespace RPG.Network
         private SkillSystem  _skillSystem;
         private Camera       _cam;
 
-        // Câmera
         private float _yaw      = 45f;
         private float _pitch    = 45f;
         private float _distance = 12f;
@@ -105,7 +104,8 @@ namespace RPG.Network
                 var targetable = tHit.collider.GetComponentInParent<ITargetable>();
                 if (targetable != null && !targetable.IsDead)
                 {
-                    _skillSystem?.CancelPendingAction();
+                    // Usa CancelPendingWalk (nome correto no SkillSystem novo)
+                    _skillSystem?.CancelPendingWalk();
                     _playerEntity?.SetTarget(targetable);
                     UIManager.Instance?.UpdateTargetPanel(targetable);
                     return;
@@ -116,7 +116,7 @@ namespace RPG.Network
             if (terrainLayer != 0 &&
                 Physics.Raycast(ray, out RaycastHit gHit, 300f, terrainLayer))
             {
-                _skillSystem?.CancelPendingAction();
+                _skillSystem?.CancelPendingWalk();
                 _playerEntity?.ClearTarget();
                 UIManager.Instance?.ClearTargetPanel();
 
@@ -124,6 +124,7 @@ namespace RPG.Network
                 if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                     dest = navHit.position;
 
+                // Predição local + confirma no servidor
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.SetDestination(dest);
 
@@ -132,7 +133,7 @@ namespace RPG.Network
                 return;
             }
 
-            // 3. Fallback
+            // 3. Fallback (sem layers configuradas)
             if (terrainLayer == 0 && targetableLayer == 0 &&
                 Physics.Raycast(ray, out RaycastHit hitAny, 300f))
             {
@@ -149,7 +150,7 @@ namespace RPG.Network
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.SetDestination(dest);
                 CmdMoveTo(dest);
-                _skillSystem?.CancelPendingAction();
+                _skillSystem?.CancelPendingWalk();
                 _playerEntity?.ClearTarget();
                 UIManager.Instance?.ClearTargetPanel();
             }

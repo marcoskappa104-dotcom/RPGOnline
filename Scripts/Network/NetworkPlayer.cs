@@ -5,70 +5,71 @@ using RPG.Data;
 using RPG.UI;
 using RPG.Managers;
 using RPG.Character;
+using RPG.Combat;
 using System.Collections.Generic;
 using System;
 
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v5 — TOTALMENTE SERVER-AUTHORITATIVE
+    /// NetworkPlayer v6 — TOTALMENTE SERVER-AUTHORITATIVE
     ///
-    /// FLUXO:
-    ///   1. RPGNetworkManager spawna o player e chama ServerInitialize(charData, username).
-    ///   2. Servidor calcula tudo e seta SyncVars.
-    ///   3. RpcInitializeLocalPlayer envia os dados ao cliente local para exibição.
-    ///   4. NENHUM dado de gameplay (HP, dano, XP) vem do cliente.
-    ///
-    /// REMOVIDO:
-    ///   - CmdRegisterCharacter (dados vêm direto do servidor via ServerInitialize).
-    ///   - Qualquer leitura de GameManager no lado server.
-    ///   - SelectedCharacter / CurrentAccount no servidor.
+    /// CORREÇÕES v6:
+    ///   - Usa PlayerEntity.InitializeFromServer() em vez de Initialize().
+    ///   - Usa PlayerEntity.OnServerDeath() em vez de OnNetworkDeath().
+    ///   - Usa PlayerEntity.OnServerRespawn() em vez de ForceSetHP/ForceSetMP/Respawn.
+    ///   - Usa PlayerEntity.SetHPFromServer() / SetMPFromServer().
+    ///   - Removido ManagedByNetwork (PlayerEntity não tem mais este campo).
+    ///   - Adicionados ServerConsumeMP / RpcSkillConfirmed / RpcSkillRejected
+    ///     (chamados pelo NetworkMonsterEntity ao processar skills).
+    ///   - Cooldowns de skill gerenciados no servidor (_serverSkillCooldowns).
+    ///   - FreeAttributePoints no ServerGrantExp corrigido (estava +1+4 por loop).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
     [RequireComponent(typeof(NetworkTransformReliable))]
     public class NetworkPlayer : NetworkBehaviour, ITargetable
     {
-        // ── Registro estático (servidor) ───────────────────────────────
+        // ── Registro estático (servidor) ───────────────────────────────────
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        // ── Limites anti-cheat ─────────────────────────────────────────
-        private const int   MAX_LEVEL      = 99;
-        private const float MAX_HP_CAP     = 500_000f;
-        private const float MAX_MP_CAP     = 200_000f;
+        // ── Caps anti-cheat ────────────────────────────────────────────────
+        private const int   MAX_LEVEL  = 99;
+        private const float MAX_HP_CAP = 500_000f;
+        private const float MAX_MP_CAP = 200_000f;
 
-        // ── SyncVars ───────────────────────────────────────────────────
-        [SyncVar(hook = nameof(OnNameChanged))]
+        // ── SyncVars ───────────────────────────────────────────────────────
+        [SyncVar(hook = nameof(OnNetNameChanged))]
         public string CharacterName = "...";
 
         [SyncVar]
         public string RaceStr = "Human";
 
-        [SyncVar(hook = nameof(OnLevelChanged))]
+        [SyncVar(hook = nameof(OnNetLevelChanged))]
         public int Level = 1;
 
-        [SyncVar(hook = nameof(OnHPChanged))]
+        [SyncVar(hook = nameof(OnNetHPChanged))]
         public float CurrentHP = 0f;
 
-        [SyncVar(hook = nameof(OnMaxHPChanged))]
+        [SyncVar(hook = nameof(OnNetMaxHPChanged))]
         public float MaxHP = 1f;
 
-        [SyncVar(hook = nameof(OnMPChanged))]
+        [SyncVar(hook = nameof(OnNetMPChanged))]
         public float CurrentMP = 0f;
 
-        [SyncVar(hook = nameof(OnMaxMPChanged))]
+        [SyncVar(hook = nameof(OnNetMaxMPChanged))]
         public float MaxMP = 1f;
 
-        [SyncVar(hook = nameof(OnMovingChanged))]
+        [SyncVar(hook = nameof(OnNetMovingChanged))]
         public bool IsMoving = false;
 
-        [SyncVar(hook = nameof(OnExpChanged))]
+        [SyncVar]
         public long Experience = 0;
 
         [SyncVar]
         public long ExperienceToNextLevel = 100;
 
-        [SyncVar(hook = nameof(OnFreePointsChanged))]
+        [SyncVar(hook = nameof(OnNetFreePointsChanged))]
         public int FreeAttributePoints = 0;
 
         [SyncVar] public int AllocatedSTR = 0;
@@ -78,7 +79,7 @@ namespace RPG.Network
         [SyncVar] public int AllocatedINT = 0;
         [SyncVar] public int AllocatedLUK = 0;
 
-        // ── ITargetable ────────────────────────────────────────────────
+        // ── ITargetable ────────────────────────────────────────────────────
         string  ITargetable.DisplayName => CharacterName;
         float   ITargetable.CurrentHP   => CurrentHP;
         float   ITargetable.MaxHP       => MaxHP;
@@ -90,11 +91,7 @@ namespace RPG.Network
         public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
             => Debug.Log("[NetworkPlayer] PvP não implementado.");
 
-        // ── Componentes ────────────────────────────────────────────────
-        private NavMeshAgent _agent;
-        private Animator     _animator;
-        private PlayerEntity _playerEntity;
-
+        // ── Componentes serializados ───────────────────────────────────────
         [Header("Visuals")]
         [SerializeField] private GameObject            selectionIndicator;
         [SerializeField] private TMPro.TMP_Text        nameTagText;
@@ -103,20 +100,31 @@ namespace RPG.Network
         [Header("Spawn Points (fallback)")]
         [SerializeField] private Transform[] spawnPoints;
 
-        // ── Throttle de IsMoving ───────────────────────────────────────
-        private float _lastMovingCmdTime;
-        private const float MOVING_CMD_INTERVAL = 0.1f;
+        // ── Componentes em runtime ─────────────────────────────────────────
+        private NavMeshAgent _agent;
+        private Animator     _animator;
+        private PlayerEntity _playerEntity;
 
+        // ── Estado público ─────────────────────────────────────────────────
         public bool Dead => CurrentHP <= 0f;
 
-        // ── Dados autoritativos (SERVIDOR) ─────────────────────────────
+        // ── Dados autoritativos no servidor ───────────────────────────────
         private CharacterData _serverCharData;
         private DerivedStats  _serverStats;
         private string        _serverAccountUsername;
 
+        /// <summary>Stats autoritativos — acessados pelo NetworkMonsterEntity.</summary>
         public DerivedStats ServerStats => _serverStats;
 
-        // ── Lifecycle ──────────────────────────────────────────────────
+        // ── Cooldowns de skill no servidor (anti-cheat) ───────────────────
+        // Chave = índice da skill, Valor = timestamp em que o cooldown termina
+        private readonly Dictionary<int, float> _serverSkillCooldowns = new();
+
+        // ── Throttle de IsMoving ───────────────────────────────────────────
+        private float _lastMovingCmdTime;
+        private const float MOVING_CMD_INTERVAL = 0.1f;
+
+        // ── Lifecycle ──────────────────────────────────────────────────────
 
         private void Awake()
         {
@@ -136,10 +144,8 @@ namespace RPG.Network
 
         public override void OnStartLocalPlayer()
         {
+            _playerEntity = GetComponent<PlayerEntity>();
             Debug.Log("[NetworkPlayer] Local player ativo — aguardando RpcInitializeLocalPlayer.");
-
-            if (_playerEntity != null)
-                _playerEntity.ManagedByNetwork = true;
         }
 
         private void Update()
@@ -154,7 +160,7 @@ namespace RPG.Network
             }
         }
 
-        // ── Inicialização pelo servidor ────────────────────────────────
+        // ── Inicialização pelo servidor ────────────────────────────────────
 
         /// <summary>
         /// Chamado SOMENTE pelo RPGNetworkManager após spawn.
@@ -170,7 +176,6 @@ namespace RPG.Network
             float maxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
             float maxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
 
-            // Seta SyncVars
             CharacterName         = charData.CharacterName;
             RaceStr               = charData.Race.ToString();
             Level                 = charData.Level;
@@ -191,7 +196,6 @@ namespace RPG.Network
             CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP)
                         ? charData.CurrentMP : maxMP;
 
-            // Posiciona o player
             if (charData.PosX != 0f || charData.PosY != 0f || charData.PosZ != 0f)
             {
                 var pos = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
@@ -202,13 +206,9 @@ namespace RPG.Network
             Debug.Log($"[Server] {charData.CharacterName} inicializado | " +
                       $"HP:{CurrentHP:0}/{MaxHP:0} | Lv:{Level} | Conta:{accountUsername}");
 
-            // Inicializa o cliente local
             RpcInitializeLocalPlayer(
-                charData.CharacterName,
-                charData.Race,
-                charData.Level,
-                charData.Experience,
-                charData.ExperienceToNextLevel,
+                charData.CharacterName, charData.Race, charData.Level,
+                charData.Experience, charData.ExperienceToNextLevel,
                 charData.FreeAttributePoints,
                 charData.AllocatedSTR, charData.AllocatedAGI, charData.AllocatedVIT,
                 charData.AllocatedDEX, charData.AllocatedINT, charData.AllocatedLUK,
@@ -218,7 +218,7 @@ namespace RPG.Network
             );
         }
 
-        // ── Commands ───────────────────────────────────────────────────
+        // ── Commands (cliente → servidor) ──────────────────────────────────
 
         [Command]
         public void CmdSetMoving(bool moving) => IsMoving = moving;
@@ -226,8 +226,7 @@ namespace RPG.Network
         [Command]
         public void CmdAllocateAttribute(int attributeIndex)
         {
-            if (FreeAttributePoints <= 0) return;
-            if (_serverCharData == null) return;
+            if (FreeAttributePoints <= 0 || _serverCharData == null) return;
             if (attributeIndex < 0 || attributeIndex > 5) return;
 
             FreeAttributePoints--;
@@ -255,7 +254,63 @@ namespace RPG.Network
         [Command]
         public void CmdRequestRespawn() => ServerRespawn();
 
-        // ── Métodos de servidor ────────────────────────────────────────
+        // ── Self Skill (heal / buff) — Command para o próprio player ───────
+
+        /// <summary>
+        /// Cliente pede ao servidor para executar uma skill de self/heal.
+        /// Servidor valida MP, cooldown e executa o efeito.
+        /// </summary>
+        [Command]
+        public void CmdRequestSelfSkill(int skillIndex)
+        {
+            if (Dead) return;
+            if (_serverStats == null) return;
+
+            var skillSystem = GetComponent<SkillSystem>();
+            var skill = skillSystem?.GetSkill(skillIndex);
+            if (skill == null)
+            {
+                RpcSkillRejected(connectionToClient, skillIndex, "Skill inválida.");
+                return;
+            }
+
+            // Valida cooldown no servidor
+            if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime) &&
+                Time.time < endTime)
+            {
+                float remaining = endTime - Time.time;
+                RpcSkillRejected(connectionToClient, skillIndex,
+                    $"{skill.Name}: aguarde {remaining:0.0}s");
+                return;
+            }
+
+            // Valida MP
+            if (CurrentMP < skill.ManaCost)
+            {
+                RpcSkillRejected(connectionToClient, skillIndex, "MP insuficiente!");
+                return;
+            }
+
+            // Consome MP
+            ServerConsumeMP(skill.ManaCost);
+
+            // Registra cooldown no servidor
+            _serverSkillCooldowns[skillIndex] = Time.time + skill.Cooldown;
+
+            // Aplica efeito
+            if (skill.Type == SkillType.Heal)
+            {
+                float heal = Mathf.Max(10f, (_serverStats.MATK) * skill.AtkMultiplier);
+                CurrentHP  = Mathf.Min(MaxHP, CurrentHP + heal);
+                _serverCharData.CurrentHP = CurrentHP;
+            }
+            // Buffs: implementar futuramente
+
+            // Confirma para o cliente
+            RpcSkillConfirmed(connectionToClient, skillIndex, skill.Cooldown);
+        }
+
+        // ── Métodos de servidor (chamados pelo NetworkMonsterEntity) ────────
 
         [Server]
         public void ServerApplyDamage(float dmg)
@@ -265,12 +320,38 @@ namespace RPG.Network
             if (CurrentHP <= 0f) ServerDie();
         }
 
+        /// <summary>
+        /// Consome MP no servidor. Chamado pelo NetworkMonsterEntity
+        /// após validar a skill do atacante.
+        /// </summary>
+        [Server]
+        public void ServerConsumeMP(float amount)
+        {
+            CurrentMP = Mathf.Max(0f, CurrentMP - amount);
+            if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
+        }
+
+        /// <summary>
+        /// Verifica e registra cooldown de skill no servidor.
+        /// Retorna true se a skill pode ser usada (cooldown expirado).
+        /// </summary>
+        [Server]
+        public bool ServerCheckAndSetCooldown(int skillIndex, float cooldownDuration)
+        {
+            if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime) &&
+                Time.time < endTime)
+                return false;
+
+            _serverSkillCooldowns[skillIndex] = Time.time + cooldownDuration;
+            return true;
+        }
+
         [Server]
         public void ServerGrantExp(long amount)
         {
             if (_serverCharData == null) return;
 
-            Experience += amount;
+            Experience                 += amount;
             _serverCharData.Experience += amount;
 
             bool leveledUp = false;
@@ -283,20 +364,19 @@ namespace RPG.Network
                 Level++;
                 _serverCharData.Level++;
 
-                FreeAttributePoints++;
-                _serverCharData.FreeAttributePoints += 5;
-                // Correção: era += 5 mas o loop incrementa 1 por ciclo, somando 5 em bloco
-                FreeAttributePoints += 4; // total +5
+                // +5 pontos por nível (corrigido — não usar += 1 + += 4)
+                FreeAttributePoints                  += 5;
+                _serverCharData.FreeAttributePoints  += 5;
 
                 long nextExp = _serverCharData.GetExperienceForLevel(_serverCharData.Level);
-                ExperienceToNextLevel = nextExp;
+                ExperienceToNextLevel                = nextExp;
                 _serverCharData.ExperienceToNextLevel = nextExp;
 
                 _serverStats = _serverCharData.GetDerivedStats();
-                MaxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
-                MaxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
-                CurrentHP = MaxHP;
-                CurrentMP = MaxMP;
+                MaxHP        = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
+                MaxMP        = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+                CurrentHP    = MaxHP;
+                CurrentMP    = MaxMP;
                 _serverCharData.CurrentHP = MaxHP;
                 _serverCharData.CurrentMP = MaxMP;
 
@@ -307,6 +387,29 @@ namespace RPG.Network
             ServerSaveCharacter();
             RpcOnExpGained(amount, leveledUp);
         }
+
+        // ── ClientRpcs para skills ─────────────────────────────────────────
+
+        /// <summary>
+        /// Informa o cliente que a skill foi aceita pelo servidor.
+        /// O cliente então inicia o cooldown visual e o feedback de UI.
+        /// </summary>
+        [TargetRpc]
+        public void RpcSkillConfirmed(NetworkConnection target, int skillIndex, float cooldown)
+        {
+            GetComponent<SkillSystem>()?.OnServerSkillConfirmed(skillIndex, cooldown);
+        }
+
+        /// <summary>
+        /// Informa o cliente que a skill foi rejeitada (MP, cooldown, range).
+        /// </summary>
+        [TargetRpc]
+        public void RpcSkillRejected(NetworkConnection target, int skillIndex, string reason)
+        {
+            GetComponent<SkillSystem>()?.OnServerSkillRejected(skillIndex, reason);
+        }
+
+        // ── Morte / Respawn ────────────────────────────────────────────────
 
         [Server]
         private void ServerDie()
@@ -352,7 +455,7 @@ namespace RPG.Network
             var account = SaveManager.Instance?.LoadAccount(_serverAccountUsername);
             if (account == null)
             {
-                Debug.LogWarning($"[Server] Conta '{_serverAccountUsername}' não encontrada para save.");
+                Debug.LogWarning($"[Server] Conta '{_serverAccountUsername}' não encontrada.");
                 return;
             }
             SaveManager.Instance?.SaveCharacter(account, _serverCharData);
@@ -363,10 +466,10 @@ namespace RPG.Network
         {
             if (spawnPoints != null && spawnPoints.Length > 0)
                 return spawnPoints[UnityEngine.Random.Range(0, spawnPoints.Length)].position;
-            return new Vector3(0f, 0f, 0f);
+            return Vector3.zero;
         }
 
-        // ── ClientRpcs ─────────────────────────────────────────────────
+        // ── ClientRpcs ─────────────────────────────────────────────────────
 
         [TargetRpc]
         private void RpcInitializeLocalPlayer(
@@ -393,7 +496,7 @@ namespace RPG.Network
                 AllocatedLUK          = allocLUK,
                 CurrentHP             = currentHP,
                 CurrentMP             = currentMP,
-                EquipmentBonuses      = new EquipmentBonuses
+                EquipmentBonuses = new EquipmentBonuses
                 {
                     ATK = equipATK, DEF = equipDEF,
                     MATK = equipMATK, MDEF = equipMDEF
@@ -401,13 +504,10 @@ namespace RPG.Network
             };
 
             _playerEntity = GetComponent<PlayerEntity>();
-            if (_playerEntity != null)
-            {
-                _playerEntity.ManagedByNetwork = true;
-                _playerEntity.Initialize(data);
-            }
+            // Usa InitializeFromServer — método correto do PlayerEntity novo
+            _playerEntity?.InitializeFromServer(data);
 
-            Debug.Log($"[Client] PlayerEntity inicializado: {charName} Lv{level}");
+            Debug.Log($"[Client] PlayerEntity inicializado via servidor: {charName} Lv{level}");
         }
 
         [ClientRpc]
@@ -417,7 +517,8 @@ namespace RPG.Network
             _agent?.ResetPath();
             if (_agent != null) _agent.isStopped = true;
             GetComponent<NetworkPlayerController>()?.SetEnabled(false);
-            _playerEntity?.OnNetworkDeath();
+            // Usa OnServerDeath — método correto do PlayerEntity novo
+            _playerEntity?.OnServerDeath();
             DeathScreenUI.Show(this);
         }
 
@@ -425,18 +526,10 @@ namespace RPG.Network
         private void RpcOnRespawned(Vector3 position, float hp, float maxHp, float mp, float maxMp)
         {
             if (!isLocalPlayer) return;
-            if (_agent != null)
-            {
-                _agent.isStopped = false;
-                _agent.Warp(position);
-            }
+            if (_agent != null) { _agent.isStopped = false; _agent.Warp(position); }
             GetComponent<NetworkPlayerController>()?.SetEnabled(true);
-            if (_playerEntity != null)
-            {
-                _playerEntity.ForceSetHP(hp, maxHp);
-                _playerEntity.ForceSetMP(mp, maxMp);
-                _playerEntity.Respawn(position);
-            }
+            // Usa OnServerRespawn — método correto do PlayerEntity novo
+            _playerEntity?.OnServerRespawn(position, hp, maxHp, mp, maxMp);
             DeathScreenUI.Hide();
         }
 
@@ -449,28 +542,24 @@ namespace RPG.Network
             if (!isLocalPlayer) return;
 
             FloatingTextManager.Instance?.Show(
-                $"+{amount} XP",
-                transform.position + Vector3.up * 2f,
-                Color.cyan);
+                $"+{amount} XP", transform.position + Vector3.up * 2f, Color.cyan);
 
             if (leveledUp)
             {
                 FloatingTextManager.Instance?.Show(
-                    "LEVEL UP!",
-                    transform.position + Vector3.up * 2.5f,
-                    Color.yellow);
+                    "LEVEL UP!", transform.position + Vector3.up * 2.5f, Color.yellow);
                 UIManager.Instance?.ShowMessage("Level up! Você evoluiu!");
             }
         }
 
-        // ── SyncVar Hooks ──────────────────────────────────────────────
+        // ── SyncVar Hooks ──────────────────────────────────────────────────
 
-        private void OnNameChanged(string _, string newName)
+        private void OnNetNameChanged(string _, string v)
         {
-            if (nameTagText != null) nameTagText.text = newName;
+            if (nameTagText != null) nameTagText.text = v;
         }
 
-        private void OnHPChanged(float _, float newHP)
+        private void OnNetHPChanged(float _, float newHP)
         {
             if (hpBarSlider != null)
             {
@@ -478,50 +567,45 @@ namespace RPG.Network
                 hpBarSlider.value    = newHP;
                 hpBarSlider.gameObject.SetActive(newHP < MaxHP);
             }
+            // Usa SetHPFromServer — método correto do PlayerEntity novo
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-                _playerEntity.SetHPFromNetwork(newHP, MaxHP);
+                _playerEntity.SetHPFromServer(newHP, MaxHP);
         }
 
-        private void OnMaxHPChanged(float _, float newMaxHP)
+        private void OnNetMaxHPChanged(float _, float newMax)
         {
-            if (hpBarSlider != null) hpBarSlider.maxValue = newMaxHP;
+            if (hpBarSlider != null) hpBarSlider.maxValue = newMax;
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-                _playerEntity.SetHPFromNetwork(CurrentHP, newMaxHP);
+                _playerEntity.SetHPFromServer(CurrentHP, newMax);
         }
 
-        private void OnMPChanged(float _, float newMP)
-        {
-            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-                _playerEntity.SetMPFromNetwork(newMP, MaxMP);
-        }
-
-        private void OnMaxMPChanged(float _, float newMaxMP)
+        private void OnNetMPChanged(float _, float newMP)
         {
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-                _playerEntity.SetMPFromNetwork(CurrentMP, newMaxMP);
+                _playerEntity.SetMPFromServer(newMP, MaxMP);
         }
 
-        private void OnLevelChanged(int _, int newLevel)
+        private void OnNetMaxMPChanged(float _, float newMax)
+        {
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.SetMPFromServer(CurrentMP, newMax);
+        }
+
+        private void OnNetLevelChanged(int _, int v)
         {
             if (!isLocalPlayer) return;
-            UIManager.Instance?.RefreshLevel(newLevel);
+            UIManager.Instance?.RefreshLevel(v);
         }
 
-        private void OnExpChanged(long _, long newExp)
-        {
-            // UI atualiza via UpdateExpBar() no UIManager que lê as SyncVars
-        }
-
-        private void OnFreePointsChanged(int _, int newPoints)
+        private void OnNetFreePointsChanged(int _, int v)
         {
             if (!isLocalPlayer) return;
-            AttributeWindowUI.Instance?.OnFreePointsUpdated(newPoints);
+            AttributeWindowUI.Instance?.OnFreePointsUpdated(v);
         }
 
-        private void OnMovingChanged(bool _, bool newVal)
+        private void OnNetMovingChanged(bool _, bool v)
         {
-            if (!isLocalPlayer)
-                _animator?.SetBool("IsMoving", newVal);
+            if (!isLocalPlayer) _animator?.SetBool("IsMoving", v);
         }
     }
 }

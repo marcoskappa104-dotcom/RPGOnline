@@ -7,18 +7,21 @@ using RPG.Data;
 namespace RPG.Network
 {
     /// <summary>
-    /// RPGNetworkManager v4 — Server-Authoritative
+    /// RPGNetworkManager v5
     ///
-    /// Mudanças:
-    ///   - NÃO chama AddPlayerForConnection em OnServerAddPlayer.
-    ///     O spawn acontece SOMENTE após login + seleção de personagem.
-    ///   - SpawnPlayerForConnection é chamado pelo ServerAuthManager.
-    ///   - Registra handlers de conexão/desconexão no ServerAuthManager.
+    /// CORREÇÕES:
+    ///   - DontDestroyOnLoad correto: o Mirror já faz isso internamente,
+    ///     mas precisamos garantir que não duplique entre cenas.
+    ///   - OnClientDisconnect NÃO carrega LoginScene automaticamente
+    ///     (isso estava causando loop infinito de reconexão).
+    ///     A navegação é responsabilidade do ClientAuthHandler / UI.
+    ///   - OnServerAddPlayer intencionalmente vazio (spawn ocorre via
+    ///     ServerAuthManager após login + seleção de personagem).
     /// </summary>
     public class RPGNetworkManager : NetworkManager
     {
         public static new RPGNetworkManager singleton =>
-            (RPGNetworkManager)NetworkManager.singleton;
+            NetworkManager.singleton as RPGNetworkManager;
 
         [Header("RPG Settings")]
         [SerializeField] private Transform[] spawnPoints;
@@ -29,7 +32,15 @@ namespace RPG.Network
 
         private ServerAuthManager _authManager;
 
-        // ── Lifecycle ────────────────────────────────────────────────────
+        // ── Lifecycle ──────────────────────────────────────────────────────
+
+        public override void Awake()
+        {
+            // Mirror's NetworkManager.Awake() já chama DontDestroyOnLoad e
+            // destrói duplicatas — NÃO chame base.Awake() manualmente se já
+            // estiver herdando. Apenas delegue.
+            base.Awake();
+        }
 
         public override void Start()
         {
@@ -40,10 +51,12 @@ namespace RPG.Network
         public override void OnStartServer()
         {
             base.OnStartServer();
+
             _authManager = GetComponent<ServerAuthManager>();
             if (_authManager == null)
                 _authManager = gameObject.AddComponent<ServerAuthManager>();
 
+            _authManager.RegisterHandlers();
             Debug.Log("[RPGNetworkManager] Servidor iniciado.");
         }
 
@@ -53,12 +66,8 @@ namespace RPG.Network
             RegisterSpawnablePrefabs();
         }
 
-        // ── Conexões ─────────────────────────────────────────────────────
+        // ── Conexões do servidor ───────────────────────────────────────────
 
-        /// <summary>
-        /// ATENÇÃO: NÃO spawna o player aqui.
-        /// O player só é spawnado após login + seleção de personagem.
-        /// </summary>
         public override void OnServerConnect(NetworkConnectionToClient conn)
         {
             base.OnServerConnect(conn);
@@ -69,30 +78,32 @@ namespace RPG.Network
         {
             _authManager?.OnServerDisconnect(conn);
             base.OnServerDisconnect(conn);
-            Debug.Log($"[Server] Desconectado: connId={conn.connectionId}");
+            Debug.Log($"[Server] Player desconectado: connId={conn.connectionId}");
         }
 
         /// <summary>
-        /// Sobrescrito para NÃO spawnar automaticamente.
-        /// O spawn ocorre via SpawnPlayerForConnection.
+        /// Intencionalmente VAZIO.
+        /// O player só spawna após login + seleção de personagem via ServerAuthManager.
         /// </summary>
         public override void OnServerAddPlayer(NetworkConnectionToClient conn)
         {
-            // Intencionalmente vazio — não spawna aqui.
-            // O ServerAuthManager dispara SpawnPlayerForConnection quando apropriado.
+            // Não faz nada — o spawn é disparado pelo ServerAuthManager.
         }
 
-        // ── Spawn do player (chamado pelo ServerAuthManager) ─────────────
+        // ── Spawn do player (chamado pelo ServerAuthManager) ───────────────
 
-        /// <summary>
-        /// Spawna o player após autenticação e seleção de personagem.
-        /// </summary>
         [Server]
         public void SpawnPlayerForConnection(
             NetworkConnectionToClient conn,
             CharacterData charData,
             string accountUsername)
         {
+            if (playerPrefab == null)
+            {
+                Debug.LogError("[RPGNetworkManager] playerPrefab não configurado!");
+                return;
+            }
+
             Transform spawn    = GetSpawnPoint(charData);
             var       playerGO = Instantiate(playerPrefab, spawn.position, spawn.rotation);
 
@@ -105,7 +116,26 @@ namespace RPG.Network
                       $"connId={conn.connectionId} | pos={spawn.position}");
         }
 
-        // ── Prefabs ──────────────────────────────────────────────────────
+        // ── Conexões do cliente ────────────────────────────────────────────
+
+        public override void OnClientConnect()
+        {
+            base.OnClientConnect();
+            Debug.Log("[Client] Conectado ao servidor.");
+            // NÃO chama AddPlayer — o login é feito via mensagens (ClientAuthHandler).
+        }
+
+        public override void OnClientDisconnect()
+        {
+            base.OnClientDisconnect();
+            Debug.Log("[Client] Desconectado do servidor.");
+
+            // Notifica a UI — a UI decide o que fazer (voltar ao login, mostrar mensagem, etc.)
+            // NÃO carregamos cena aqui para evitar loop de reconexão.
+            ClientAuthHandler.Instance?.OnDisconnectedFromServer();
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────────
 
         private void RegisterSpawnablePrefabs()
         {
@@ -126,11 +156,8 @@ namespace RPG.Network
             }
         }
 
-        // ── Spawn point ──────────────────────────────────────────────────
-
         private Transform GetSpawnPoint(CharacterData charData = null)
         {
-            // Se o personagem tem posição salva e não é (0,0,0), usa ela
             if (charData != null)
             {
                 var saved = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
@@ -138,7 +165,7 @@ namespace RPG.Network
                 {
                     var go = new GameObject("SavedSpawn");
                     go.transform.position = saved;
-                    Destroy(go, 1f);
+                    Destroy(go, 2f);
                     return go.transform;
                 }
             }
@@ -147,27 +174,9 @@ namespace RPG.Network
                 return spawnPoints[numPlayers % spawnPoints.Length];
 
             var def = new GameObject("DefaultSpawn");
-            def.transform.position = new Vector3(0f, 0f, 0f);
-            Destroy(def, 1f);
+            def.transform.position = Vector3.zero;
+            Destroy(def, 2f);
             return def.transform;
-        }
-
-        // ── Cliente ──────────────────────────────────────────────────────
-
-        public override void OnClientConnect()
-        {
-            base.OnClientConnect();
-            Debug.Log("[Client] Conectado ao servidor.");
-            // NÃO chama AddPlayer aqui — o login é feito via mensagens diretas.
-        }
-
-        public override void OnClientDisconnect()
-        {
-            base.OnClientDisconnect();
-            Debug.Log("[Client] Desconectado do servidor.");
-            // Volta para tela de login
-            UnityEngine.SceneManagement.SceneManager.LoadScene(
-                GameManager.SCENE_LOGIN);
         }
     }
 }

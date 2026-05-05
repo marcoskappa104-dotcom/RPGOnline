@@ -1,31 +1,40 @@
 using UnityEngine;
 using Mirror;
-using RPG.Managers;
 
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkConnectionBootstrapper — ponto de entrada de TODAS as cenas com rede.
+    /// NetworkConnectionBootstrapper v2
     ///
-    /// COLOQUE NA CENA DE LOGIN.
-    ///
-    /// - Servidor dedicado (-batchmode ou -server): inicia o servidor.
-    /// - Cliente: conecta ao servidor. NÃO spawna player automaticamente.
-    ///   O spawn ocorre após login + seleção de personagem.
+    /// CORREÇÕES:
+    ///   - Removido redirect para ServerScene (causava erro porque a cena
+    ///     pode não estar no Build Settings ainda).
+    ///     O ServerEntryPoint faz esse redirect ANTES, no Awake.
+    ///   - Não tenta reconectar ao ser destruído (OnDestroy simplificado).
+    ///   - Servidor: apenas StartServer(). Ponto.
+    ///   - Cliente: apenas StartClient(). Ponto.
     /// </summary>
     public class NetworkConnectionBootstrapper : MonoBehaviour
     {
-        [Header("Conexão")]
+        [Header("Conexão (apenas cliente)")]
         [SerializeField] public string serverAddress = "localhost";
         [SerializeField] public ushort serverPort    = 7777;
 
         private void Start()
         {
+            // Já está rodando? Não faz nada.
+            if (NetworkServer.active || NetworkClient.active)
+            {
+                Debug.Log("[Bootstrapper] Rede já ativa — ignorando Start().");
+                return;
+            }
+
             bool isServer = IsServerBuild();
             bool isHost   = IsHostBuild();
 
-            // Configura KCP
-            var kcp = FindObjectOfType<kcp2k.KcpTransport>();
+            // Configura porta KCP
+            var kcp = GetComponentInChildren<kcp2k.KcpTransport>()
+                   ?? FindObjectOfType<kcp2k.KcpTransport>();
             if (kcp != null)
                 kcp.Port = serverPort;
             else
@@ -39,6 +48,7 @@ namespace RPG.Network
             else if (isHost)
             {
                 Debug.Log($"[Bootstrapper] HOST | Porta:{serverPort}");
+                NetworkManager.singleton.networkAddress = serverAddress;
                 NetworkManager.singleton.StartHost();
             }
             else
@@ -49,7 +59,7 @@ namespace RPG.Network
             }
         }
 
-        private bool IsServerBuild()
+        public static bool IsServerBuild()
         {
             if (Application.isBatchMode) return true;
             foreach (var arg in System.Environment.GetCommandLineArgs())
@@ -57,21 +67,11 @@ namespace RPG.Network
             return false;
         }
 
-        private bool IsHostBuild()
+        public static bool IsHostBuild()
         {
             foreach (var arg in System.Environment.GetCommandLineArgs())
                 if (arg.ToLower() == "-host") return true;
             return false;
-        }
-
-        private void OnDestroy()
-        {
-            if (NetworkServer.active && NetworkClient.isConnected)
-                NetworkManager.singleton?.StopHost();
-            else if (NetworkClient.isConnected)
-                NetworkManager.singleton?.StopClient();
-            else if (NetworkServer.active)
-                NetworkManager.singleton?.StopServer();
         }
     }
 }

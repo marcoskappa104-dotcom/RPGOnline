@@ -8,13 +8,12 @@ using RPG.Network;
 namespace RPG.UI
 {
     /// <summary>
-    /// CharacterUIController v2 — Server-Authoritative
+    /// CharacterUIController v3
     ///
-    /// MUDANÇAS:
-    ///   - A lista de personagens vem do servidor via ClientAuthHandler.OnCharacterListReceived.
-    ///   - Criação de personagem envia apenas nome + raça ao servidor.
-    ///   - Seleção de personagem envia o CharacterId ao servidor.
-    ///   - Sem acesso a SaveManager, GameManager.CurrentAccount ou CharacterData local.
+    /// CORREÇÃO:
+    ///   - HandleSelectCharacterResult NÃO carrega mais a GameplayScene.
+    ///     Isso agora é responsabilidade do ClientAuthHandler.
+    ///   - Apenas atualiza o status visual e desabilita botões enquanto aguarda.
     /// </summary>
     public class CharacterUIController : MonoBehaviour
     {
@@ -52,7 +51,6 @@ namespace RPG.UI
             PopulateRaceDropdown();
             ShowSelectionPanel();
 
-            // Vincula eventos
             if (ClientAuthHandler.Instance != null)
             {
                 ClientAuthHandler.Instance.OnCharacterListReceived  += HandleCharacterList;
@@ -62,6 +60,7 @@ namespace RPG.UI
             else
             {
                 Debug.LogWarning("[CharacterUI] ClientAuthHandler não encontrado!");
+                SetSelectionStatus("Erro: sem conexão com servidor.");
             }
         }
 
@@ -75,15 +74,13 @@ namespace RPG.UI
             }
         }
 
-        // ── Seleção ───────────────────────────────────────────────────
+        // ── Seleção ────────────────────────────────────────────────────────
 
         private void ShowSelectionPanel()
         {
             selectionPanel.SetActive(true);
             creationPanel.SetActive(false);
             SetSelectionStatus("Carregando personagens...");
-
-            // Pede lista atualizada ao servidor
             ClientAuthHandler.Instance?.SendRequestCharacterList();
         }
 
@@ -91,19 +88,13 @@ namespace RPG.UI
         {
             _cachedCharacters = characters ?? new List<CharacterSummary>();
             RefreshCharacterList();
-            SetSelectionStatus("");
+            SetSelectionStatus(_cachedCharacters.Count == 0 ? "Nenhum personagem. Crie um!" : "");
         }
 
         private void RefreshCharacterList()
         {
             foreach (Transform child in characterListContent)
                 Destroy(child.gameObject);
-
-            if (_cachedCharacters.Count == 0)
-            {
-                SetSelectionStatus("Nenhum personagem. Crie um novo!");
-                return;
-            }
 
             foreach (var ch in _cachedCharacters)
             {
@@ -122,44 +113,42 @@ namespace RPG.UI
         private void SelectCharacter(string characterId)
         {
             SetSelectionStatus("Entrando no jogo...");
-            foreach (Transform child in characterListContent)
-                child.GetComponent<Button>()?.SetInteractable(false);
-
+            SetAllButtonsInteractable(false);
             ClientAuthHandler.Instance?.SendSelectCharacter(characterId);
         }
 
         private void HandleSelectCharacterResult(bool success, string error)
         {
+            // CORREÇÃO: NÃO carregamos cena aqui — o ClientAuthHandler já faz isso.
+            // Só trata o caso de erro.
             if (!success)
             {
                 SetSelectionStatus($"Erro: {error}");
-                // Reativa botões
-                foreach (Transform child in characterListContent)
-                    child.GetComponent<Button>()?.SetInteractable(true);
+                SetAllButtonsInteractable(true);
             }
-            // Se success, ClientAuthHandler já carregou a cena de gameplay
+            // Se success: ClientAuthHandler carregou GameplayScene — esta cena some.
         }
 
-        // ── Criação ───────────────────────────────────────────────────
+        // ── Criação ────────────────────────────────────────────────────────
 
         private void ShowCreationPanel()
         {
             selectionPanel.SetActive(false);
             creationPanel.SetActive(true);
             nameInput.text     = "";
-            errorText.text     = "";
+            if (errorText) errorText.text = "";
             raceDropdown.value = 0;
             UpdateRaceInfo();
         }
 
         private void OnCreateCharacter()
         {
-            errorText.text = "";
+            if (errorText) errorText.text = "";
             string charName = nameInput.text.Trim();
 
             if (charName.Length < 2)
             {
-                errorText.text = "Nome deve ter ao menos 2 caracteres.";
+                if (errorText) errorText.text = "Nome: mínimo 2 caracteres.";
                 return;
             }
 
@@ -173,16 +162,15 @@ namespace RPG.UI
 
             if (!success)
             {
-                errorText.text = error ?? "Erro ao criar personagem.";
+                if (errorText) errorText.text = error ?? "Erro ao criar personagem.";
                 return;
             }
 
-            // Atualiza lista e volta para seleção
             if (updatedList != null) _cachedCharacters = updatedList;
             ShowSelectionPanel();
         }
 
-        // ── Race Dropdown ─────────────────────────────────────────────
+        // ── Race Dropdown ──────────────────────────────────────────────────
 
         private void PopulateRaceDropdown()
         {
@@ -207,22 +195,26 @@ namespace RPG.UI
             };
         }
 
-        // ── Logout ────────────────────────────────────────────────────
+        // ── Logout ─────────────────────────────────────────────────────────
 
-        private void OnLogout()
-        {
-            Managers.GameManager.Instance?.Logout();
-        }
+        private void OnLogout() => Managers.GameManager.Instance?.Logout();
 
-        // ── Helpers ───────────────────────────────────────────────────
+        // ── Helpers ────────────────────────────────────────────────────────
 
         private void SetSelectionStatus(string msg)
         {
             if (selectionStatusText != null) selectionStatusText.text = msg;
         }
+
+        private void SetAllButtonsInteractable(bool value)
+        {
+            foreach (Transform child in characterListContent)
+                child.GetComponent<Button>()?.SetInteractable(false);
+            if (createNewButton) createNewButton.interactable = value;
+            if (logoutButton)    logoutButton.interactable    = value;
+        }
     }
 
-    // Extensão para compatibilidade
     public static class ButtonExtensions
     {
         public static void SetInteractable(this Button btn, bool value)
