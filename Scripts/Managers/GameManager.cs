@@ -4,25 +4,23 @@ using UnityEngine.SceneManagement;
 namespace RPG.Managers
 {
     /// <summary>
-    /// GameManager v2 — Server-Authoritative
+    /// GameManager v3 — Atualizado para usar DatabaseManager.
     ///
-    /// REMOVIDO:
-    ///   - CurrentAccount  (dados de conta ficam no servidor)
-    ///   - SelectedCharacter (dados do personagem ficam no servidor)
+    /// MUDANÇAS em relação à v2:
+    ///   - Sem referência a SaveManager (removido do projeto).
+    ///   - HashPassword mantido aqui (usado pelo ClientAuthHandler para
+    ///     fazer hash antes de enviar pela rede).
+    ///   - Demais funcionalidades inalteradas.
     ///
-    /// MANTIDO:
-    ///   - LoggedUsername: referência mínima para UI exibir o nome do usuário logado.
-    ///   - Constantes de cena e HashPassword (usado pelo ClientAuthHandler).
-    ///   - GoToCharacterSelect / GoToGameplay agora apenas carregam cenas.
+    /// REMOVER DO PROJETO:
+    ///   DELETE: SaveManager.cs
     /// </summary>
     public class GameManager : MonoBehaviour
     {
         public static GameManager Instance { get; private set; }
 
-        // ── Sessão (mínima — dados reais ficam no servidor) ────────────
         public string LoggedUsername { get; private set; } = "";
 
-        // ── Constantes de cenas ────────────────────────────────────────
         public const string SCENE_LOGIN      = "LoginScene";
         public const string SCENE_CHARACTER  = "CharacterScene";
         public const string SCENE_GAMEPLAY   = "GameplayScene";
@@ -36,33 +34,14 @@ namespace RPG.Managers
             Debug.Log($"[GameManager] Iniciado — versão {GAME_VERSION}");
         }
 
-        // ── Sessão ─────────────────────────────────────────────────────
-
         public void SetLoggedUsername(string username)
         {
             LoggedUsername = username;
             Debug.Log($"[GameManager] Usuário logado: {username}");
         }
 
-        // ── Navegação ──────────────────────────────────────────────────
-
-        /// <summary>
-        /// Vai para a tela de seleção/criação de personagem.
-        /// Só deve ser chamado após login confirmado pelo servidor.
-        /// </summary>
-        public void GoToCharacterSelect()
-        {
-            SceneManager.LoadScene(SCENE_CHARACTER);
-        }
-
-        /// <summary>
-        /// Vai para o jogo. Chamado após seleção de personagem confirmada.
-        /// O player é spawnado pelo servidor — cliente apenas carrega a cena.
-        /// </summary>
-        public void GoToGameplay()
-        {
-            SceneManager.LoadScene(SCENE_GAMEPLAY);
-        }
+        public void GoToCharacterSelect()  => SceneManager.LoadScene(SCENE_CHARACTER);
+        public void GoToGameplay()         => SceneManager.LoadScene(SCENE_GAMEPLAY);
 
         public void Logout()
         {
@@ -70,11 +49,10 @@ namespace RPG.Managers
             SceneManager.LoadScene(SCENE_LOGIN);
         }
 
-        // ── Utilitários ────────────────────────────────────────────────
-
         /// <summary>
         /// Hash SHA-256 para envio seguro de senha ao servidor.
-        /// Em produção com banco real: use bcrypt/Argon2 com salt no servidor.
+        /// O servidor armazena e compara apenas o hash — nunca a senha em texto.
+        /// Em produção com banco real externo: adicione salt no servidor.
         /// </summary>
         public static string HashPassword(string password)
         {

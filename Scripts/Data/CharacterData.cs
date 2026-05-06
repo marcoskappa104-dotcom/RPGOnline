@@ -5,6 +5,10 @@ using RPG.Data;
 
 namespace RPG.Data
 {
+    /// <summary>
+    /// CharacterData v2 — sem alterações de lógica, apenas documentação atualizada.
+    /// Os dados agora vêm do SQLite (DatabaseManager) e não de JSON.
+    /// </summary>
     [Serializable]
     public class CharacterData
     {
@@ -70,12 +74,17 @@ namespace RPG.Data
         }
     }
 
+    /// <summary>
+    /// AccountData v2 — simplificado.
+    /// Characters agora é carregado separadamente pelo DatabaseManager.
+    /// Mantemos a lista para compatibilidade com mensagens de rede (CharacterListResponse).
+    /// </summary>
     [Serializable]
     public class AccountData
     {
         public string              Username;
         public string              PasswordHash;
-        public List<CharacterData> Characters = new List<CharacterData>();
+        public List<CharacterData> Characters = new List<CharacterData>(); // populado pelo DatabaseManager.TryLoginWithHash
         public string              LastLogin;
     }
 }
