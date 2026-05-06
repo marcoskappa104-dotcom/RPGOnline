@@ -25,7 +25,8 @@ namespace RPG.Data
         public int           Level                  = 1;
         public long          Experience             = 0;
         public long          ExperienceToNextLevel  = 100;
-
+		public const int MAX_LEVEL = 99;
+		
         public BaseAttributes    BaseAttributes   = new BaseAttributes();
         public EquipmentBonuses  EquipmentBonuses = new EquipmentBonuses();
 
@@ -57,21 +58,29 @@ namespace RPG.Data
             return (long)(100 * Mathf.Pow(level, 1.5f));
         }
 
-        /// <summary>Adiciona XP e processa level-ups. Retorna true se houve level-up. Servidor only.</summary>
-        public bool AddExperience(long amount)
-        {
-            Experience += amount;
-            bool leveled = false;
-            while (Experience >= ExperienceToNextLevel)
-            {
-                Experience            -= ExperienceToNextLevel;
-                Level++;
-                FreeAttributePoints   += 5;
-                ExperienceToNextLevel  = GetExperienceForLevel(Level);
-                leveled                = true;
-            }
-            return leveled;
-        }
+
+public bool AddExperience(long amount)
+{
+    if (Level >= MAX_LEVEL) return false; // já no nível máximo
+
+    Experience += amount;
+    bool leveled = false;
+
+    while (Experience >= ExperienceToNextLevel && Level < MAX_LEVEL)
+    {
+        Experience            -= ExperienceToNextLevel;
+        Level++;
+        FreeAttributePoints   += 5;
+        ExperienceToNextLevel  = Level >= MAX_LEVEL ? 0 : GetExperienceForLevel(Level);
+        leveled                = true;
+    }
+
+    // Garante que XP não ultrapasse o necessário no nível máximo
+    if (Level >= MAX_LEVEL)
+        Experience = 0;
+
+    return leveled;
+}
     }
 
     /// <summary>

@@ -338,7 +338,29 @@ private void InitializeDatabase()
                 return null;
             }
         }
+/// <summary>
+/// Carrega personagem verificando ownership em uma única query.
+/// Mais seguro e eficiente que LoadCharacter + LoadCharacters separados.
+/// </summary>
+public CharacterData LoadCharacterForAccount(string characterId, string username)
+{
+    if (string.IsNullOrWhiteSpace(characterId) || string.IsNullOrWhiteSpace(username))
+        return null;
 
+    try
+    {
+        var row = _db.FindWithQuery<CharacterRow>(
+            "SELECT * FROM characters WHERE character_id = ? AND LOWER(username) = LOWER(?)",
+            characterId, username.Trim());
+
+        return row != null ? RowToCharacterData(row) : null;
+    }
+    catch (Exception e)
+    {
+        Debug.LogError($"[DB] LoadCharacterForAccount erro: {e.Message}");
+        return null;
+    }
+}
         /// <summary>
         /// Cria personagem. Retorna null se sucesso, mensagem de erro se falhar.
         /// </summary>

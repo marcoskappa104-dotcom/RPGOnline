@@ -110,11 +110,18 @@ namespace RPG.Network
             if (_agent != null && _playerEntity != null && _playerEntity.Stats != null)
                 _agent.speed = Mathf.Clamp(_playerEntity.Stats.MoveSpeed, 3f, 7f);
 
-            Cursor.visible   = true;
-            Cursor.lockState = CursorLockMode.None;
+Cursor.visible   = true;
+Cursor.lockState = CursorLockMode.None;
 
-            UIManager.Instance?.BindLocalPlayer(_playerEntity);
-            Debug.Log("[NetworkPlayerController] Controller local iniciado.");
+if (terrainLayer == 0)
+    Debug.LogWarning("[NetworkPlayerController] terrainLayer não configurado no Inspector! " +
+                     "O raycast de movimento vai acertar qualquer collider.");
+if (targetableLayer == 0)
+    Debug.LogWarning("[NetworkPlayerController] targetableLayer não configurado no Inspector! " +
+                     "A seleção de alvos vai acertar qualquer collider.");
+
+UIManager.Instance?.BindLocalPlayer(_playerEntity);
+Debug.Log("[NetworkPlayerController] Controller local iniciado.");
         }
 
         // ── Update / LateUpdate ────────────────────────────────────────────
@@ -168,18 +175,19 @@ namespace RPG.Network
             return true;
         }
 
-        private void TryMoveToGround(Ray ray)
-        {
-            RaycastHit hit;
-            bool didHit = terrainLayer != 0
-                ? Physics.Raycast(ray, out hit, 300f, terrainLayer)
-                : Physics.Raycast(ray, out hit, 300f);
+private void TryMoveToGround(Ray ray)
+{
+    RaycastHit hit;
 
-            if (!didHit) return;
+    // Exclui o layer Targetable do raycast de movimento
+    // para não mover ao clicar em monstros ou players
+    int moveLayerMask = terrainLayer != 0
+        ? terrainLayer
+        : ~(1 << LayerMask.NameToLayer("Targetable"));
 
-            if (terrainLayer == 0 && hit.collider.GetComponentInParent<ITargetable>() != null)
-                return;
+    bool didHit = Physics.Raycast(ray, out hit, 300f, moveLayerMask);
 
+    if (!didHit) return;
             _skillSystem?.CancelPendingWalk();
             _playerEntity?.ClearTarget();
             UIManager.Instance?.ClearTargetPanel();
@@ -269,12 +277,28 @@ namespace RPG.Network
 
             if (_agent == null) return;
 
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas))
-                _agent.SetDestination(hit.position);
-            else
-                _agent.SetDestination(destination);
-        }
+Vector3 finalDest = destination;
+if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas))
+{
+    finalDest = hit.position;
+    _agent.SetDestination(finalDest);
+}
+else
+{
+    _agent.SetDestination(finalDest);
+}
 
+// Confirma posição final ao cliente owner para corrigir dessincronia
+RpcMoveConfirmed(finalDest);
+        }
+		
+[TargetRpc]
+private void RpcMoveConfirmed(Vector3 destination)
+{
+    // Corrige posição do agente local caso o servidor tenha ajustado o destino
+    if (_agent != null && _agent.isOnNavMesh)
+        _agent.SetDestination(destination);
+}
         // ── API pública ────────────────────────────────────────────────────
 
         public void SetEnabled(bool value)

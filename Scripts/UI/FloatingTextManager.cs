@@ -1,4 +1,4 @@
-using System.Collections;
+	using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
@@ -122,9 +122,13 @@ namespace RPG.UI
                     tmp.color = c;
                 }
 
-                // Billboard — texto sempre vira para a câmera
-                if (Camera.main != null)
-                    obj.transform.forward = Camera.main.transform.forward;
+// Billboard — texto sempre vira para a câmera
+if (Camera.main != null)
+{
+    Vector3 dir = obj.transform.position - Camera.main.transform.position;
+    if (dir.sqrMagnitude > 0.001f)
+        obj.transform.forward = dir.normalized;
+}
 
                 yield return null;
             }

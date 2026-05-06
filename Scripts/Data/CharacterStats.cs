@@ -91,7 +91,7 @@ namespace RPG.Data
     {
         public static readonly int   BASE_HP        = 100;
         public static readonly int   BASE_MP        = 50;
-        public static readonly float BASE_ASPD      = 1.0f;
+        public static readonly float BASE_ASPD      = 0.5f;
         public static readonly float BASE_MOVESPEED = 4.0f; // m/s base para jogadores
 
         public static RaceBonus GetRaceBonus(CharacterRace race)
@@ -138,18 +138,18 @@ namespace RPG.Data
 
             var s = new DerivedStats();
 
-            s.MaxHP = BASE_HP + (VIT * 50f) + (STR * 10f) + equip.HPBonus;
-            s.MaxMP = BASE_MP + (INT * 40f) + (DEX * 5f)  + equip.MPBonus;
+            s.MaxHP = BASE_HP + (VIT * 20f) + (STR * 5f) + (level * 10f) + equip.HPBonus;
+			s.MaxMP = BASE_MP + (INT * 15f) + (DEX * 3f) + (level * 5f)  + equip.MPBonus;
 
-            s.ATK  = ((STR * 2f)   + (DEX * 1f)   + level + equip.ATK)  * buff.ATKMultiplier;
-            s.MATK = ((INT * 2.5f) + (DEX * 0.5f) + level + equip.MATK) * buff.ATKMultiplier;
+			s.ATK  = ((STR * 1.5f) + (DEX * 0.5f) + level + equip.ATK)  * buff.ATKMultiplier;
+			s.MATK = ((INT * 2.0f) + (DEX * 0.5f) + level + equip.MATK) * buff.ATKMultiplier;
 
-            s.DEF  = ((VIT * 2f) + (STR * 0.5f) + equip.DEF)  * buff.DEFMultiplier;
-            s.MDEF = ((INT * 2f) + (VIT * 1f)   + equip.MDEF) * buff.DEFMultiplier;
+			s.DEF  = ((VIT * 1.2f) + (STR * 0.3f) + equip.DEF)  * buff.DEFMultiplier;
+			s.MDEF = ((INT * 1.2f) + (VIT * 0.5f) + equip.MDEF) * buff.DEFMultiplier;
 
             // ASPD: ataques por segundo — usado APENAS como timer de cooldown de ataque
             // NÃO deve ser usado como velocidade do NavMeshAgent
-            s.ASPD = BASE_ASPD + (AGI * 0.05f) + (DEX * 0.02f); // max ~2.5 ataques/s com atributos altos
+            s.ASPD = Mathf.Clamp(BASE_ASPD + (AGI * 0.02f) + (DEX * 0.01f), 0.3f, 3.0f); // max ~2.5 ataques/s com atributos altos
 
             // MoveSpeed: velocidade de deslocamento em m/s — fórmula conservadora
             s.MoveSpeed = Mathf.Clamp(BASE_MOVESPEED + (AGI * 0.03f), 3f, 7f);

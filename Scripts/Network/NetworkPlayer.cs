@@ -29,7 +29,7 @@ namespace RPG.Network
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        private const int   MAX_LEVEL     = 99;
+
         private const float MAX_HP_CAP    = 500_000f;
         private const float MAX_MP_CAP    = 200_000f;
         private const float SAVE_INTERVAL = 60f;
@@ -43,8 +43,8 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetMPChanged))]         public float  CurrentMP             = 0f;
         [SyncVar(hook = nameof(OnNetMaxMPChanged))]      public float  MaxMP                 = 1f;
         [SyncVar(hook = nameof(OnNetMovingChanged))]     public bool   IsMoving              = false;
-        [SyncVar(hook = nameof(OnNetExpChanged))]        public long   Experience            = 0;
-        [SyncVar(hook = nameof(OnNetExpChanged))]        public long   ExperienceToNextLevel = 100;
+[SyncVar(hook = nameof(OnNetExpChanged))]        public long Experience            = 0;
+[SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
         [SyncVar] public int AllocatedSTR = 0;
         [SyncVar] public int AllocatedAGI = 0;
@@ -365,11 +365,14 @@ namespace RPG.Network
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
 
-            // Registra no log de economia (analytics e balanceamento)
-            DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
+// Registra no log de economia (analytics e balanceamento)
+DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
 
-            ServerSaveCharacter();
-            RpcOnExpGained(amount, leveledUp);
+// Só salva imediatamente se houve level up, caso contrário aguarda o save periódico
+if (leveledUp)
+    ServerSaveCharacter();
+
+RpcOnExpGained(amount, leveledUp);
         }
 
         // ── Salvar — MUDANÇA PRINCIPAL v11 ────────────────────────────────
@@ -431,23 +434,27 @@ namespace RPG.Network
                 }
             };
 
-            if (_playerEntity == null)
-            {
-                _pendingClientInit = true;
-                _pendingInitData   = data;
-                return;
-            }
+if (_playerEntity == null)
+{
+    _pendingClientInit = true;
+    _pendingInitData   = data;
+    return;
+}
 
-            if (_clientInitialized) return;
-            StartCoroutine(DelayedClientInit(data));
+if (_clientInitialized) return;
+_clientInitialized = true; // seta ANTES do yield para evitar dupla inicialização
+StartCoroutine(DelayedClientInit(data));
         }
 
         private IEnumerator DelayedClientInit(CharacterData data)
         {
             yield return null;
 
-            if (_clientInitialized) yield break;
-            _clientInitialized = true;
+if (_playerEntity == null)
+{
+    Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado no prefab do player!");
+    yield break;
+}
 
             _playerEntity = GetComponent<PlayerEntity>();
             if (_playerEntity == null)
@@ -622,5 +629,11 @@ namespace RPG.Network
             UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
+		private void OnNetExpToNextChanged(long _, long __)
+{
+    if (!isLocalPlayer) return;
+    UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
+    AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
+}
     }
 }

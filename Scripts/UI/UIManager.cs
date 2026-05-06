@@ -74,9 +74,6 @@ namespace RPG.UI
         private RPG.Network.NetworkPlayer _netPlayer;
         private float                     _messageTimer;
 
-        // Polling leve para HP do alvo (10x/s em vez de 60x/s)
-        private float _targetHPUpdateTimer;
-        private const float TARGET_HP_INTERVAL = 0.1f;
 
         private void Awake()
         {
@@ -183,17 +180,6 @@ namespace RPG.UI
                 if (_messageTimer <= 0 && messageText != null)
                     messageText.text = "";
             }
-
-            // Polling leve do HP do alvo (10x/s)
-            // Necessário porque SyncVar hooks do monstro não chamam UIManager diretamente.
-            // Para eliminar este polling, implemente um evento no NetworkMonsterEntity
-            // que dispare quando o HP muda e chame UIManager.RefreshTargetPanel().
-            _targetHPUpdateTimer += Time.deltaTime;
-            if (_targetHPUpdateTimer >= TARGET_HP_INTERVAL)
-            {
-                _targetHPUpdateTimer = 0f;
-                PollTargetHP();
-            }
         }
 
         // ── HP / MP ───────────────────────────────────────────────────────
@@ -292,29 +278,6 @@ namespace RPG.UI
                 targetHPText.text = $"{target.CurrentHP:0}/{target.MaxHP:0}";
         }
 
-        private void PollTargetHP()
-        {
-            if (_player == null || targetPanel == null || !targetPanel.activeSelf) return;
-
-            var t = _player.CurrentTarget;
-            if (t == null) return;
-
-            // Verifica se o objeto Unity ainda existe (monstro pode ter sido destruído)
-            if (t is UnityEngine.Object unityObj && unityObj == null)
-            {
-                _player.ClearTarget();
-                ClearTargetPanel();
-                return;
-            }
-
-            if (t.IsDead)
-            {
-                ClearTargetPanel();
-                return;
-            }
-
-            RefreshTargetHP(t);
-        }
 
         public void ClearTargetPanel()
         {

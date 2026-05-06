@@ -365,12 +365,15 @@ namespace RPG.Network
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
             if (dist > aggroRange * 2.5f) { ResetAggro(); return; }
 
-            if (dist <= attackRange)
-            {
-                _attackAccumulator = 0f;
-                _state             = AIState.Combat;
-                if (_agent.isOnNavMesh) _agent.ResetPath();
-            }
+if (dist <= attackRange)
+{
+    // Zera o acumulador mas deixa um tempo mínimo para não atacar instantaneamente
+    // ao entrar em combat. O primeiro ataque acontece após metade do intervalo normal.
+    float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+    _attackAccumulator = attackInterval * 0.5f;
+    _state             = AIState.Combat;
+    if (_agent.isOnNavMesh) _agent.ResetPath();
+}
         }
 
         private void ServerCombat()
@@ -490,27 +493,36 @@ namespace RPG.Network
         }
 
         // ── Aggro ──────────────────────────────────────────────────────────
+[Server]
+private void TryAggro()
+{
+    // Usa layer Targetable que está tanto no player quanto no monstro
+    // Filtra apenas players verificando o componente NetworkPlayer
+    int targetableLayer = 1 << LayerMask.NameToLayer("Targetable");
+    var cols = Physics.OverlapSphere(transform.position, aggroRange, targetableLayer);
 
-        [Server]
-        private void TryAggro()
-        {
-            float closest = aggroRange;
-            NetworkPlayer found = null;
-            foreach (var np in NetworkPlayer.All)
-            {
-                if (np == null || np.Dead) continue;
-                float d = Vector3.Distance(transform.position, np.transform.position);
-                if (d < closest) { closest = d; found = np; }
-            }
-            if (found != null)
-            {
-                _aggroTarget = found;
-                _state       = AIState.Chase;
-                _attackAccumulator = 0f;
-                CancelPatrolWait();
-            }
-        }
+    NetworkPlayer found = null;
+    float closest = aggroRange;
 
+    foreach (var col in cols)
+    {
+        // Só aggroa players, não outros monstros
+        var np = col.GetComponent<NetworkPlayer>();
+        if (np == null || np.Dead) continue;
+
+        float d = Vector3.Distance(transform.position, np.transform.position);
+        if (d < closest) { closest = d; found = np; }
+    }
+
+    if (found != null)
+    {
+        _aggroTarget = found;
+        _state       = AIState.Chase;
+        float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+_attackAccumulator = attackInterval * 0.3f;
+        CancelPatrolWait();
+    }
+}
         [Server]
         private void ResetAggro()
         {
@@ -520,7 +532,8 @@ namespace RPG.Network
                 _agent.ResetPath();
                 _agent.stoppingDistance = 0.3f;
             }
-            _attackAccumulator = 0f;
+            float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+_attackAccumulator = attackInterval * 0.3f;
             _patrolTargetSet   = false;
 
             if (Vector3.Distance(transform.position, _homePosition) > leashRange * 0.5f)
@@ -556,7 +569,8 @@ namespace RPG.Network
             bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
             float dmg  = StatsCalculator.CalculatePhysicalDamage(
                 _stats.ATK, _aggroTarget.ServerStats?.DEF ?? 10f, crit, _stats.CritDMG);
-            _aggroTarget.ServerApplyDamage(dmg);
+            if (!_aggroTarget.Dead)
+    _aggroTarget.ServerApplyDamage(dmg);
             RpcPlayAnim("Attack");
         }
 
@@ -643,7 +657,8 @@ namespace RPG.Network
                         CancelPatrolWait();
                         _aggroTarget       = attacker;
                         _state             = AIState.Chase;
-                        _attackAccumulator = 0f;
+                        float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+_attackAccumulator = attackInterval * 0.3f;
                     }
                     break;
 
@@ -653,7 +668,9 @@ namespace RPG.Network
                         CancelPatrolWait();
                         _aggroTarget       = attacker;
                         _state             = AIState.Chase;
-                        _attackAccumulator = 0f;
+                        // Delay inicial ao aggrar — monstro não ataca instantaneamente ao detectar o player
+float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+_attackAccumulator = attackInterval * 0.3f;
                     }
                     break;
             }
@@ -709,9 +726,15 @@ namespace RPG.Network
             RpcHideVisuals();
             if (respawnDelay <= 0f) yield break;
             yield return new WaitForSeconds(respawnDelay);
-            if (isServer) { _serverResetDone = false; ServerReset(); }
+            if (isServer) StartCoroutine(DelayedRespawn());
         }
-
+[Server]
+private IEnumerator DelayedRespawn()
+{
+    yield return null;
+    _serverResetDone = false;
+    ServerReset();
+}
         // ── NavMesh Helper ─────────────────────────────────────────────────
 
         private bool TryGetRandomAreaPoint(Vector3 center, float radius, out Vector3 result)
@@ -771,7 +794,11 @@ namespace RPG.Network
             }
         }
 
-        private void OnCurrentHPChanged(float _, float v) => healthBarUI?.UpdateBar(v, _maxHP);
+        private void OnCurrentHPChanged(float _, float v)
+{
+    healthBarUI?.UpdateBar(v, _maxHP);
+    UIManager.Instance?.RefreshTargetPanel(this);
+}
 
         private void OnDeadChanged(bool _, bool dead)
         {

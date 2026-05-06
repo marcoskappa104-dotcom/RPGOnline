@@ -76,4 +76,23 @@ namespace RPG.Network
         public bool   Success;
         public string Error;
     }
+	// ── ERRO GENÉRICO ──────────────────────────────────────────────────────────
+
+/// <summary>
+/// Resposta genérica de erro para requisições rejeitadas por falta de autenticação
+/// ou outros erros de protocolo. Evita enviar MsgLoginResponse em contextos errados.
+/// </summary>
+public struct MsgErrorResponse : NetworkMessage
+{
+    public string Error;
+}
+
+// ── CONFIRMAÇÃO DE CENA ────────────────────────────────────────────────────
+
+/// <summary>
+/// Enviado pelo cliente ao servidor quando a GameplayScene terminou de carregar.
+/// O servidor só então spawna o player, garantindo que o NavMeshAgent funciona.
+/// Movido de RPGNetworkManager.cs para cá para centralizar todas as mensagens.
+/// </summary>
+public struct MsgClientSceneReady : NetworkMessage { }
 }

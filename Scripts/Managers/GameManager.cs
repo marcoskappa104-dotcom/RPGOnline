@@ -48,18 +48,21 @@ namespace RPG.Managers
             LoggedUsername = "";
             SceneManager.LoadScene(SCENE_LOGIN);
         }
+/// <summary>
+/// Hash da senha para transmissão segura pela rede.
+/// O servidor re-aplica um salt fixo antes de comparar.
+/// ATENÇÃO: em produção real, use PBKDF2 com salt por usuário no servidor.
+/// </summary>
+public static string HashPassword(string password)
+{
+    // Salt fixo do aplicativo — impede rainbow tables básicas
+    // Troque esta string antes de lançar o jogo
+    const string APP_SALT = "RPG_ONLINE_SALT_2024_TROQUE_ISSO";
 
-        /// <summary>
-        /// Hash SHA-256 para envio seguro de senha ao servidor.
-        /// O servidor armazena e compara apenas o hash — nunca a senha em texto.
-        /// Em produção com banco real externo: adicione salt no servidor.
-        /// </summary>
-        public static string HashPassword(string password)
-        {
-            using var sha256 = System.Security.Cryptography.SHA256.Create();
-            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(password);
-            byte[] hash  = sha256.ComputeHash(bytes);
-            return System.BitConverter.ToString(hash).Replace("-", "").ToLower();
-        }
+    using var sha256 = System.Security.Cryptography.SHA256.Create();
+    byte[] bytes = System.Text.Encoding.UTF8.GetBytes(password + APP_SALT);
+    byte[] hash  = sha256.ComputeHash(bytes);
+    return System.BitConverter.ToString(hash).Replace("-", "").ToLower();
+}
     }
 }

@@ -186,25 +186,15 @@ namespace RPG.Network
                 return;
             }
 
-            // Carrega o personagem diretamente do banco pelo ID
-            var charData = DatabaseManager.Instance?.LoadCharacter(msg.CharacterId);
+// Carrega o personagem verificando ownership em uma única query
+var charData = DatabaseManager.Instance?.LoadCharacterForAccount(msg.CharacterId, session.Username);
 
-            // Verifica se o personagem pertence a esta conta
-            if (charData == null)
-            {
-                conn.Send(new MsgSelectCharacterResponse { Success = false, Error = "Personagem não encontrado." });
-                return;
-            }
-
-            // Segurança: verifica ownership pelo banco (evita seleção de personagem de outra conta)
-            var ownedChars = DatabaseManager.Instance?.LoadCharacters(session.Username);
-            bool owned = ownedChars?.Exists(c => c.CharacterId == msg.CharacterId) ?? false;
-            if (!owned)
-            {
-                conn.Send(new MsgSelectCharacterResponse { Success = false, Error = "Personagem não pertence a esta conta." });
-                Debug.LogWarning($"[ServerAuth] SECURITY: {session.Username} tentou selecionar personagem de outra conta!");
-                return;
-            }
+if (charData == null)
+{
+    conn.Send(new MsgSelectCharacterResponse { Success = false, Error = "Personagem não encontrado ou não pertence a esta conta." });
+    Debug.LogWarning($"[ServerAuth] SECURITY: {session.Username} tentou selecionar personagem {msg.CharacterId}");
+    return;
+}
 
             session.State       = ConnState.InGame;
             session.CharacterId = msg.CharacterId;
@@ -215,19 +205,19 @@ namespace RPG.Network
 
         // ── RequireAuth simplificado ───────────────────────────────────────
 
-        private bool RequireAuth(NetworkConnectionToClient conn, out ConnData session)
-        {
-            if (!_sessions.TryGetValue(conn.connectionId, out session))
-            {
-                conn.Send(new MsgLoginResponse { Success = false, Error = "Sessão inválida." });
-                return false;
-            }
-            if (session.State == ConnState.Unauthenticated)
-            {
-                conn.Send(new MsgLoginResponse { Success = false, Error = "Não autenticado." });
-                return false;
-            }
-            return true;
-        }
+private bool RequireAuth(NetworkConnectionToClient conn, out ConnData session)
+{
+    if (!_sessions.TryGetValue(conn.connectionId, out session))
+    {
+        conn.Send(new MsgErrorResponse { Error = "Sessão inválida." });
+        return false;
+    }
+    if (session.State == ConnState.Unauthenticated)
+    {
+        conn.Send(new MsgErrorResponse { Error = "Não autenticado." });
+        return false;
+    }
+    return true;
+}
     }
 }

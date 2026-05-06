@@ -283,10 +283,4 @@ namespace RPG.Network
             }
         }
     }
-
-    /// <summary>
-    /// Enviado pelo cliente ao servidor quando a GameplayScene terminou de carregar.
-    /// O servidor só então spawna o player, garantindo que o NavMeshAgent funciona.
-    /// </summary>
-    public struct MsgClientSceneReady : NetworkMessage { }
 }
