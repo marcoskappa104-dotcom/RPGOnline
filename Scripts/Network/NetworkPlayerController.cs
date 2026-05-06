@@ -8,25 +8,29 @@ using RPG.Combat;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController v6 — Server-Authoritative
+    /// NetworkPlayerController v7 — Corrigido para RPG Online profissional.
     ///
-    /// CORREÇÕES v6:
-    ///   1. CmdMoveTo agora está neste script (era duplicado com NetworkPlayer).
-    ///      NetworkPlayer.CmdMoveTo foi removido — controlador de input é aqui.
+    /// CORREÇÕES v7:
     ///
-    ///   2. Predição local de movimento: cliente move o agente imediatamente para UX
-    ///      responsivo, servidor confirma e pode corrigir se necessário.
-    ///      Sem predição local o personagem "trava" esperando o RTT do servidor.
+    ///   1. NETWORKтранsform AWARENESS:
+    ///      Este controller usa predição local de movimento (cliente move imediatamente,
+    ///      servidor valida). Para que isso funcione sem jitter, o componente
+    ///      NetworkTransform no prefab do PLAYER LOCAL deve estar configurado com:
+    ///        - Client Authority: TRUE  (ou usar NetworkTransformReliable com isOwned)
+    ///      Caso contrário, o servidor vai sobrescrever a posição local todo frame,
+    ///      causando o efeito de "andar travado".
     ///
-    ///   3. SkillSystem.WalkThenSendCmd passa a usar CmdMoveTo deste controller
-    ///      para manter o servidor ciente do movimento durante uso de skill.
+    ///      CONFIGURAÇÃO OBRIGATÓRIA NO PREFAB:
+    ///        NetworkTransform → Sync Direction: Client To Server
+    ///        (Mirror 2022+: NetworkTransformReliable com syncDirection = ClientToServer)
     ///
-    ///   4. Layer masks validadas com aviso claro se não configuradas.
+    ///   2. Velocidade do NavMeshAgent do player configurada a partir dos stats
+    ///      (MoveSpeed de DerivedStats, não ASPD).
     ///
-    ///   5. Câmera usa LateUpdate para eliminar jitter após o player ser movido
-    ///      no Update.
+    ///   3. Anti-cheat de CmdMoveTo com distância máxima de 80 unidades (jogador
+    ///      não pode teleportar, mas o limite anterior de 100 era grande demais).
     ///
-    ///   6. SetEnabled() público mantido para NetworkPlayer usar na morte/respawn.
+    ///   4. LateUpdate de câmera mantido para evitar jitter pós-movimento.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
@@ -52,16 +56,23 @@ namespace RPG.Network
         private Camera       _cam;
 
         // ── Câmera ─────────────────────────────────────────────────────────
-        private float   _yaw          = 45f;
-        private float   _pitch        = 45f;
-        private float   _distance     = 12f;
+        private float   _yaw         = 45f;
+        private float   _pitch       = 45f;
+        private float   _distance    = 12f;
         private bool    _orbiting;
-        private Vector3 _camVelocity  = Vector3.zero;
+        private Vector3 _camVelocity = Vector3.zero;
 
         private const float PITCH_MIN = 10f;
         private const float PITCH_MAX = 80f;
         private const float DIST_MIN  = 3f;
         private const float DIST_MAX  = 30f;
+
+        // ── Constantes ─────────────────────────────────────────────────────
+        /// <summary>
+        /// Distância máxima permitida para um CmdMoveTo.
+        /// Previne teleporte via cheat. 80u cobre cliques em mapas grandes.
+        /// </summary>
+        private const float MAX_MOVE_DIST = 80f;
 
         // ── Awake ──────────────────────────────────────────────────────────
 
@@ -94,6 +105,11 @@ namespace RPG.Network
             if (_cam == null)
                 Debug.LogWarning("[NetworkPlayerController] Camera.main não encontrada!");
 
+            // Configura velocidade do agente a partir dos stats do player
+            // (será atualizado novamente quando InitializeFromServer rodar)
+            if (_agent != null && _playerEntity != null && _playerEntity.Stats != null)
+                _agent.speed = Mathf.Clamp(_playerEntity.Stats.MoveSpeed, 3f, 7f);
+
             Cursor.visible   = true;
             Cursor.lockState = CursorLockMode.None;
 
@@ -101,7 +117,7 @@ namespace RPG.Network
             Debug.Log("[NetworkPlayerController] Controller local iniciado.");
         }
 
-        // ── Update (input do cliente) ──────────────────────────────────────
+        // ── Update / LateUpdate ────────────────────────────────────────────
 
         private void Update()
         {
@@ -111,9 +127,6 @@ namespace RPG.Network
             HandleCameraOrbit();
         }
 
-        /// <summary>
-        /// LateUpdate para câmera evita jitter quando o player é movido no Update.
-        /// </summary>
         private void LateUpdate()
         {
             if (!isLocalPlayer) return;
@@ -127,17 +140,13 @@ namespace RPG.Network
             if (!Input.GetMouseButtonDown(0)) return;
             if (_cam == null) return;
 
-            // Bloqueia clique sobre UI
             if (UnityEngine.EventSystems.EventSystem.current != null &&
                 UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject())
                 return;
 
             Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-            // 1. Tenta selecionar entidade targetável
             if (TrySelectTargetable(ray)) return;
-
-            // 2. Tenta mover para o terreno
             TryMoveToGround(ray);
         }
 
@@ -168,7 +177,6 @@ namespace RPG.Network
 
             if (!didHit) return;
 
-            // Ignora se atingiu uma entidade ao usar fallback sem layer
             if (terrainLayer == 0 && hit.collider.GetComponentInParent<ITargetable>() != null)
                 return;
 
@@ -180,11 +188,13 @@ namespace RPG.Network
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
 
-            // Predição local: move imediatamente para UX responsivo
+            // Predição local: cliente move imediatamente para UX responsivo
+            // IMPORTANTE: NetworkTransform do player DEVE ter syncDirection = ClientToServer
+            // para que esta posição local não seja sobrescrita pelo servidor.
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.SetDestination(dest);
 
-            // Confirma no servidor (servidor re-valida e aplica)
+            // Confirma no servidor (servidor valida e aplica)
             CmdMoveTo(dest);
             SpawnMoveIndicator(hit.point);
         }
@@ -228,7 +238,6 @@ namespace RPG.Network
             Vector3    pivot  = transform.position + Vector3.up * 1.5f;
             Vector3    target = pivot + offset;
 
-            // Suaviza movimento da câmera para eliminar jitter
             _cam.transform.position = Vector3.SmoothDamp(
                 _cam.transform.position, target, ref _camVelocity, cameraSmoothTime);
             _cam.transform.LookAt(pivot);
@@ -238,7 +247,12 @@ namespace RPG.Network
 
         /// <summary>
         /// Movimento server-authoritative com anti-teleport.
-        /// O cliente já moveu localmente (predição); o servidor valida e confirma.
+        ///
+        /// NOTA SOBRE SINCRONIZAÇÃO:
+        /// O cliente já moveu o agente localmente (predição). O servidor valida
+        /// e aplica o mesmo destino. Como o NetworkTransform está configurado com
+        /// ClientToServer, o servidor NÃO sobrescreve a posição do cliente local —
+        /// apenas registra e transmite para outros jogadores.
         /// </summary>
         [Command]
         public void CmdMoveTo(Vector3 destination)
@@ -246,9 +260,8 @@ namespace RPG.Network
             var netPlayer = GetComponent<NetworkPlayer>();
             if (netPlayer == null || netPlayer.Dead) return;
 
-            // Anti-cheat: rejeita destinos muito distantes
             float dist = Vector3.Distance(transform.position, destination);
-            if (dist > 100f)
+            if (dist > MAX_MOVE_DIST)
             {
                 Debug.LogWarning($"[Server] CmdMoveTo suspeito: dist={dist:0.0} para {netPlayer.CharacterName}");
                 return;
@@ -264,9 +277,6 @@ namespace RPG.Network
 
         // ── API pública ────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Chamado por NetworkPlayer na morte/respawn para bloquear/liberar input.
-        /// </summary>
         public void SetEnabled(bool value)
         {
             enabled = value;

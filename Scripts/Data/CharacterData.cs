@@ -1,8 +1,3 @@
-// ═══════════════════════════════════════════════════════
-// CharacterData.cs — ADIÇÃO: campo RaceInt para serialização de rede
-// Substitua o arquivo Scripts/Data/CharacterData.cs pelo conteúdo abaixo.
-// ═══════════════════════════════════════════════════════
-
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -17,10 +12,6 @@ namespace RPG.Data
         public string        CharacterName;
         public CharacterRace Race;
 
-        /// <summary>
-        /// Inteiro da raça — necessário para serialização em SyncVars de rede.
-        /// Mantido sincronizado com Race.
-        /// </summary>
         public int RaceInt
         {
             get => (int)Race;
@@ -31,28 +22,20 @@ namespace RPG.Data
         public long          Experience             = 0;
         public long          ExperienceToNextLevel  = 100;
 
-        // Atributos base fixos (definidos na criação, nunca mudam)
         public BaseAttributes    BaseAttributes   = new BaseAttributes();
         public EquipmentBonuses  EquipmentBonuses = new EquipmentBonuses();
 
-        // Posição salva
         public float  PosX, PosY, PosZ;
         public string CurrentMap = "World_01";
 
-        // HP/MP persistidos
         public float CurrentHP;
         public float CurrentMP;
 
-        // Pontos de atributo livres
         public int FreeAttributePoints = 0;
 
-        // Atributos alocados pelo jogador
         public int AllocatedSTR, AllocatedAGI, AllocatedVIT;
         public int AllocatedDEX, AllocatedINT, AllocatedLUK;
 
-        /// <summary>
-        /// Calcula stats derivados SEM modificar este objeto (sem side-effects).
-        /// </summary>
         public DerivedStats GetDerivedStats(BuffBonuses buff = null)
         {
             return StatsCalculator.Calculate(
@@ -70,10 +53,7 @@ namespace RPG.Data
             return (long)(100 * Mathf.Pow(level, 1.5f));
         }
 
-        /// <summary>
-        /// Adiciona XP e processa level-ups. Retorna true se houve level-up.
-        /// Usado APENAS no servidor.
-        /// </summary>
+        /// <summary>Adiciona XP e processa level-ups. Retorna true se houve level-up. Servidor only.</summary>
         public bool AddExperience(long amount)
         {
             Experience += amount;

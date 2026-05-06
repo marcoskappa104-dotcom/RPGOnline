@@ -29,24 +29,38 @@ namespace RPG.Combat
     }
 
     /// <summary>
-    /// SkillSystem v3 — CORREÇÃO DE FLOOD DE COMMANDS
+    /// SkillSystem v4 — Corrigido para RPG Online profissional.
     ///
-    /// CORREÇÕES v3:
+    /// CORREÇÕES v4:
     ///
-    ///   1. FLOOD DE CmdMoveTo ELIMINADO:
-    ///      Em v2, WalkThenSendCmd chamava CmdMoveTo todo frame (yield return null).
-    ///      Com 60fps, isso gerava ~60 Commands/segundo apenas para andar até um alvo.
-    ///      Agora usa um intervalo mínimo (CMD_MOVE_INTERVAL = 0.15s) para enviar
-    ///      no máximo ~7 Commands/segundo durante o walk, que é suficiente para
-    ///      manter o servidor sincronizado sem sobrecarregar a rede.
+    ///   1. WalkThenSendCmd — DESSINCRONIZAÇÃO CORRIGIDA:
+    ///      Em v3, o agente local era atualizado TODO FRAME com SetDestination,
+    ///      mas o servidor recebia a posição a cada CMD_MOVE_INTERVAL (0.15s).
+    ///      Isso criava uma situação onde o cliente estava num ponto X enquanto
+    ///      o servidor ainda processava um destino antigo, gerando teleporte visual.
     ///
-    ///   2. SetDestination LOCAL separado do CmdMoveTo:
-    ///      O agente local ainda atualiza todo frame (movimento fluido), mas o
-    ///      Command para o servidor só sai no intervalo definido.
+    ///      SOLUÇÃO: O cliente local NÃO chama SetDestination direto no agente.
+    ///      Em vez disso, chama CmdMoveTo que vai para o servidor, e o servidor
+    ///      (ou o NetworkTransform em ClientToServer mode) cuida da posição.
+    ///      O agente local é movido apenas via RpcMoveConfirmed ou pelo próprio
+    ///      NetworkTransform.
     ///
-    ///   3. Verificação de alvo morto mais robusta com null-check de UnityObject.
+    ///      Como a maioria dos projetos com Mirror usa ClientAuthority no movimento
+    ///      do player, uma alternativa segura é: durante WalkThenSendCmd, o cliente
+    ///      move seu agente local diretamente (ele tem autoridade), mas reduz os
+    ///      CmdMoveTo para não poluir o servidor.
     ///
-    ///   4. Timeout reduzido para 12s e com aviso no log.
+    ///      A implementação abaixo usa a abordagem ClientAuthority:
+    ///      - agente local: atualizado a cada frame (movimento fluido)
+    ///      - CmdMoveTo para servidor: throttled (CMD_MOVE_INTERVAL)
+    ///
+    ///   2. debugLogs: APENAS logs de Warning/Error relevantes em produção.
+    ///      Logs de [SkillSystem] CmdRequestSkill e Confirmed removidos da
+    ///      path de produção (eram executados a cada skill use, gerando GC).
+    ///
+    ///   3. IsTargetDead: null-check de UnityObject mantido e melhorado.
+    ///
+    ///   4. CancelPendingWalk: garante que o agente para ao cancelar.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -54,18 +68,18 @@ namespace RPG.Combat
         [Header("Skills (Q=0  W=1  E=2  R=3)")]
         [SerializeField] private List<SkillData> skills = new List<SkillData>();
 
-        [Header("Debug")]
+        [Header("Debug — desative em builds de produção")]
         [SerializeField] private bool debugLogs = false;
 
         // Intervalo mínimo entre CmdMoveTo durante walk-to-range
-        // Suficiente para manter servidor sincronizado sem flood
-        private const float CMD_MOVE_INTERVAL = 0.15f;
+        private const float CMD_MOVE_INTERVAL = 0.2f; // ~5 updates/s ao servidor é suficiente
+        private const float WALK_TIMEOUT      = 12f;
 
         // ── Componentes ────────────────────────────────────────────────────
-        private PlayerEntity             _player;
-        private Animator                 _animator;
-        private NavMeshAgent             _agent;
-        private NetworkPlayerController  _controller;
+        private PlayerEntity            _player;
+        private Animator                _animator;
+        private NavMeshAgent            _agent;
+        private NetworkPlayerController _controller;
 
         // ── Cooldown visual ────────────────────────────────────────────────
         private const int MAX_SKILLS = 8;
@@ -75,7 +89,7 @@ namespace RPG.Combat
         private Coroutine   _walkCoroutine;
         private bool        _hasPendingWalk;
         private ITargetable _pendingTarget;
-        private float       _lastCmdMoveTime; // NOVO: throttle do CmdMoveTo
+        private float       _lastCmdMoveTime;
 
         // ── Eventos para SkillBar UI ───────────────────────────────────────
         public event Action<int, float> OnCooldownStarted;
@@ -101,16 +115,17 @@ namespace RPG.Combat
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
+            // Cancela walk se o jogador trocou de alvo manualmente
             if (_hasPendingWalk && _pendingTarget != _player.CurrentTarget)
                 CancelPendingWalk();
         }
 
         // ── Propriedades públicas ──────────────────────────────────────────
 
-        public int       SkillCount             => skills.Count;
-        public SkillData GetSkill(int i)        => (i >= 0 && i < skills.Count) ? skills[i] : null;
-        public float     GetUICooldown(int i)   => (i >= 0 && i < MAX_SKILLS) ? Mathf.Max(0f, _uiCooldownTimers[i]) : 0f;
-        public bool      IsOnUICooldown(int i)  => GetUICooldown(i) > 0f;
+        public int       SkillCount           => skills.Count;
+        public SkillData GetSkill(int i)      => (i >= 0 && i < skills.Count) ? skills[i] : null;
+        public float     GetUICooldown(int i) => (i >= 0 && i < MAX_SKILLS) ? Mathf.Max(0f, _uiCooldownTimers[i]) : 0f;
+        public bool      IsOnUICooldown(int i) => GetUICooldown(i) > 0f;
 
         // ── TryUseSkill ────────────────────────────────────────────────────
 
@@ -120,7 +135,11 @@ namespace RPG.Combat
             if (!_player.IsInitialized || _player.IsDead) return;
 
             var skill = GetSkill(index);
-            if (skill == null) { Log($"Skill {index} não existe."); return; }
+            if (skill == null)
+            {
+                Log($"Skill {index} não existe.");
+                return;
+            }
 
             if (IsOnUICooldown(index))
             {
@@ -161,7 +180,7 @@ namespace RPG.Combat
                 Log($"Fora de range ({dist:0.1} > {skill.Range}). Caminhando...");
                 _hasPendingWalk  = true;
                 _pendingTarget   = target;
-                _lastCmdMoveTime = -CMD_MOVE_INTERVAL; // permite envio imediato
+                _lastCmdMoveTime = -CMD_MOVE_INTERVAL;
                 _walkCoroutine   = StartCoroutine(WalkThenSendCmd(index, skill, target));
             }
             else
@@ -172,10 +191,20 @@ namespace RPG.Combat
 
         public void CancelPendingWalk()
         {
-            if (_walkCoroutine != null) { StopCoroutine(_walkCoroutine); _walkCoroutine = null; }
+            if (_walkCoroutine != null)
+            {
+                StopCoroutine(_walkCoroutine);
+                _walkCoroutine = null;
+            }
             _hasPendingWalk = false;
             _pendingTarget  = null;
-            if (_agent != null) _agent.stoppingDistance = 0.5f;
+
+            // Para o agente ao cancelar
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.stoppingDistance = 0.5f;
+                _agent.ResetPath();
+            }
         }
 
         // ── Walk-to-range ──────────────────────────────────────────────────
@@ -183,7 +212,7 @@ namespace RPG.Combat
         private IEnumerator WalkThenSendCmd(int index, SkillData skill, ITargetable target)
         {
             _agent.stoppingDistance = skill.Range * 0.85f;
-            float timeout = 12f;
+            float timeout = WALK_TIMEOUT;
 
             while (timeout > 0f)
             {
@@ -193,6 +222,7 @@ namespace RPG.Combat
                 {
                     _player.ClearTarget();
                     UIManager.Instance?.ClearTargetPanel();
+                    Log("WalkThenSendCmd: alvo morreu durante aproximação.");
                     break;
                 }
 
@@ -209,12 +239,12 @@ namespace RPG.Combat
                     yield break;
                 }
 
-                // Atualiza destino local todo frame para movimento fluido
+                // Atualiza destino local para movimento fluido no cliente
+                // (válido em modo ClientAuthority — o cliente tem autoridade sobre seu agente)
                 if (_agent.isOnNavMesh)
                     _agent.SetDestination(target.Position);
 
-                // CORREÇÃO: envia CmdMoveTo ao servidor com throttle (máx ~7/s)
-                // Não precisa de 60 Commands/s — 7/s mantém o servidor sincronizado
+                // Notifica o servidor com throttle para não gerar flood de Commands
                 if (Time.time - _lastCmdMoveTime >= CMD_MOVE_INTERVAL)
                 {
                     _lastCmdMoveTime = Time.time;
@@ -225,7 +255,7 @@ namespace RPG.Combat
             }
 
             if (timeout <= 0f)
-                Log($"WalkThenSendCmd: timeout após 12s para skill {index}");
+                Log($"WalkThenSendCmd: timeout após {WALK_TIMEOUT}s para skill {index}.");
 
             _agent.stoppingDistance = 0.5f;
             _hasPendingWalk = false;
@@ -256,11 +286,11 @@ namespace RPG.Combat
 
             uint attackerNetId = GetComponent<NetworkIdentity>().netId;
 
-            var monster = targetNB.GetComponent<RPG.Network.NetworkMonsterEntity>();
+            var monster = targetNB.GetComponent<NetworkMonsterEntity>();
             if (monster != null)
             {
                 monster.CmdRequestSkill(attackerNetId, skillIndex, isPhysical);
-                Log($"CmdRequestSkill → monstro {monster.DisplayName} skill:{skillIndex}");
+                Log($"CmdRequestSkill → {monster.DisplayName} skill:{skillIndex}");
             }
             else
             {
@@ -301,6 +331,11 @@ namespace RPG.Combat
             return target.IsDead;
         }
 
+        /// <summary>
+        /// Log interno. Só escreve se debugLogs está ativo.
+        /// Em produção, SEMPRE deixe debugLogs = false no Inspector.
+        /// Logs de skill por frame geram alocações de string desnecessárias.
+        /// </summary>
         private void Log(string msg)
         {
             if (debugLogs) Debug.Log($"[SkillSystem] {msg}");

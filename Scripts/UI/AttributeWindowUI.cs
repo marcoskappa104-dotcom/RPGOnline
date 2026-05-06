@@ -252,7 +252,7 @@ namespace RPG.UI
             if (mpregenText   != null) mpregenText.text   = $"{s.MPRegen:0.0}/5s";
         }
 
-        private void RefreshXPBar(long exp, long expToNext)
+        public  void RefreshXPBar(long exp, long expToNext)
         {
             if (xpBar != null)
             {

@@ -13,27 +13,29 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v9
+    /// NetworkPlayer v10 — Corrigido para RPG Online profissional.
     ///
-    /// CORREÇÕES v9:
+    /// CORREÇÕES v10:
     ///
-    ///   1. ServerGrantExp CORRIGIDO — Agora usa CharacterData.AddExperience()
-    ///      para processar level-up, depois sincroniza os SyncVars a partir do
-    ///      _serverCharData. Antes havia duplicação da lógica de level-up entre
-    ///      este método e CharacterData, causando inconsistência nos saves.
+    ///   1. GUARDA DO RpcInitializeLocalPlayer CORRIGIDA:
+    ///      A condição anterior verificava GetComponent<PlayerEntity>() == null,
+    ///      que nunca era true (componente existe no prefab). A race condition
+    ///      real é quando _playerEntity ainda não foi cacheado em OnStartLocalPlayer.
+    ///      Agora verifica _playerEntity == null (a referência cacheada).
     ///
-    ///   2. _clientInitialized NÃO bloqueia mais re-init:
-    ///      Se o RpcInitializeLocalPlayer chegar antes do OnStartLocalPlayer
-    ///      (race condition), o dado fica em _pendingInitData. Quando
-    ///      OnStartLocalPlayer roda, ele chama DelayedClientInit com os dados
-    ///      pendentes. O flag só é setado true dentro de DelayedClientInit,
-    ///      garantindo que o init sempre acontece exatamente uma vez.
+    ///   2. ACCOUNTDATA CACHEADA no servidor:
+    ///      ServerSaveCharacter antes chamava LoadAccount (leitura de disco) toda vez.
+    ///      Agora o AccountData é carregado uma vez em ServerInitialize e cacheado
+    ///      em _serverAccount. Saves subsequentes apenas atualizam o objeto cacheado
+    ///      e escrevem no disco sem reler.
     ///
-    ///   3. CmdMoveTo removido deste arquivo — responsabilidade exclusiva do
-    ///      NetworkPlayerController. Mantida apenas a referência ao agent para
-    ///      uso interno do servidor (SetDestination em respawn, etc.).
+    ///   3. EVENTO OnExpChanged adicionado ao NetworkPlayer:
+    ///      UIManager e AttributeWindowUI podem se inscrever neste evento em vez de
+    ///      ler XP todo frame no Update.
     ///
-    ///   4. MOVING_CMD_INTERVAL reduzido para 0.1s para animação mais responsiva.
+    ///   4. MOVING_CMD_INTERVAL mantido em 0.1s (suficiente para animação responsiva).
+    ///
+    ///   5. CmdMoveTo permanece em NetworkPlayerController (sem duplicação).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -41,23 +43,23 @@ namespace RPG.Network
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        private const int   MAX_LEVEL       = 99;
-        private const float MAX_HP_CAP      = 500_000f;
-        private const float MAX_MP_CAP      = 200_000f;
-        private const float SAVE_INTERVAL   = 60f;
+        private const int   MAX_LEVEL     = 99;
+        private const float MAX_HP_CAP    = 500_000f;
+        private const float MAX_MP_CAP    = 200_000f;
+        private const float SAVE_INTERVAL = 60f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
-        [SyncVar(hook = nameof(OnNetNameChanged))]   public string CharacterName = "...";
-        [SyncVar]                                     public string RaceStr = "Human";
-        [SyncVar(hook = nameof(OnNetLevelChanged))]  public int    Level = 1;
-        [SyncVar(hook = nameof(OnNetHPChanged))]     public float  CurrentHP = 0f;
-        [SyncVar(hook = nameof(OnNetMaxHPChanged))]  public float  MaxHP = 1f;
-        [SyncVar(hook = nameof(OnNetMPChanged))]     public float  CurrentMP = 0f;
-        [SyncVar(hook = nameof(OnNetMaxMPChanged))]  public float  MaxMP = 1f;
-        [SyncVar(hook = nameof(OnNetMovingChanged))] public bool   IsMoving = false;
-        [SyncVar] public long Experience            = 0;
-        [SyncVar] public long ExperienceToNextLevel = 100;
-        [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int FreeAttributePoints = 0;
+        [SyncVar(hook = nameof(OnNetNameChanged))]    public string CharacterName         = "...";
+        [SyncVar]                                      public string RaceStr               = "Human";
+        [SyncVar(hook = nameof(OnNetLevelChanged))]   public int    Level                 = 1;
+        [SyncVar(hook = nameof(OnNetHPChanged))]      public float  CurrentHP             = 0f;
+        [SyncVar(hook = nameof(OnNetMaxHPChanged))]   public float  MaxHP                 = 1f;
+        [SyncVar(hook = nameof(OnNetMPChanged))]      public float  CurrentMP             = 0f;
+        [SyncVar(hook = nameof(OnNetMaxMPChanged))]   public float  MaxMP                 = 1f;
+        [SyncVar(hook = nameof(OnNetMovingChanged))]  public bool   IsMoving              = false;
+        [SyncVar(hook = nameof(OnNetExpChanged))]     public long   Experience            = 0;
+        [SyncVar(hook = nameof(OnNetExpChanged))]     public long   ExperienceToNextLevel = 100;
+        [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int FreeAttributePoints   = 0;
         [SyncVar] public int AllocatedSTR = 0;
         [SyncVar] public int AllocatedAGI = 0;
         [SyncVar] public int AllocatedVIT = 0;
@@ -92,6 +94,7 @@ namespace RPG.Network
 
         // ── Estado do servidor ─────────────────────────────────────────────
         private CharacterData _serverCharData;
+        private AccountData   _serverAccount;   // CORREÇÃO: cacheado, não relido do disco
         private DerivedStats  _serverStats;
         private string        _serverAccountUsername;
         private float         _autoSaveTimer;
@@ -107,8 +110,8 @@ namespace RPG.Network
         private CharacterData _pendingInitData   = null;
 
         // ── Movimento ─────────────────────────────────────────────────────
-        private float _lastMovingCmdTime;
-        private const float MOVING_CMD_INTERVAL = 0.1f; // CORREÇÃO: era 0.15s
+        private float       _lastMovingCmdTime;
+        private const float MOVING_CMD_INTERVAL = 0.1f;
 
         public bool Dead => CurrentHP <= 0f;
 
@@ -151,7 +154,7 @@ namespace RPG.Network
 
             Debug.Log("[NetworkPlayer] Local player ativo — aguardando RpcInitializeLocalPlayer.");
 
-            // CORREÇÃO: verifica dados pendentes de race condition
+            // Processa dados pendentes (race condition: RPC chegou antes do OnStartLocalPlayer)
             if (_pendingClientInit && _pendingInitData != null)
             {
                 var data = _pendingInitData;
@@ -198,6 +201,9 @@ namespace RPG.Network
             _serverAccountUsername = accountUsername;
             _serverCharData        = charData;
             _serverStats           = charData.GetDerivedStats();
+
+            // CORREÇÃO: carrega e cacheia o AccountData uma única vez
+            _serverAccount = SaveManager.Instance?.LoadAccount(accountUsername);
 
             float maxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
             float maxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
@@ -282,6 +288,10 @@ namespace RPG.Network
             if (CurrentHP > MaxHP) CurrentHP = MaxHP;
             if (CurrentMP > MaxMP) CurrentMP = MaxMP;
 
+            // Atualiza velocidade do agente com o novo MoveSpeed
+            if (_agent != null && _agent.isOnNavMesh)
+                _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+
             ServerSaveCharacter();
         }
 
@@ -344,9 +354,8 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// CORRIGIDO: Usa CharacterData.AddExperience() para processar level-up,
-        /// depois sincroniza os SyncVars a partir do estado do _serverCharData.
-        /// Elimina a duplicação de lógica de level-up e garante consistência nos saves.
+        /// Usa CharacterData.AddExperience() como fonte da verdade para level-up.
+        /// Sincroniza SyncVars a partir do _serverCharData após processamento.
         /// </summary>
         [Server]
         public void ServerGrantExp(long amount)
@@ -355,7 +364,6 @@ namespace RPG.Network
 
             bool leveledUp = _serverCharData.AddExperience(amount);
 
-            // Sincroniza SyncVars a partir do CharacterData (fonte da verdade)
             Experience            = _serverCharData.Experience;
             ExperienceToNextLevel = _serverCharData.ExperienceToNextLevel;
             Level                 = _serverCharData.Level;
@@ -363,7 +371,6 @@ namespace RPG.Network
 
             if (leveledUp)
             {
-                // Recalcula stats após level-up
                 _serverStats = _serverCharData.GetDerivedStats();
                 MaxHP        = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
                 MaxMP        = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
@@ -372,6 +379,10 @@ namespace RPG.Network
 
                 _serverCharData.CurrentHP = MaxHP;
                 _serverCharData.CurrentMP = MaxMP;
+
+                // Atualiza velocidade do agente após level up
+                if (_agent != null && _agent.isOnNavMesh)
+                    _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
@@ -393,8 +404,6 @@ namespace RPG.Network
         {
             if (!isLocalPlayer) return;
 
-            // CORREÇÃO: não bloqueia com _clientInitialized aqui.
-            // Se OnStartLocalPlayer ainda não rodou, guarda e aguarda.
             var data = new CharacterData
             {
                 CharacterName         = charName,
@@ -418,8 +427,9 @@ namespace RPG.Network
                 }
             };
 
-            // Se OnStartLocalPlayer ainda não rodou, guarda para depois
-            if (GetComponent<PlayerEntity>() == null || !gameObject.activeInHierarchy)
+            // CORREÇÃO: verifica _playerEntity (referência cacheada), não GetComponent
+            // _playerEntity é null se OnStartLocalPlayer ainda não rodou
+            if (_playerEntity == null)
             {
                 _pendingClientInit = true;
                 _pendingInitData   = data;
@@ -434,7 +444,6 @@ namespace RPG.Network
         {
             yield return null;
 
-            // Garante que só inicializa uma vez
             if (_clientInitialized) yield break;
             _clientInitialized = true;
 
@@ -536,10 +545,20 @@ namespace RPG.Network
             RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);
         }
 
+        /// <summary>
+        /// CORREÇÃO: Usa _serverAccount cacheado em vez de reler do disco a cada save.
+        /// Só faz I/O de escrita, não de leitura.
+        /// </summary>
         [Server]
         public void ServerSaveCharacter()
         {
             if (_serverCharData == null || string.IsNullOrEmpty(_serverAccountUsername)) return;
+            if (_serverAccount == null)
+            {
+                // Fallback: só acontece se ServerInitialize falhou em cachear
+                _serverAccount = SaveManager.Instance?.LoadAccount(_serverAccountUsername);
+                if (_serverAccount == null) return;
+            }
 
             _serverCharData.CurrentHP = CurrentHP;
             _serverCharData.CurrentMP = CurrentMP;
@@ -547,10 +566,7 @@ namespace RPG.Network
             _serverCharData.PosY      = transform.position.y;
             _serverCharData.PosZ      = transform.position.z;
 
-            var account = SaveManager.Instance?.LoadAccount(_serverAccountUsername);
-            if (account == null) return;
-
-            SaveManager.Instance?.SaveCharacter(account, _serverCharData);
+            SaveManager.Instance?.SaveCharacter(_serverAccount, _serverCharData);
         }
 
         [Server]
@@ -620,6 +636,17 @@ namespace RPG.Network
         private void OnNetMovingChanged(bool _, bool v)
         {
             if (!isLocalPlayer) _animator?.SetBool("IsMoving", v);
+        }
+
+        /// <summary>
+        /// Hook para Experience e ExperienceToNextLevel.
+        /// UIManager usa este hook via evento — sem polling no Update.
+        /// </summary>
+        private void OnNetExpChanged(long _, long __)
+        {
+            if (!isLocalPlayer) return;
+            UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
+            AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
     }
 }

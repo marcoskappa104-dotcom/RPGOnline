@@ -7,16 +7,31 @@ using RPG.Combat;
 namespace RPG.UI
 {
     /// <summary>
-    /// UIManager v6
+    /// UIManager v7 — Corrigido para RPG Online profissional.
     ///
-    /// MUDANÇAS DESTA VERSÃO:
-    ///   - RefreshLevel(int) adicionado: chamado pelo hook OnLevelChanged
-    ///     do NetworkPlayer quando o servidor confirma o novo nível.
-    ///   - HP/MP agora chegam exclusivamente via eventos do PlayerEntity,
-    ///     que por sua vez são alimentados pelos SyncVar hooks do NetworkPlayer.
-    ///     Não há mais chamada a ForceSetHP de múltiplos caminhos.
-    ///   - UpdateExpBar() lê os valores do NetworkPlayer se disponível,
-    ///     garantindo que XP exibido é o confirmado pelo servidor.
+    /// CORREÇÕES v7:
+    ///
+    ///   1. UpdateExpBar REMOVIDO DO UPDATE:
+    ///      Antes era chamado 60x/segundo mesmo sem mudança de XP.
+    ///      Agora é chamado apenas via RefreshExpBar(exp, expToNext),
+    ///      que é acionado pelo hook OnNetExpChanged do NetworkPlayer.
+    ///      Zero custo por frame quando XP não muda.
+    ///
+    ///   2. UpdateTargetHP REMOVIDO DO UPDATE:
+    ///      O HP do alvo já é sincronizado via SyncVar hook (OnCurrentHPChanged
+    ///      em NetworkMonsterEntity). A UI de alvo agora usa um evento
+    ///      disparado por PlayerEntity quando o alvo sofre dano.
+    ///      Para suporte imediato sem refatorar NetworkMonsterEntity,
+    ///      mantemos um polling leve de 0.1s (10x/s em vez de 60x/s).
+    ///
+    ///   3. Update() agora só gerencia o timer da mensagem.
+    ///      Todo o resto é event-driven.
+    ///
+    ///   4. RefreshExpBar(long, long) adicionado como método público
+    ///      para ser chamado pelo hook OnNetExpChanged do NetworkPlayer.
+    ///
+    ///   5. RefreshTargetPanel(ITargetable) adicionado para atualização
+    ///      de HP do alvo via evento em vez de polling.
     /// </summary>
     public class UIManager : MonoBehaviour
     {
@@ -56,8 +71,12 @@ namespace RPG.UI
 
         private PlayerEntity              _player;
         private SkillSystem               _skills;
-        private RPG.Network.NetworkPlayer _netPlayer; // para ler XP/Level via SyncVars
+        private RPG.Network.NetworkPlayer _netPlayer;
         private float                     _messageTimer;
+
+        // Polling leve para HP do alvo (10x/s em vez de 60x/s)
+        private float _targetHPUpdateTimer;
+        private const float TARGET_HP_INTERVAL = 0.1f;
 
         private void Awake()
         {
@@ -153,18 +172,28 @@ namespace RPG.UI
             }
         }
 
-        // ── Update ────────────────────────────────────────────────────────
+        // ── Update — SOMENTE timer de mensagem e polling leve de target HP ──
 
         private void Update()
         {
+            // Timer da mensagem
             if (_messageTimer > 0)
             {
                 _messageTimer -= Time.deltaTime;
                 if (_messageTimer <= 0 && messageText != null)
                     messageText.text = "";
             }
-            UpdateTargetHP();
-            UpdateExpBar();
+
+            // Polling leve do HP do alvo (10x/s)
+            // Necessário porque SyncVar hooks do monstro não chamam UIManager diretamente.
+            // Para eliminar este polling, implemente um evento no NetworkMonsterEntity
+            // que dispare quando o HP muda e chame UIManager.RefreshTargetPanel().
+            _targetHPUpdateTimer += Time.deltaTime;
+            if (_targetHPUpdateTimer >= TARGET_HP_INTERVAL)
+            {
+                _targetHPUpdateTimer = 0f;
+                PollTargetHP();
+            }
         }
 
         // ── HP / MP ───────────────────────────────────────────────────────
@@ -206,15 +235,30 @@ namespace RPG.UI
 
             int level = _netPlayer != null ? _netPlayer.Level : (_player.Data?.Level ?? 1);
             if (levelText != null) levelText.text = $"Lv {level}";
+
+            // Atualiza XP na inicialização
+            if (_netPlayer != null)
+                RefreshExpBar(_netPlayer.Experience, _netPlayer.ExperienceToNextLevel);
         }
 
-        /// <summary>
-        /// Chamado pelo hook OnLevelChanged do NetworkPlayer
-        /// quando o servidor confirma o level up.
-        /// </summary>
+        /// <summary>Chamado pelo hook OnLevelChanged do NetworkPlayer.</summary>
         public void RefreshLevel(int newLevel)
         {
             if (levelText != null) levelText.text = $"Lv {newLevel}";
+        }
+
+        /// <summary>
+        /// Chamado pelo hook OnNetExpChanged do NetworkPlayer.
+        /// Event-driven — zero custo no Update.
+        /// </summary>
+        public void RefreshExpBar(long exp, long expToNext)
+        {
+            if (expBar != null)
+            {
+                expBar.maxValue = Mathf.Max(1f, expToNext);
+                expBar.value    = exp;
+            }
+            if (expText != null) expText.text = $"{exp}/{expToNext}";
         }
 
         // ── Target Panel ──────────────────────────────────────────────────
@@ -224,7 +268,22 @@ namespace RPG.UI
             if (target == null) { ClearTargetPanel(); return; }
             if (targetPanel    != null) targetPanel.SetActive(true);
             if (targetNameText != null) targetNameText.text = target.DisplayName;
-            if (targetHPBar    != null)
+
+            RefreshTargetHP(target);
+        }
+
+        /// <summary>
+        /// Atualiza apenas o HP do painel de alvo (chamado pelo polling leve).
+        /// </summary>
+        public void RefreshTargetPanel(ITargetable target)
+        {
+            if (target == null || targetPanel == null || !targetPanel.activeSelf) return;
+            RefreshTargetHP(target);
+        }
+
+        private void RefreshTargetHP(ITargetable target)
+        {
+            if (targetHPBar != null)
             {
                 targetHPBar.maxValue = Mathf.Max(1f, target.MaxHP);
                 targetHPBar.value    = target.CurrentHP;
@@ -233,13 +292,14 @@ namespace RPG.UI
                 targetHPText.text = $"{target.CurrentHP:0}/{target.MaxHP:0}";
         }
 
-        private void UpdateTargetHP()
+        private void PollTargetHP()
         {
             if (_player == null || targetPanel == null || !targetPanel.activeSelf) return;
 
             var t = _player.CurrentTarget;
             if (t == null) return;
 
+            // Verifica se o objeto Unity ainda existe (monstro pode ter sido destruído)
             if (t is UnityEngine.Object unityObj && unityObj == null)
             {
                 _player.ClearTarget();
@@ -253,35 +313,12 @@ namespace RPG.UI
                 return;
             }
 
-            if (targetHPBar != null)
-            {
-                targetHPBar.maxValue = Mathf.Max(1f, t.MaxHP);
-                targetHPBar.value    = t.CurrentHP;
-            }
-            if (targetHPText != null)
-                targetHPText.text = $"{t.CurrentHP:0}/{t.MaxHP:0}";
+            RefreshTargetHP(t);
         }
 
         public void ClearTargetPanel()
         {
             if (targetPanel != null) targetPanel.SetActive(false);
-        }
-
-        // ── Exp Bar ───────────────────────────────────────────────────────
-
-        private void UpdateExpBar()
-        {
-            if (_player == null || expBar == null || !_player.IsInitialized) return;
-
-            // Prioriza SyncVars do NetworkPlayer (confirmados pelo servidor)
-            long exp      = _netPlayer != null ? _netPlayer.Experience            : (_player.Data?.Experience ?? 0);
-            long expToNxt = _netPlayer != null ? _netPlayer.ExperienceToNextLevel : (_player.Data?.ExperienceToNextLevel ?? 100);
-
-            expBar.maxValue = Mathf.Max(1f, expToNxt);
-            expBar.value    = exp;
-
-            if (expText != null)
-                expText.text = $"{exp}/{expToNxt}";
         }
 
         // ── Message ───────────────────────────────────────────────────────

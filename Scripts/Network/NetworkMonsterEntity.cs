@@ -13,25 +13,29 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v14
+    /// NetworkMonsterEntity v15 — Corrigido para RPG Online profissional.
     ///
-    /// CORREÇÕES v14:
+    /// CORREÇÕES v15:
     ///
-    ///   1. ORDEM DE SPAWN CORRIGIDA (causa raiz da patrulha quebrada):
-    ///      Em versões anteriores, OnStartServer() chamava ServerReset() com
-    ///      _homePosition = Vector3.zero porque SetSpawnData() ainda não havia rodado.
-    ///      O monstro era teleportado para a origem (0,0,0) e patrulhava lá.
-    ///      SOLUÇÃO: OnStartServer() NÃO chama ServerReset(). SetSpawnData() define
-    ///      _homePosition e então chama ServerReset(). Para monstros colocados
-    ///      manualmente na cena (sem SetSpawnData), o primeiro Update() do servidor
-    ///      detecta o flag e chama ServerReset() com transform.position como home.
+    ///   1. _agent.speed agora usa _stats.MoveSpeed (3~7 m/s), NÃO _stats.ASPD.
+    ///      ASPD é a cadência de ataque (ataques/segundo), não velocidade de movimento.
+    ///      Antes: monstro com AGI=8 andava a 6.6 m/s (ASPD). Agora: ~4.2 m/s.
     ///
-    ///   2. PATRULHA GARANTIDA: estado inicial é Patrol. PathUpdateLoop tem um
-    ///      primeiro tick imediato (yield return null) para não depender de esperar
-    ///      pathUpdateRate antes de dar o primeiro SetDestination.
+    ///   2. pathUpdateRate aumentado para 0.15s (máx ~7 updates/s por monstro).
+    ///      Antes: 0.05s = 20 updates/s por monstro. Com 5 monstros = 100 pacotes/s
+    ///      saindo do servidor apenas para posições — causava travamento nos clientes.
+    ///      Com 0.15s e 5 monstros = ~33 pacotes/s de posição. Muito mais razoável.
     ///
-    ///   3. RESPAWN CORRETO: ServerDeathSequence reseta _serverResetDone antes de
-    ///      chamar ServerReset() para garantir que o reset funciona na segunda morte.
+    ///   3. aggroScanInterval aumentado para 0.5s (não precisa de varredura mais rápida).
+    ///
+    ///   4. Cooldown de ataque baseado em _stats.ASPD (1/ASPD = segundos entre ataques).
+    ///      ASPD = 1.0 → ataca a cada 1s. ASPD = 2.0 → ataca a cada 0.5s.
+    ///      Isso usa o campo como sempre deveria ter sido usado.
+    ///
+    ///   5. Interpolação de posição no cliente: NetworkTransform deve ser configurado
+    ///      com interpolation enabled para suavizar o movimento entre updates do servidor.
+    ///
+    ///   6. ServerReset preserva flag _serverResetDone corretamente no ciclo de respawn.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -53,15 +57,18 @@ namespace RPG.Network
         [SerializeField] private int baseLUK = 5;
 
         [Header("Ranges de IA")]
-        [SerializeField] private float aggroRange      = 10f;
-        [SerializeField] private float attackRange     = 2.5f;
-        [SerializeField] private float kiteDistance    = 1.8f;
-        [SerializeField] private float attackCooldown  = 2f;
-        [SerializeField] private float leashRange      = 30f;
+        [SerializeField] private float aggroRange     = 10f;
+        [SerializeField] private float attackRange    = 2.5f;
+        [SerializeField] private float kiteDistance   = 1.8f;
+        [SerializeField] private float leashRange     = 30f;
 
         [Header("Performance de IA")]
-        [SerializeField] private float aggroScanInterval = 0.4f;
-        [SerializeField] private float pathUpdateRate    = 0.05f;
+        [Tooltip("Intervalo entre varreduras de aggro. 0.5s é suficiente.")]
+        [SerializeField] private float aggroScanInterval = 0.5f;
+
+        [Tooltip("Intervalo de atualização de path no servidor (s). " +
+                 "0.15s = ~7 updates/s por monstro. NÃO use valores abaixo de 0.1s.")]
+        [SerializeField] private float pathUpdateRate = 0.15f;
 
         [Header("Patrulha")]
         [SerializeField] private bool        usePatrolPoints = false;
@@ -71,7 +78,7 @@ namespace RPG.Network
 
         [Header("Fuga (apenas Passive)")]
         [SerializeField] private float fleeDuration  = 6f;
-        [SerializeField] private float fleeSpeedMult = 1.5f;
+        [SerializeField] private float fleeSpeedMult = 1.3f;
 
         [Header("Morte e Respawn")]
         [SerializeField] private float hideDelay    = 3f;
@@ -121,7 +128,11 @@ namespace RPG.Network
         private NetworkPlayer _aggroTarget;
         private bool          _wasAttacked;
 
-        private float _attackTimer;
+        /// <summary>
+        /// Acumulador de tempo de ataque. Quando >= (1f / _stats.ASPD), ataca.
+        /// Usando ASPD como ataques/segundo (correto).
+        /// </summary>
+        private float _attackAccumulator;
         private float _fleeTimer;
 
         private int     _patrolIndex;
@@ -131,9 +142,7 @@ namespace RPG.Network
 
         private Vector3 _homePosition;
         private float   _patrolRadiusRuntime;
-
-        // CORREÇÃO: flags de controle de ordem de spawn
-        private bool _serverResetDone = false;
+        private bool    _serverResetDone = false;
 
         private Coroutine _aggroScanCoroutine;
         private Coroutine _pathUpdateCoroutine;
@@ -142,9 +151,8 @@ namespace RPG.Network
 
         private bool _deathProcessed = false;
 
-        private const float REGEN_INTERVAL        = 3f;
-        private const float REGEN_PERCENT         = 0.05f;
-        private const float SKILL_RANGE_TOLERANCE = 2.0f;
+        private const float REGEN_INTERVAL  = 3f;
+        private const float REGEN_PERCENT   = 0.05f;
 
         // ── Awake / OnStartServer ──────────────────────────────────────────
 
@@ -159,10 +167,6 @@ namespace RPG.Network
                 level, CharacterRace.Human);
         }
 
-        /// <summary>
-        /// CORRIGIDO: OnStartServer NÃO chama ServerReset.
-        /// ServerReset é chamado por SetSpawnData ou pelo fallback no Update.
-        /// </summary>
         public override void OnStartServer()
         {
             _patrolRadiusRuntime = patrolRadius;
@@ -174,10 +178,6 @@ namespace RPG.Network
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
         }
 
-        /// <summary>
-        /// Chamado pelo NetworkMonsterSpawner ANTES de NetworkServer.Spawn.
-        /// Define _homePosition e dispara ServerReset após o spawn completar.
-        /// </summary>
         [Server]
         public void SetSpawnData(Vector3 homePos, float newPatrolRadius)
         {
@@ -185,15 +185,9 @@ namespace RPG.Network
             _patrolRadiusRuntime = newPatrolRadius;
             transform.position   = homePos;
             _patrolTargetSet     = false;
-
-            // OnStartServer já rodou durante Spawn — podemos chamar ServerReset agora
-            // Se por algum motivo não rodou ainda, o Update fará o fallback
             StartCoroutine(ServerResetNextFrame());
         }
 
-        /// <summary>
-        /// Aguarda 1 frame para garantir que OnStartServer() completou antes de resetar.
-        /// </summary>
         [Server]
         private IEnumerator ServerResetNextFrame()
         {
@@ -205,25 +199,28 @@ namespace RPG.Network
         [Server]
         private void ServerReset()
         {
-            _serverResetDone = true;
-            _maxHP           = _stats.MaxHP;
-            _currentHP       = _maxHP;
-            _isDead          = false;
-            _deathProcessed  = false;
-            _wasAttacked     = false;
-            _state           = AIState.Patrol;
-            _aggroTarget     = null;
-            _attackTimer     = 0f;
-            _fleeTimer       = 0f;
-            _patrolIndex     = 0;
-            _patrolWaiting   = false;
-            _patrolTargetSet = false;
+            _serverResetDone    = true;
+            _maxHP              = _stats.MaxHP;
+            _currentHP          = _maxHP;
+            _isDead             = false;
+            _deathProcessed     = false;
+            _wasAttacked        = false;
+            _state              = AIState.Patrol;
+            _aggroTarget        = null;
+            _attackAccumulator  = 0f;
+            _fleeTimer          = 0f;
+            _patrolIndex        = 0;
+            _patrolWaiting      = false;
+            _patrolTargetSet    = false;
             _damageLog.Clear();
 
             if (_agent != null)
             {
-                _agent.enabled = true;
-                _agent.speed   = _stats.ASPD;
+                _agent.enabled   = true;
+                // CORREÇÃO: usa MoveSpeed, não ASPD
+                _agent.speed     = _stats.MoveSpeed;
+                _agent.angularSpeed = 360f;
+                _agent.acceleration = 12f;
                 if (_agent.isOnNavMesh)
                     _agent.Warp(_homePosition);
                 else
@@ -250,7 +247,6 @@ namespace RPG.Network
         {
             if (!isServer) return;
 
-            // Fallback para monstros colocados manualmente na cena (sem SetSpawnData)
             if (!_serverResetDone)
             {
                 _homePosition        = transform.position;
@@ -261,16 +257,17 @@ namespace RPG.Network
 
             if (_isDead) return;
 
-            _attackTimer += Time.deltaTime;
+            // CORREÇÃO: acumula tempo para atacar baseado em ASPD (ataques/segundo)
+            _attackAccumulator += Time.deltaTime;
 
             switch (_state)
             {
-                case AIState.Idle:    break;
-                case AIState.Patrol:  if (usePatrolPoints) ServerPatrolWaypoints(); break;
-                case AIState.Chase:   ServerChaseCheck();  break;
-                case AIState.Combat:  ServerCombat();      break;
-                case AIState.Flee:    ServerFleeCheck();   break;
-                case AIState.ReturnHome: ServerReturnHomeCheck(); break;
+                case AIState.Idle:       break;
+                case AIState.Patrol:     if (usePatrolPoints) ServerPatrolWaypoints(); break;
+                case AIState.Chase:      ServerChaseCheck();       break;
+                case AIState.Combat:     ServerCombat();           break;
+                case AIState.Flee:       ServerFleeCheck();        break;
+                case AIState.ReturnHome: ServerReturnHomeCheck();  break;
             }
         }
 
@@ -296,9 +293,10 @@ namespace RPG.Network
         [Server]
         private IEnumerator PathUpdateLoop()
         {
-            // Tick imediato para iniciar patrulha sem esperar pathUpdateRate
+            // Tick imediato para a primeira atualização de path
             yield return null;
 
+            var wait = new WaitForSeconds(pathUpdateRate);
             while (true)
             {
                 if (!_isDead)
@@ -313,7 +311,7 @@ namespace RPG.Network
                             break;
                     }
                 }
-                yield return new WaitForSeconds(pathUpdateRate);
+                yield return wait;
             }
         }
 
@@ -347,20 +345,14 @@ namespace RPG.Network
             if (patrolPoints == null || patrolPoints.Length == 0) return;
             if (!_agent.isOnNavMesh) return;
 
-            if (_patrolWaiting)
-            {
-                _fleeTimer += Time.deltaTime;
-                if (_fleeTimer < patrolWaitTime) return;
-                _patrolWaiting = false;
-                _fleeTimer     = 0f;
-            }
+            if (_patrolWaiting) return;
 
             if (!_agent.pathPending && _agent.remainingDistance < 0.5f)
             {
                 _patrolIndex = (_patrolIndex + 1) % patrolPoints.Length;
                 _agent.SetDestination(patrolPoints[_patrolIndex].position);
                 _patrolWaiting = true;
-                _fleeTimer     = 0f;
+                StartCoroutine(PatrolWaitCoroutine());
             }
         }
 
@@ -375,8 +367,8 @@ namespace RPG.Network
 
             if (dist <= attackRange)
             {
-                _attackTimer = 0f;
-                _state       = AIState.Combat;
+                _attackAccumulator = 0f;
+                _state             = AIState.Combat;
                 if (_agent.isOnNavMesh) _agent.ResetPath();
             }
         }
@@ -401,15 +393,18 @@ namespace RPG.Network
                 else _agent.ResetPath();
             }
 
+            // Rotação suave em direção ao alvo
             Vector3 dir = _aggroTarget.transform.position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.Slerp(
                     transform.rotation, Quaternion.LookRotation(dir), 8f * Time.deltaTime);
 
-            if (_attackTimer >= attackCooldown)
+            // CORREÇÃO: usa ASPD como ataques/segundo (1/ASPD = segundos por ataque)
+            float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+            if (_attackAccumulator >= attackInterval)
             {
-                _attackTimer = 0f;
+                _attackAccumulator -= attackInterval; // subtrai em vez de zerar para manter precisão
                 ServerAttack();
             }
         }
@@ -419,7 +414,7 @@ namespace RPG.Network
             _fleeTimer += Time.deltaTime;
             if (_fleeTimer >= fleeDuration || !_agent.isOnNavMesh)
             {
-                if (_agent != null) _agent.speed = _stats.ASPD;
+                if (_agent != null) _agent.speed = _stats.MoveSpeed;
                 _fleeTimer = 0f;
                 EnterReturnHome();
             }
@@ -511,14 +506,8 @@ namespace RPG.Network
             {
                 _aggroTarget = found;
                 _state       = AIState.Chase;
-                _attackTimer = 0f;
-                if (_patrolWaitCoroutine != null)
-                {
-                    StopCoroutine(_patrolWaitCoroutine);
-                    _patrolWaitCoroutine = null;
-                }
-                _patrolWaiting   = false;
-                _patrolTargetSet = false;
+                _attackAccumulator = 0f;
+                CancelPatrolWait();
             }
         }
 
@@ -531,8 +520,8 @@ namespace RPG.Network
                 _agent.ResetPath();
                 _agent.stoppingDistance = 0.3f;
             }
-            _attackTimer     = 0f;
-            _patrolTargetSet = false;
+            _attackAccumulator = 0f;
+            _patrolTargetSet   = false;
 
             if (Vector3.Distance(transform.position, _homePosition) > leashRange * 0.5f)
                 EnterReturnHome();
@@ -544,15 +533,16 @@ namespace RPG.Network
         {
             _state       = AIState.ReturnHome;
             _aggroTarget = null;
-            if (_patrolWaitCoroutine != null)
-            {
-                StopCoroutine(_patrolWaitCoroutine);
-                _patrolWaitCoroutine = null;
-            }
-            _patrolWaiting = false;
+            CancelPatrolWait();
             if (_agent != null) _agent.stoppingDistance = 0.5f;
             if (_regenCoroutine != null) StopCoroutine(_regenCoroutine);
             _regenCoroutine = StartCoroutine(RegenLoop());
+        }
+
+        private void CancelPatrolWait()
+        {
+            if (_patrolWaitCoroutine != null) { StopCoroutine(_patrolWaitCoroutine); _patrolWaitCoroutine = null; }
+            _patrolWaiting = false;
         }
 
         // ── Ataque ─────────────────────────────────────────────────────────
@@ -583,9 +573,11 @@ namespace RPG.Network
         public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
         {
             if (_isDead) return;
+
             NetworkPlayer attacker = null;
             foreach (var np in NetworkPlayer.All)
                 if (np != null && np.netId == attackerNetId) { attacker = np; break; }
+
             if (attacker == null || attacker.Dead) return;
 
             var atkStats = attacker.ServerStats;
@@ -624,6 +616,7 @@ namespace RPG.Network
                 : StatsCalculator.CalculateMagicDamage(atkStats.MATK * skill.AtkMultiplier, _stats.MDEF, crit, atkStats.CritDMG);
 
             dmg = Mathf.Max(1f, dmg);
+
             if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
             _damageLog[attacker.netId] += dmg;
 
@@ -635,34 +628,37 @@ namespace RPG.Network
                 case MonsterDisposition.Passive:
                     if (_state != AIState.Flee && _state != AIState.ReturnHome && _state != AIState.Dead)
                     {
-                        _aggroTarget = attacker; _fleeTimer = 0f; _state = AIState.Flee;
-                        if (_agent != null) _agent.speed = _stats.ASPD * fleeSpeedMult;
+                        _aggroTarget = attacker;
+                        _fleeTimer   = 0f;
+                        _state       = AIState.Flee;
+                        // CORREÇÃO: velocidade de fuga usa MoveSpeed, não ASPD
+                        if (_agent != null) _agent.speed = _stats.MoveSpeed * fleeSpeedMult;
                     }
                     break;
+
                 case MonsterDisposition.Neutral:
                     _wasAttacked = true;
                     if (_state == AIState.Idle || _state == AIState.Patrol || _state == AIState.ReturnHome)
                     {
                         CancelPatrolWait();
-                        _aggroTarget = attacker; _state = AIState.Chase; _attackTimer = 0f;
+                        _aggroTarget       = attacker;
+                        _state             = AIState.Chase;
+                        _attackAccumulator = 0f;
                     }
                     break;
+
                 case MonsterDisposition.Aggressive:
                     if (_state == AIState.Idle || _state == AIState.Patrol)
                     {
                         CancelPatrolWait();
-                        _aggroTarget = attacker; _state = AIState.Chase; _attackTimer = 0f;
+                        _aggroTarget       = attacker;
+                        _state             = AIState.Chase;
+                        _attackAccumulator = 0f;
                     }
                     break;
             }
 
             if (_currentHP <= 0f) ServerDie();
-        }
-
-        private void CancelPatrolWait()
-        {
-            if (_patrolWaitCoroutine != null) { StopCoroutine(_patrolWaitCoroutine); _patrolWaitCoroutine = null; }
-            _patrolWaiting = false;
         }
 
         // ── Morte / Respawn ────────────────────────────────────────────────
@@ -671,10 +667,19 @@ namespace RPG.Network
         private void ServerDie()
         {
             if (_isDead || _deathProcessed) return;
-            _isDead = true; _deathProcessed = true; _state = AIState.Dead;
+            _isDead         = true;
+            _deathProcessed = true;
+            _state          = AIState.Dead;
+
             StopAllCoroutines();
             _aggroScanCoroutine = _pathUpdateCoroutine = _patrolWaitCoroutine = _regenCoroutine = null;
-            if (_agent != null) { if (_agent.isOnNavMesh) _agent.ResetPath(); _agent.enabled = false; }
+
+            if (_agent != null)
+            {
+                if (_agent.isOnNavMesh) _agent.ResetPath();
+                _agent.enabled = false;
+            }
+
             Debug.Log("[NetworkMonster] Monstro morreu!");
             ServerDistributeExp();
             StartCoroutine(ServerDeathSequence());
@@ -723,13 +728,19 @@ namespace RPG.Network
 
         // ── ClientRpcs ─────────────────────────────────────────────────────
 
-        [ClientRpc] private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
-            => FloatingTextManager.Instance?.Show(crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}", pos + Vector3.up, crit ? Color.yellow : Color.white);
+        [ClientRpc]
+        private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
+            => FloatingTextManager.Instance?.Show(
+                crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}",
+                pos + Vector3.up,
+                crit ? Color.yellow : Color.white);
 
-        [ClientRpc] private void RpcShowMiss(Vector3 pos)
+        [ClientRpc]
+        private void RpcShowMiss(Vector3 pos)
             => FloatingTextManager.Instance?.Show("MISS", pos + Vector3.up * 0.5f, Color.gray);
 
-        [ClientRpc] private void RpcPlayAnim(string trigger)
+        [ClientRpc]
+        private void RpcPlayAnim(string trigger)
             => _animator?.SetTrigger(trigger);
 
         [ClientRpc]
@@ -753,16 +764,29 @@ namespace RPG.Network
         {
             if (visualRoot)         visualRoot.SetActive(true);
             if (selectionIndicator) selectionIndicator.SetActive(false);
-            if (healthBarUI)        { healthBarUI.gameObject.SetActive(true); healthBarUI.UpdateBar(_currentHP, _maxHP); }
+            if (healthBarUI)
+            {
+                healthBarUI.gameObject.SetActive(true);
+                healthBarUI.UpdateBar(_currentHP, _maxHP);
+            }
         }
 
         private void OnCurrentHPChanged(float _, float v) => healthBarUI?.UpdateBar(v, _maxHP);
-        private void OnDeadChanged(bool _, bool dead) { if (dead && _agent != null) _agent.enabled = false; }
+
+        private void OnDeadChanged(bool _, bool dead)
+        {
+            if (dead && _agent != null) _agent.enabled = false;
+        }
 
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
         {
-            Gizmos.color = disposition switch { MonsterDisposition.Passive => Color.green, MonsterDisposition.Neutral => Color.yellow, _ => Color.red };
+            Gizmos.color = disposition switch
+            {
+                MonsterDisposition.Passive  => Color.green,
+                MonsterDisposition.Neutral  => Color.yellow,
+                _                           => Color.red
+            };
             Gizmos.DrawWireSphere(transform.position, aggroRange);
             Gizmos.color = new Color(1f, 0.3f, 0.3f);
             Gizmos.DrawWireSphere(transform.position, attackRange);

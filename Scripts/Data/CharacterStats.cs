@@ -44,7 +44,9 @@ namespace RPG.Data
         public float MDEF;
 
         // Velocidade
+        /// <summary>Ataques por segundo (usado como timer de ataque, NÃO como velocidade do NavMeshAgent).</summary>
         public float ASPD;
+        /// <summary>Velocidade de deslocamento em m/s para o NavMeshAgent. Separado de ASPD.</summary>
         public float MoveSpeed;
         public float CastSpeed;
 
@@ -87,19 +89,20 @@ namespace RPG.Data
 
     public static class StatsCalculator
     {
-        public static readonly int   BASE_HP   = 100;
-        public static readonly int   BASE_MP   = 50;
-        public static readonly float BASE_ASPD = 1.0f;
+        public static readonly int   BASE_HP        = 100;
+        public static readonly int   BASE_MP        = 50;
+        public static readonly float BASE_ASPD      = 1.0f;
+        public static readonly float BASE_MOVESPEED = 4.0f; // m/s base para jogadores
 
         public static RaceBonus GetRaceBonus(CharacterRace race)
         {
             return race switch
             {
-                CharacterRace.Human  => new RaceBonus { STR=2,  AGI=2,  VIT=2,  DEX=2,  INT=2,  LUK=5  },
-                CharacterRace.Elf    => new RaceBonus { STR=0,  AGI=5,  VIT=0,  DEX=5,  INT=5,  LUK=3  },
-                CharacterRace.Dwarf  => new RaceBonus { STR=5,  AGI=0,  VIT=8,  DEX=2,  INT=0,  LUK=2  },
-                CharacterRace.Orc    => new RaceBonus { STR=8,  AGI=2,  VIT=5,  DEX=0,  INT=0,  LUK=0  },
-                CharacterRace.Undead => new RaceBonus { STR=2,  AGI=2,  VIT=0,  DEX=2,  INT=8,  LUK=0  },
+                CharacterRace.Human  => new RaceBonus { STR=2, AGI=2, VIT=2, DEX=2, INT=2, LUK=5 },
+                CharacterRace.Elf    => new RaceBonus { STR=0, AGI=5, VIT=0, DEX=5, INT=5, LUK=3 },
+                CharacterRace.Dwarf  => new RaceBonus { STR=5, AGI=0, VIT=8, DEX=2, INT=0, LUK=2 },
+                CharacterRace.Orc    => new RaceBonus { STR=8, AGI=2, VIT=5, DEX=0, INT=0, LUK=0 },
+                CharacterRace.Undead => new RaceBonus { STR=2, AGI=2, VIT=0, DEX=2, INT=8, LUK=0 },
                 _                    => new RaceBonus()
             };
         }
@@ -109,24 +112,23 @@ namespace RPG.Data
         /// NÃO modifica os objetos passados como parâmetro (sem side-effects).
         /// </summary>
         public static DerivedStats Calculate(
-            BaseAttributes baseAttr,
-            int            level,
-            CharacterRace  race,
-            int            allocSTR = 0,
-            int            allocAGI = 0,
-            int            allocVIT = 0,
-            int            allocDEX = 0,
-            int            allocINT = 0,
-            int            allocLUK = 0,
-            EquipmentBonuses equip  = null,
-            BuffBonuses      buff   = null)
+            BaseAttributes   baseAttr,
+            int              level,
+            CharacterRace    race,
+            int              allocSTR  = 0,
+            int              allocAGI  = 0,
+            int              allocVIT  = 0,
+            int              allocDEX  = 0,
+            int              allocINT  = 0,
+            int              allocLUK  = 0,
+            EquipmentBonuses equip     = null,
+            BuffBonuses      buff      = null)
         {
             equip ??= new EquipmentBonuses();
             buff  ??= new BuffBonuses();
 
             var raceBonus = GetRaceBonus(race);
 
-            // Atributos finais = base + raça + alocados + equip + buff
             float STR = baseAttr.STR + raceBonus.STR + allocSTR + equip.STR + buff.STR;
             float AGI = baseAttr.AGI + raceBonus.AGI + allocAGI + equip.AGI + buff.AGI;
             float VIT = baseAttr.VIT + raceBonus.VIT + allocVIT + equip.VIT + buff.VIT;
@@ -145,8 +147,12 @@ namespace RPG.Data
             s.DEF  = ((VIT * 2f) + (STR * 0.5f) + equip.DEF)  * buff.DEFMultiplier;
             s.MDEF = ((INT * 2f) + (VIT * 1f)   + equip.MDEF) * buff.DEFMultiplier;
 
-            s.ASPD      = BASE_ASPD + (AGI * 0.5f) + (DEX * 0.2f);
-            s.MoveSpeed = 3f + (AGI * 0.05f); // 3~8 m/s
+            // ASPD: ataques por segundo — usado APENAS como timer de cooldown de ataque
+            // NÃO deve ser usado como velocidade do NavMeshAgent
+            s.ASPD = BASE_ASPD + (AGI * 0.05f) + (DEX * 0.02f); // max ~2.5 ataques/s com atributos altos
+
+            // MoveSpeed: velocidade de deslocamento em m/s — fórmula conservadora
+            s.MoveSpeed = Mathf.Clamp(BASE_MOVESPEED + (AGI * 0.03f), 3f, 7f);
 
             s.HIT  = (DEX * 2f) + (LUK * 0.5f);
             s.FLEE = (AGI * 2f) + (LUK * 0.3f);
