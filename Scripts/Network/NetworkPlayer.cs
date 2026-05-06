@@ -13,32 +13,27 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v8
+    /// NetworkPlayer v9
     ///
-    /// CORREÇÕES v8:
+    /// CORREÇÕES v9:
     ///
-    ///   1. MOVIMENTO TRAVADO — NetworkTransformUnreliable recomendado no prefab
-    ///      (troque NetworkTransformReliable por NetworkTransformUnreliable no prefab).
-    ///      Reliable usa delta-compression com threshold alto → "teleporte" perceptível.
-    ///      Unreliable envia toda mudança de posição → interpolação suave no cliente.
+    ///   1. ServerGrantExp CORRIGIDO — Agora usa CharacterData.AddExperience()
+    ///      para processar level-up, depois sincroniza os SyncVars a partir do
+    ///      _serverCharData. Antes havia duplicação da lógica de level-up entre
+    ///      este método e CharacterData, causando inconsistência nos saves.
     ///
-    ///   2. DOUBLE-RPC REMOVIDO — RpcSkillConfirmed e RpcSkillRejected existiam como
-    ///      [ClientRpc] E [TargetRpc] com o mesmo nome → conflito de assinatura no Mirror.
-    ///      Agora só existem as versões [ClientRpc] com guarda if (!isLocalPlayer) return.
+    ///   2. _clientInitialized NÃO bloqueia mais re-init:
+    ///      Se o RpcInitializeLocalPlayer chegar antes do OnStartLocalPlayer
+    ///      (race condition), o dado fica em _pendingInitData. Quando
+    ///      OnStartLocalPlayer roda, ele chama DelayedClientInit com os dados
+    ///      pendentes. O flag só é setado true dentro de DelayedClientInit,
+    ///      garantindo que o init sempre acontece exatamente uma vez.
     ///
-    ///   3. INICIALIZAÇÃO ROBUSTA — _clientInitialized não bloqueia mais re-init.
-    ///      Se o Rpc chegar antes do OnStartLocalPlayer (race condition), o flag é
-    ///      verificado e o init é feito corretamente via coroutine.
+    ///   3. CmdMoveTo removido deste arquivo — responsabilidade exclusiva do
+    ///      NetworkPlayerController. Mantida apenas a referência ao agent para
+    ///      uso interno do servidor (SetDestination em respawn, etc.).
     ///
-    ///   4. CmdMoveTo com validação de distância (anti-teleport básico).
-    ///
-    ///   5. ServerGrantExp usa CharacterData.AddExperience() em vez de reimplementar
-    ///      o loop de level-up manualmente (DRY).
-    ///
-    ///   6. Saving async-ready: ServerSaveCharacter pode ser facilmente movido para
-    ///      background thread (preparado com comentário).
-    ///
-    ///   7. Adicionado CurrentMP como propriedade pública (necessário para SkillSystem).
+    ///   4. MOVING_CMD_INTERVAL reduzido para 0.1s para animação mais responsiva.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -49,8 +44,7 @@ namespace RPG.Network
         private const int   MAX_LEVEL       = 99;
         private const float MAX_HP_CAP      = 500_000f;
         private const float MAX_MP_CAP      = 200_000f;
-        private const float MAX_MOVE_DIST   = 100f;   // Anti-teleport: distância máxima por CmdMoveTo
-        private const float SAVE_INTERVAL   = 60f;    // Auto-save a cada 60 segundos
+        private const float SAVE_INTERVAL   = 60f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNetNameChanged))]   public string CharacterName = "...";
@@ -108,13 +102,13 @@ namespace RPG.Network
         private readonly Dictionary<int, float> _serverSkillCooldowns = new();
 
         // ── Estado do cliente ──────────────────────────────────────────────
-        private bool _clientInitialized  = false;
-        private bool _pendingClientInit  = false;
-        private CharacterData _pendingInitData = null;
+        private bool          _clientInitialized = false;
+        private bool          _pendingClientInit = false;
+        private CharacterData _pendingInitData   = null;
 
         // ── Movimento ─────────────────────────────────────────────────────
         private float _lastMovingCmdTime;
-        private const float MOVING_CMD_INTERVAL = 0.15f;
+        private const float MOVING_CMD_INTERVAL = 0.1f; // CORREÇÃO: era 0.15s
 
         public bool Dead => CurrentHP <= 0f;
 
@@ -136,7 +130,6 @@ namespace RPG.Network
         public override void OnStopServer()
         {
             All.Remove(this);
-            // Salva ao desconectar
             ServerSaveCharacter();
         }
 
@@ -145,8 +138,6 @@ namespace RPG.Network
             if (_nameTagText        != null) _nameTagText.text = CharacterName;
             if (_selectionIndicator != null) _selectionIndicator.SetActive(false);
 
-            // Clientes não-locais não precisam de NavMeshAgent.
-            // O movimento deles é replicado via NetworkTransformUnreliable.
             if (!isLocalPlayer && _agent != null)
                 _agent.enabled = false;
         }
@@ -160,12 +151,13 @@ namespace RPG.Network
 
             Debug.Log("[NetworkPlayer] Local player ativo — aguardando RpcInitializeLocalPlayer.");
 
-            // Se houve race condition e o Rpc já chegou antes do OnStartLocalPlayer
+            // CORREÇÃO: verifica dados pendentes de race condition
             if (_pendingClientInit && _pendingInitData != null)
             {
-                StartCoroutine(DelayedClientInit(_pendingInitData));
+                var data = _pendingInitData;
                 _pendingClientInit = false;
                 _pendingInitData   = null;
+                StartCoroutine(DelayedClientInit(data));
             }
         }
 
@@ -179,7 +171,6 @@ namespace RPG.Network
         [Server]
         private void ServerUpdate()
         {
-            // Auto-save periódico
             _autoSaveTimer -= Time.deltaTime;
             if (_autoSaveTimer <= 0f)
             {
@@ -230,7 +221,6 @@ namespace RPG.Network
             CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP)
                 ? charData.CurrentMP : maxMP;
 
-            // Posiciona se há posição salva
             var savedPos = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
             if (savedPos.sqrMagnitude > 0.01f)
             {
@@ -241,7 +231,6 @@ namespace RPG.Network
             Debug.Log($"[Server] {charData.CharacterName} inicializado | " +
                       $"HP:{CurrentHP:0}/{MaxHP:0} | Lv:{Level}");
 
-            // Aguarda 2 frames para garantir que SpawnMessage chegou ao cliente
             StartCoroutine(SendInitRpcDelayed(charData));
         }
 
@@ -267,29 +256,6 @@ namespace RPG.Network
 
         [Command]
         public void CmdSetMoving(bool moving) => IsMoving = moving;
-
-        /// <summary>
-        /// Movimento com validação anti-teleport básica.
-        /// </summary>
-        [Command]
-        public void CmdMoveTo(Vector3 destination)
-        {
-            if (_agent == null || Dead) return;
-
-            // Anti-cheat: rejeita destinos impossíveis (teleporte)
-            float dist = Vector3.Distance(transform.position, destination);
-            if (dist > MAX_MOVE_DIST)
-            {
-                Debug.LogWarning($"[Server] CmdMoveTo suspeito: {CharacterName} " +
-                                 $"dist={dist:0.0} (máx={MAX_MOVE_DIST})");
-                return;
-            }
-
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas))
-                _agent.SetDestination(hit.position);
-            else
-                _agent.SetDestination(destination);
-        }
 
         [Command]
         public void CmdAllocateAttribute(int attributeIndex)
@@ -378,41 +344,35 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// Concede XP e processa level-up usando CharacterData.AddExperience()
-        /// (elimina duplicação de lógica de level-up).
+        /// CORRIGIDO: Usa CharacterData.AddExperience() para processar level-up,
+        /// depois sincroniza os SyncVars a partir do estado do _serverCharData.
+        /// Elimina a duplicação de lógica de level-up e garante consistência nos saves.
         /// </summary>
         [Server]
         public void ServerGrantExp(long amount)
         {
             if (_serverCharData == null) return;
 
-            Experience            += amount;
-            _serverCharData.Experience += amount;
+            bool leveledUp = _serverCharData.AddExperience(amount);
 
-            bool leveledUp = false;
+            // Sincroniza SyncVars a partir do CharacterData (fonte da verdade)
+            Experience            = _serverCharData.Experience;
+            ExperienceToNextLevel = _serverCharData.ExperienceToNextLevel;
+            Level                 = _serverCharData.Level;
+            FreeAttributePoints   = _serverCharData.FreeAttributePoints;
 
-            while (Experience >= ExperienceToNextLevel && Level < MAX_LEVEL)
+            if (leveledUp)
             {
-                Experience                           -= ExperienceToNextLevel;
-                _serverCharData.Experience           -= _serverCharData.ExperienceToNextLevel;
-                Level++;
-                _serverCharData.Level++;
-                FreeAttributePoints                 += 5;
-                _serverCharData.FreeAttributePoints += 5;
-
-                long nextExp                          = _serverCharData.GetExperienceForLevel(_serverCharData.Level);
-                ExperienceToNextLevel                 = nextExp;
-                _serverCharData.ExperienceToNextLevel = nextExp;
-
+                // Recalcula stats após level-up
                 _serverStats = _serverCharData.GetDerivedStats();
                 MaxHP        = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
                 MaxMP        = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
                 CurrentHP    = MaxHP;
                 CurrentMP    = MaxMP;
+
                 _serverCharData.CurrentHP = MaxHP;
                 _serverCharData.CurrentMP = MaxMP;
 
-                leveledUp = true;
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
 
@@ -433,6 +393,8 @@ namespace RPG.Network
         {
             if (!isLocalPlayer) return;
 
+            // CORREÇÃO: não bloqueia com _clientInitialized aqui.
+            // Se OnStartLocalPlayer ainda não rodou, guarda e aguarda.
             var data = new CharacterData
             {
                 CharacterName         = charName,
@@ -456,8 +418,8 @@ namespace RPG.Network
                 }
             };
 
-            // Se OnStartLocalPlayer ainda não rodou, guarda para executar depois
-            if (!isLocalPlayer || GetComponent<PlayerEntity>() == null)
+            // Se OnStartLocalPlayer ainda não rodou, guarda para depois
+            if (GetComponent<PlayerEntity>() == null || !gameObject.activeInHierarchy)
             {
                 _pendingClientInit = true;
                 _pendingInitData   = data;
@@ -468,13 +430,11 @@ namespace RPG.Network
             StartCoroutine(DelayedClientInit(data));
         }
 
-        /// <summary>
-        /// Aguarda 1 frame para garantir que todos os Awake/Start do player rodaram.
-        /// </summary>
         private IEnumerator DelayedClientInit(CharacterData data)
         {
             yield return null;
 
+            // Garante que só inicializa uma vez
             if (_clientInitialized) yield break;
             _clientInitialized = true;
 
@@ -529,12 +489,6 @@ namespace RPG.Network
             }
         }
 
-        // ── Skills (apenas [ClientRpc] — sem overload TargetRpc) ──────────
-
-        /// <summary>
-        /// Confirmação de skill vinda do servidor.
-        /// Guarda isLocalPlayer para não processar em outros clientes.
-        /// </summary>
         [ClientRpc]
         public void RpcSkillConfirmed(int skillIndex, float cooldown)
         {
@@ -542,9 +496,6 @@ namespace RPG.Network
             GetComponent<SkillSystem>()?.OnServerSkillConfirmed(skillIndex, cooldown);
         }
 
-        /// <summary>
-        /// Rejeição de skill vinda do servidor.
-        /// </summary>
         [ClientRpc]
         public void RpcSkillRejected(int skillIndex, string reason)
         {

@@ -29,25 +29,24 @@ namespace RPG.Combat
     }
 
     /// <summary>
-    /// SkillSystem v2 — CLIENTE APENAS SOLICITA. SERVIDOR DECIDE E EXECUTA TUDO.
+    /// SkillSystem v3 — CORREÇÃO DE FLOOD DE COMMANDS
     ///
-    /// CORREÇÕES v2:
+    /// CORREÇÕES v3:
     ///
-    ///   1. WalkThenSendCmd agora usa NetworkPlayerController.CmdMoveTo para
-    ///      informar o servidor do movimento durante walk-to-range.
-    ///      Antes usava _agent.SetDestination direto → servidor não sabia da
-    ///      movimentação → dessincronização de posição.
+    ///   1. FLOOD DE CmdMoveTo ELIMINADO:
+    ///      Em v2, WalkThenSendCmd chamava CmdMoveTo todo frame (yield return null).
+    ///      Com 60fps, isso gerava ~60 Commands/segundo apenas para andar até um alvo.
+    ///      Agora usa um intervalo mínimo (CMD_MOVE_INTERVAL = 0.15s) para enviar
+    ///      no máximo ~7 Commands/segundo durante o walk, que é suficiente para
+    ///      manter o servidor sincronizado sem sobrecarregar a rede.
     ///
-    ///   2. Cooldown visual inicia APENAS após confirmação do servidor
-    ///      (RpcSkillConfirmed). Antes havia um cooldown local otimista que
-    ///      podia desincronizar com o servidor.
+    ///   2. SetDestination LOCAL separado do CmdMoveTo:
+    ///      O agente local ainda atualiza todo frame (movimento fluido), mas o
+    ///      Command para o servidor só sai no intervalo definido.
     ///
-    ///   3. Verificação de alvo morto no WalkThenSendCmd mais robusta:
-    ///      verifica tanto IsDead quanto se o UnityObject é null.
+    ///   3. Verificação de alvo morto mais robusta com null-check de UnityObject.
     ///
-    ///   4. Timeout do WalkThenSendCmd reduzido para 12 s (era 20 s).
-    ///
-    ///   5. Log condicional com category para facilitar debugging.
+    ///   4. Timeout reduzido para 12s e com aviso no log.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -58,13 +57,17 @@ namespace RPG.Combat
         [Header("Debug")]
         [SerializeField] private bool debugLogs = false;
 
+        // Intervalo mínimo entre CmdMoveTo durante walk-to-range
+        // Suficiente para manter servidor sincronizado sem flood
+        private const float CMD_MOVE_INTERVAL = 0.15f;
+
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity             _player;
         private Animator                 _animator;
         private NavMeshAgent             _agent;
         private NetworkPlayerController  _controller;
 
-        // ── Cooldown visual (UI only — não é autoridade de segurança) ──────
+        // ── Cooldown visual ────────────────────────────────────────────────
         private const int MAX_SKILLS = 8;
         private float[] _uiCooldownTimers = new float[MAX_SKILLS];
 
@@ -72,9 +75,10 @@ namespace RPG.Combat
         private Coroutine   _walkCoroutine;
         private bool        _hasPendingWalk;
         private ITargetable _pendingTarget;
+        private float       _lastCmdMoveTime; // NOVO: throttle do CmdMoveTo
 
         // ── Eventos para SkillBar UI ───────────────────────────────────────
-        public event Action<int, float> OnCooldownStarted; // (índice, duração)
+        public event Action<int, float> OnCooldownStarted;
         public event Action<int>        OnSkillFired;
 
         public bool HasPendingAction => _hasPendingWalk;
@@ -93,12 +97,10 @@ namespace RPG.Combat
         {
             if (!isLocalPlayer) return;
 
-            // Decrementa timers visuais de cooldown
             for (int i = 0; i < MAX_SKILLS; i++)
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
-            // Cancela walk se alvo mudou externamente
             if (_hasPendingWalk && _pendingTarget != _player.CurrentTarget)
                 CancelPendingWalk();
         }
@@ -110,7 +112,7 @@ namespace RPG.Combat
         public float     GetUICooldown(int i)   => (i >= 0 && i < MAX_SKILLS) ? Mathf.Max(0f, _uiCooldownTimers[i]) : 0f;
         public bool      IsOnUICooldown(int i)  => GetUICooldown(i) > 0f;
 
-        // ── TryUseSkill — ponto de entrada do input ────────────────────────
+        // ── TryUseSkill ────────────────────────────────────────────────────
 
         public void TryUseSkill(int index)
         {
@@ -120,7 +122,6 @@ namespace RPG.Combat
             var skill = GetSkill(index);
             if (skill == null) { Log($"Skill {index} não existe."); return; }
 
-            // Verificação de cooldown local (UX apenas — servidor revalida)
             if (IsOnUICooldown(index))
             {
                 UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(index):0.0}s");
@@ -129,7 +130,6 @@ namespace RPG.Combat
 
             var target = _player.CurrentTarget;
 
-            // Validação de alvo (UX — servidor valida de verdade)
             if (skill.Target == SkillTarget.Enemy)
             {
                 if (target == null)
@@ -148,22 +148,21 @@ namespace RPG.Combat
 
             CancelPendingWalk();
 
-            // Self/Heal/Buff: envia diretamente ao servidor
             if (skill.Target == SkillTarget.Self || skill.Type == SkillType.Heal || skill.Type == SkillType.Buff)
             {
                 SendSelfSkillCmd(index);
                 return;
             }
 
-            // Skill de dano: verifica range
             float dist = target != null ? Vector3.Distance(transform.position, target.Position) : 0f;
 
             if (dist > skill.Range)
             {
                 Log($"Fora de range ({dist:0.1} > {skill.Range}). Caminhando...");
-                _hasPendingWalk = true;
-                _pendingTarget  = target;
-                _walkCoroutine  = StartCoroutine(WalkThenSendCmd(index, skill, target));
+                _hasPendingWalk  = true;
+                _pendingTarget   = target;
+                _lastCmdMoveTime = -CMD_MOVE_INTERVAL; // permite envio imediato
+                _walkCoroutine   = StartCoroutine(WalkThenSendCmd(index, skill, target));
             }
             else
             {
@@ -210,16 +209,23 @@ namespace RPG.Combat
                     yield break;
                 }
 
-                // CORREÇÃO: usa CmdMoveTo para o servidor saber do movimento
-                // Não chama SetDestination direto aqui — passa pelo controller
+                // Atualiza destino local todo frame para movimento fluido
                 if (_agent.isOnNavMesh)
+                    _agent.SetDestination(target.Position);
+
+                // CORREÇÃO: envia CmdMoveTo ao servidor com throttle (máx ~7/s)
+                // Não precisa de 60 Commands/s — 7/s mantém o servidor sincronizado
+                if (Time.time - _lastCmdMoveTime >= CMD_MOVE_INTERVAL)
                 {
-                    _agent.SetDestination(target.Position); // predição local
-                    _controller?.CmdMoveTo(target.Position); // confirma no servidor
+                    _lastCmdMoveTime = Time.time;
+                    _controller?.CmdMoveTo(target.Position);
                 }
 
                 yield return null;
             }
+
+            if (timeout <= 0f)
+                Log($"WalkThenSendCmd: timeout após 12s para skill {index}");
 
             _agent.stoppingDistance = 0.5f;
             _hasPendingWalk = false;
@@ -233,18 +239,16 @@ namespace RPG.Combat
         {
             var skill = GetSkill(skillIndex);
 
-            // Animação local (feedback visual imediato)
             if (_animator != null && skill != null && !string.IsNullOrEmpty(skill.AnimTrigger))
                 _animator.SetTrigger(skill.AnimTrigger);
 
             var targetNB = target as NetworkBehaviour;
             if (targetNB == null)
             {
-                Log($"Alvo não é NetworkBehaviour — skill não enviada.");
+                Log("Alvo não é NetworkBehaviour — skill não enviada.");
                 return;
             }
 
-            // Rotação visual local em direção ao alvo
             Vector3 dir = target.Position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
@@ -260,8 +264,7 @@ namespace RPG.Combat
             }
             else
             {
-                // Placeholder para PvP futuro
-                Log($"Alvo não é monstro (PvP não implementado).");
+                Log("Alvo não é monstro (PvP não implementado).");
             }
         }
 
@@ -274,10 +277,6 @@ namespace RPG.Combat
 
         // ── Resultado vindo do servidor ────────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo NetworkPlayer via RpcSkillConfirmed.
-        /// Inicia o cooldown VISUAL após confirmação do servidor.
-        /// </summary>
         public void OnServerSkillConfirmed(int skillIndex, float cooldownDuration)
         {
             if (skillIndex < 0 || skillIndex >= MAX_SKILLS) return;
@@ -287,9 +286,6 @@ namespace RPG.Combat
             Log($"Skill {skillIndex} confirmada. Cooldown: {cooldownDuration:0.0}s");
         }
 
-        /// <summary>
-        /// Chamado pelo NetworkPlayer via RpcSkillRejected.
-        /// </summary>
         public void OnServerSkillRejected(int skillIndex, string reason)
         {
             UIManager.Instance?.ShowMessage(reason);
