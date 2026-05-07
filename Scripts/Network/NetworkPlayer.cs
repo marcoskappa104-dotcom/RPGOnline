@@ -13,22 +13,20 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v11 — Atualizado para usar DatabaseManager (SQLite).
+    /// NetworkPlayer v12 — Correções aplicadas:
     ///
-    /// MUDANÇAS em relação à v10:
-    ///   - ServerSaveCharacter agora chama DatabaseManager.SaveCharacter()
-    ///     em vez de SaveManager. Sem AccountData intermediário.
-    ///   - _serverAccount REMOVIDO (não precisa mais do AccountData para salvar).
-    ///   - ServerInitialize não carrega AccountData do disco.
-    ///   - LogEconomy integrado: XP ganho é registrado no banco.
-    ///   - Demais correções da v10 mantidas integralmente.
+    ///   CRÍTICO 1: _clientInitialized resetado em OnStopClient — corrige bug de reconexão.
+    ///   CRÍTICO 2: BaseAttributes reais enviados via SyncVars BaseSTR..BaseLUK — corrige
+    ///              stats errados no cliente (antes hardcoded em {10,10,10...}).
+    ///   AVISO 1:   Log de aviso no OnStopServer quando save é ignorado por falta de dados.
+    ///   AVISO 6:   Assert de consistência entre SyncVar Level e _serverCharData.Level.
+    ///   MELHORIA 8: AddExperience protegido contra valores negativos (guard em ServerGrantExp).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
     public class NetworkPlayer : NetworkBehaviour, ITargetable
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
-
 
         private const float MAX_HP_CAP    = 500_000f;
         private const float MAX_MP_CAP    = 200_000f;
@@ -43,8 +41,8 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetMPChanged))]         public float  CurrentMP             = 0f;
         [SyncVar(hook = nameof(OnNetMaxMPChanged))]      public float  MaxMP                 = 1f;
         [SyncVar(hook = nameof(OnNetMovingChanged))]     public bool   IsMoving              = false;
-[SyncVar(hook = nameof(OnNetExpChanged))]        public long Experience            = 0;
-[SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long ExperienceToNextLevel = 100;
+        [SyncVar(hook = nameof(OnNetExpChanged))]        public long   Experience            = 0;
+        [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
         [SyncVar] public int AllocatedSTR = 0;
         [SyncVar] public int AllocatedAGI = 0;
@@ -52,6 +50,14 @@ namespace RPG.Network
         [SyncVar] public int AllocatedDEX = 0;
         [SyncVar] public int AllocatedINT = 0;
         [SyncVar] public int AllocatedLUK = 0;
+
+        // CORREÇÃO CRÍTICO 2: SyncVars para BaseAttributes reais
+        [SyncVar] public int BaseSTR = 10;
+        [SyncVar] public int BaseAGI = 10;
+        [SyncVar] public int BaseVIT = 10;
+        [SyncVar] public int BaseDEX = 10;
+        [SyncVar] public int BaseINT = 10;
+        [SyncVar] public int BaseLUK = 10;
 
         // ── ITargetable ────────────────────────────────────────────────────
         string  ITargetable.DisplayName => CharacterName;
@@ -118,7 +124,11 @@ namespace RPG.Network
         public override void OnStopServer()
         {
             All.Remove(this);
-            ServerSaveCharacter(); // Save final ao desconectar
+            // CORREÇÃO AVISO 1: log de aviso quando save é ignorado
+            if (_serverCharData != null)
+                ServerSaveCharacter();
+            else
+                Debug.LogWarning($"[Server] OnStopServer: {CharacterName} sem dados de personagem — save ignorado.");
         }
 
         public override void OnStartClient()
@@ -128,6 +138,14 @@ namespace RPG.Network
 
             if (!isLocalPlayer && _agent != null)
                 _agent.enabled = false;
+        }
+
+        // CORREÇÃO CRÍTICO 1: resetar flags de inicialização ao desconectar
+        public override void OnStopClient()
+        {
+            _clientInitialized = false;
+            _pendingClientInit = false;
+            _pendingInitData   = null;
         }
 
         public override void OnStartLocalPlayer()
@@ -185,7 +203,6 @@ namespace RPG.Network
             _serverAccountUsername = accountUsername;
             _serverCharData        = charData;
             _serverStats           = charData.GetDerivedStats();
-            // MUDANÇA v11: sem LoadAccount — DatabaseManager.SaveCharacter não precisa de AccountData
 
             float maxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
             float maxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
@@ -202,8 +219,17 @@ namespace RPG.Network
             AllocatedDEX          = charData.AllocatedDEX;
             AllocatedINT          = charData.AllocatedINT;
             AllocatedLUK          = charData.AllocatedLUK;
-            MaxHP                 = maxHP;
-            MaxMP                 = maxMP;
+
+            // CORREÇÃO CRÍTICO 2: sincronizar BaseAttributes reais via SyncVars
+            BaseSTR = charData.BaseAttributes.STR;
+            BaseAGI = charData.BaseAttributes.AGI;
+            BaseVIT = charData.BaseAttributes.VIT;
+            BaseDEX = charData.BaseAttributes.DEX;
+            BaseINT = charData.BaseAttributes.INT;
+            BaseLUK = charData.BaseAttributes.LUK;
+
+            MaxHP     = maxHP;
+            MaxMP     = maxMP;
             CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= maxHP)
                 ? charData.CurrentHP : maxHP;
             CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP)
@@ -236,6 +262,9 @@ namespace RPG.Network
                 charData.FreeAttributePoints,
                 charData.AllocatedSTR, charData.AllocatedAGI, charData.AllocatedVIT,
                 charData.AllocatedDEX, charData.AllocatedINT, charData.AllocatedLUK,
+                // CORREÇÃO CRÍTICO 2: passa BaseAttributes reais
+                charData.BaseAttributes.STR, charData.BaseAttributes.AGI, charData.BaseAttributes.VIT,
+                charData.BaseAttributes.DEX, charData.BaseAttributes.INT, charData.BaseAttributes.LUK,
                 CurrentHP, CurrentMP,
                 charData.EquipmentBonuses?.ATK  ?? 0f, charData.EquipmentBonuses?.DEF  ?? 0f,
                 charData.EquipmentBonuses?.MATK ?? 0f, charData.EquipmentBonuses?.MDEF ?? 0f
@@ -341,6 +370,9 @@ namespace RPG.Network
         {
             if (_serverCharData == null) return;
 
+            // CORREÇÃO MELHORIA 8: proteger contra XP negativo
+            if (amount <= 0) return;
+
             bool leveledUp = _serverCharData.AddExperience(amount);
 
             Experience            = _serverCharData.Experience;
@@ -362,26 +394,21 @@ namespace RPG.Network
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
+                // CORREÇÃO AVISO 6: assert de consistência
+                Debug.Assert(_serverCharData.Level == Level,
+                    $"[Server] Level inconsistente: SyncVar={Level} Data={_serverCharData.Level}");
+
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
 
-// Registra no log de economia (analytics e balanceamento)
-DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
+            DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
 
-// Só salva imediatamente se houve level up, caso contrário aguarda o save periódico
-if (leveledUp)
-    ServerSaveCharacter();
+            if (leveledUp)
+                ServerSaveCharacter();
 
-RpcOnExpGained(amount, leveledUp);
+            RpcOnExpGained(amount, leveledUp);
         }
 
-        // ── Salvar — MUDANÇA PRINCIPAL v11 ────────────────────────────────
-
-        /// <summary>
-        /// Salva personagem no SQLite via DatabaseManager.
-        /// Sem AccountData intermediário, sem releitura de disco.
-        /// Apenas UPDATE das colunas que mudaram.
-        /// </summary>
         [Server]
         public void ServerSaveCharacter()
         {
@@ -393,18 +420,20 @@ RpcOnExpGained(amount, leveledUp);
             _serverCharData.PosY      = transform.position.y;
             _serverCharData.PosZ      = transform.position.z;
 
-            // Uma linha — UPDATE direto no banco, sem reler nada
             DatabaseManager.Instance?.SaveCharacter(_serverCharData, _serverAccountUsername);
         }
 
         // ── ClientRpcs ─────────────────────────────────────────────────────
 
+        // CORREÇÃO CRÍTICO 2: parâmetros de BaseAttributes adicionados ao Rpc
         [ClientRpc]
         private void RpcInitializeLocalPlayer(
             string charName, CharacterRace race, int level,
             long exp, long expToNext, int freePoints,
             int allocSTR, int allocAGI, int allocVIT,
             int allocDEX, int allocINT, int allocLUK,
+            int baseSTR,  int baseAGI,  int baseVIT,
+            int baseDEX,  int baseINT,  int baseLUK,
             float currentHP, float currentMP,
             float equipATK, float equipDEF, float equipMATK, float equipMDEF)
         {
@@ -426,41 +455,43 @@ RpcOnExpGained(amount, leveledUp);
                 AllocatedLUK          = allocLUK,
                 CurrentHP             = currentHP,
                 CurrentMP             = currentMP,
-                BaseAttributes        = new BaseAttributes { STR=10, AGI=10, VIT=10, DEX=10, INT=10, LUK=10 },
-                EquipmentBonuses      = new EquipmentBonuses
+                // CORREÇÃO CRÍTICO 2: usa BaseAttributes reais enviados pelo servidor
+                BaseAttributes = new BaseAttributes
+                {
+                    STR = baseSTR, AGI = baseAGI, VIT = baseVIT,
+                    DEX = baseDEX, INT = baseINT, LUK = baseLUK
+                },
+                EquipmentBonuses = new EquipmentBonuses
                 {
                     ATK = equipATK, DEF = equipDEF,
                     MATK = equipMATK, MDEF = equipMDEF
                 }
             };
 
-if (_playerEntity == null)
-{
-    _pendingClientInit = true;
-    _pendingInitData   = data;
-    return;
-}
+            if (_playerEntity == null)
+            {
+                _pendingClientInit = true;
+                _pendingInitData   = data;
+                return;
+            }
 
-if (_clientInitialized) return;
-_clientInitialized = true; // seta ANTES do yield para evitar dupla inicialização
-StartCoroutine(DelayedClientInit(data));
+            if (_clientInitialized) return;
+            _clientInitialized = true;
+            StartCoroutine(DelayedClientInit(data));
         }
 
         private IEnumerator DelayedClientInit(CharacterData data)
         {
             yield return null;
 
-if (_playerEntity == null)
-{
-    Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado no prefab do player!");
-    yield break;
-}
-
-            _playerEntity = GetComponent<PlayerEntity>();
             if (_playerEntity == null)
             {
-                Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado no prefab do player!");
-                yield break;
+                _playerEntity = GetComponent<PlayerEntity>();
+                if (_playerEntity == null)
+                {
+                    Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado no prefab do player!");
+                    yield break;
+                }
             }
 
             _playerEntity.InitializeFromServer(data);
@@ -629,11 +660,12 @@ if (_playerEntity == null)
             UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
-		private void OnNetExpToNextChanged(long _, long __)
-{
-    if (!isLocalPlayer) return;
-    UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
-    AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
-}
+
+        private void OnNetExpToNextChanged(long _, long __)
+        {
+            if (!isLocalPlayer) return;
+            UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
+            AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
+        }
     }
 }
