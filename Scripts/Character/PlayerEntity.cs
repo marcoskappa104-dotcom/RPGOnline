@@ -14,8 +14,12 @@ namespace RPG.Character
     ///   - HP, MP, XP, Level, Stats: todos chegam do servidor via NetworkPlayer SyncVars.
     ///   - Os únicos métodos que alteram estado são os Set* chamados pelo NetworkPlayer.
     ///   - Não há regen, dano, heal, save ou lógica de combate aqui.
-    ///   - NavMeshAgent é movido SOMENTE por CmdMoveTo confirmado pelo servidor
-    ///     (sem predição local — evita dessincronia).
+    ///   - NavMeshAgent é movido SOMENTE por CmdMoveTo confirmado pelo servidor.
+    ///
+    /// CORREÇÕES v2:
+    ///   - Camera cacheada no Awake para evitar Camera.main por frame.
+    ///   - IsInitialized verificado em todos os métodos Set*.
+    ///   - OnDisable garante limpeza do HashSet mesmo em crashes.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class PlayerEntity : MonoBehaviour
@@ -44,6 +48,10 @@ namespace RPG.Character
         private NavMeshAgent _agent;
         public  NavMeshAgent Agent => _agent;
 
+        // ── Cache da câmera (evita Camera.main toda frame) ─────────────────
+        private Camera _cachedCamera;
+        public  Camera MainCamera => _cachedCamera != null ? _cachedCamera : (_cachedCamera = Camera.main);
+
         // ── Alvo selecionado (só visual/local — servidor não usa isso) ─────
         public ITargetable CurrentTarget { get; private set; }
 
@@ -53,10 +61,11 @@ namespace RPG.Character
 
         private void Awake()
         {
-            _agent = GetComponent<NavMeshAgent>();
+            _agent        = GetComponent<NavMeshAgent>();
+            _cachedCamera = Camera.main;
         }
 
-        // ── Inicialização (chamada pelo NetworkPlayer via TargetRpc) ───────
+        // ── Inicialização (chamada pelo NetworkPlayer via RpcInitializeLocalPlayer) ──
 
         /// <summary>
         /// Inicializa o PlayerEntity com dados confirmados pelo servidor.
@@ -71,14 +80,14 @@ namespace RPG.Character
             }
 
             Data  = data;
-            Stats = data.GetDerivedStats(); // recalcula sem side-effects
+            Stats = data.GetDerivedStats();
 
-            CurrentHP = data.CurrentHP;
-            CurrentMP = data.CurrentMP;
+            CurrentHP = Mathf.Clamp(data.CurrentHP, 0f, Stats.MaxHP);
+            CurrentMP = Mathf.Clamp(data.CurrentMP, 0f, Stats.MaxMP);
 
             ConfigureAgent();
 
-            Debug.Log($"[PlayerEntity] Inicializado via servidor: {data.CharacterName} " +
+            Debug.Log($"[PlayerEntity] Inicializado: {data.CharacterName} " +
                       $"Lv{data.Level} HP:{CurrentHP:0}/{Stats.MaxHP:0}");
 
             OnInitialized?.Invoke();
@@ -88,9 +97,6 @@ namespace RPG.Character
 
         // ── Atualizações de estado vindas do servidor ─────────────────────
 
-        /// <summary>
-        /// Atualiza HP. Chamado pelo hook OnHPChanged / OnMaxHPChanged do NetworkPlayer.
-        /// </summary>
         public void SetHPFromServer(float hp, float maxHp)
         {
             if (!IsInitialized) return;
@@ -110,9 +116,6 @@ namespace RPG.Character
             }
         }
 
-        /// <summary>
-        /// Atualiza MP. Chamado pelo hook OnMPChanged / OnMaxMPChanged do NetworkPlayer.
-        /// </summary>
         public void SetMPFromServer(float mp, float maxMp)
         {
             if (!IsInitialized) return;
@@ -121,9 +124,6 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, maxMp);
         }
 
-        /// <summary>
-        /// Atualiza MaxHP e MaxMP quando os stats do servidor mudam (ex: level up, equipamento).
-        /// </summary>
         public void RefreshStatsFromServer(float maxHp, float maxMp)
         {
             if (!IsInitialized) return;
@@ -139,11 +139,6 @@ namespace RPG.Character
             OnMPChanged?.Invoke(CurrentMP, maxMp);
         }
 
-        /// <summary>
-        /// Atualiza os dados locais de CharacterData quando o servidor confirma
-        /// uma mudança de nível ou atributo alocado.
-        /// Não recalcula stats — Stats vem dos SyncVars MaxHP/MaxMP.
-        /// </summary>
         public void UpdateDataFromServer(int level, long exp, long expToNext,
                                          int freePoints,
                                          int allocSTR, int allocAGI, int allocVIT,
@@ -162,19 +157,17 @@ namespace RPG.Character
             Data.AllocatedLUK          = allocLUK;
         }
 
-        // ── Morte e Respawn (confirmados pelo servidor) ────────────────────
+        // ── Morte e Respawn ────────────────────────────────────────────────
 
-        /// <summary>Chamado pelo RpcPlayerDied do NetworkPlayer.</summary>
         public void OnServerDeath()
         {
             CurrentHP = 0f;
             _agent?.ResetPath();
             OnHPChanged?.Invoke(0f, Stats?.MaxHP ?? 1f);
             OnDeathChanged?.Invoke(true);
-            Debug.Log($"[PlayerEntity] Morte confirmada pelo servidor: {Data?.CharacterName}");
+            Debug.Log($"[PlayerEntity] Morte confirmada: {Data?.CharacterName}");
         }
 
-        /// <summary>Chamado pelo RpcOnRespawned do NetworkPlayer.</summary>
         public void OnServerRespawn(Vector3 position, float hp, float maxHp, float mp, float maxMp)
         {
             if (!IsInitialized) return;
@@ -190,15 +183,11 @@ namespace RPG.Character
             OnHPChanged?.Invoke(CurrentHP, maxHp);
             OnMPChanged?.Invoke(CurrentMP, maxMp);
 
-            Debug.Log($"[PlayerEntity] Respawn confirmado em {position}");
+            Debug.Log($"[PlayerEntity] Respawn em {position}");
         }
 
-        // ── Movimento (destino vem do servidor) ────────────────────────────
+        // ── Movimento ──────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Move o agente local para o destino confirmado pelo servidor.
-        /// Chamado pelo RpcMoveConfirmed do NetworkPlayerController.
-        /// </summary>
         public void MoveToConfirmed(Vector3 destination)
         {
             if (IsDead || _agent == null || !_agent.isOnNavMesh) return;
@@ -215,7 +204,7 @@ namespace RPG.Character
                 && (!_agent.hasPath || _agent.velocity.sqrMagnitude < 0.01f);
         }
 
-        // ── Alvo (seleção visual local) ────────────────────────────────────
+        // ── Alvo ──────────────────────────────────────────────────────────
 
         public void SetTarget(ITargetable target)
         {
@@ -230,7 +219,7 @@ namespace RPG.Character
             CurrentTarget = null;
         }
 
-        // ── Helpers ────────────────────────────────────────────────────────
+        // ── Helpers ───────────────────────────────────────────────────────
 
         private void ConfigureAgent()
         {

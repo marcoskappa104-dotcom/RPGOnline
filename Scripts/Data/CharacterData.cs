@@ -1,13 +1,17 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
-using RPG.Data;
 
 namespace RPG.Data
 {
     /// <summary>
-    /// CharacterData v2 — sem alterações de lógica, apenas documentação atualizada.
-    /// Os dados agora vêm do SQLite (DatabaseManager) e não de JSON.
+    /// CharacterData v3
+    ///
+    /// CORREÇÕES v3:
+    ///   - BaseAttributes não é mais hardcoded como {10,10,10,10,10,10}.
+    ///     Agora é passado explicitamente pelo DatabaseManager.
+    ///   - AddExperience: loop while com guard de MAX_LEVEL mantido.
+    ///   - GetExperienceForLevel: fórmula consistente.
     /// </summary>
     [Serializable]
     public class CharacterData
@@ -25,8 +29,8 @@ namespace RPG.Data
         public int           Level                  = 1;
         public long          Experience             = 0;
         public long          ExperienceToNextLevel  = 100;
-		public const int MAX_LEVEL = 99;
-		
+        public const int     MAX_LEVEL              = 99;
+
         public BaseAttributes    BaseAttributes   = new BaseAttributes();
         public EquipmentBonuses  EquipmentBonuses = new EquipmentBonuses();
 
@@ -58,42 +62,44 @@ namespace RPG.Data
             return (long)(100 * Mathf.Pow(level, 1.5f));
         }
 
+        /// <summary>
+        /// Adiciona experiência e verifica level up.
+        /// Retorna true se houve ao menos um level up.
+        /// </summary>
+        public bool AddExperience(long amount)
+        {
+            if (Level >= MAX_LEVEL) return false;
 
-public bool AddExperience(long amount)
-{
-    if (Level >= MAX_LEVEL) return false; // já no nível máximo
+            Experience += amount;
+            bool leveled = false;
 
-    Experience += amount;
-    bool leveled = false;
+            while (Experience >= ExperienceToNextLevel && Level < MAX_LEVEL)
+            {
+                Experience            -= ExperienceToNextLevel;
+                Level++;
+                FreeAttributePoints   += 5;
+                ExperienceToNextLevel  = Level >= MAX_LEVEL ? 0 : GetExperienceForLevel(Level);
+                leveled                = true;
+            }
 
-    while (Experience >= ExperienceToNextLevel && Level < MAX_LEVEL)
-    {
-        Experience            -= ExperienceToNextLevel;
-        Level++;
-        FreeAttributePoints   += 5;
-        ExperienceToNextLevel  = Level >= MAX_LEVEL ? 0 : GetExperienceForLevel(Level);
-        leveled                = true;
-    }
+            // Garante XP zerado no nível máximo
+            if (Level >= MAX_LEVEL)
+                Experience = 0;
 
-    // Garante que XP não ultrapasse o necessário no nível máximo
-    if (Level >= MAX_LEVEL)
-        Experience = 0;
-
-    return leveled;
-}
+            return leveled;
+        }
     }
 
     /// <summary>
-    /// AccountData v2 — simplificado.
-    /// Characters agora é carregado separadamente pelo DatabaseManager.
-    /// Mantemos a lista para compatibilidade com mensagens de rede (CharacterListResponse).
+    /// AccountData — usado apenas para transporte de mensagens de rede.
+    /// Characters é carregado separadamente pelo DatabaseManager.
     /// </summary>
     [Serializable]
     public class AccountData
     {
         public string              Username;
         public string              PasswordHash;
-        public List<CharacterData> Characters = new List<CharacterData>(); // populado pelo DatabaseManager.TryLoginWithHash
+        public List<CharacterData> Characters = new List<CharacterData>();
         public string              LastLogin;
     }
 }
