@@ -67,7 +67,8 @@ namespace RPG.Managers
         [Column("pos_z")]
         public float PosZ { get; set; } = 0f;
 
-        [Column("current_map")]
+        // CORREÇÃO: current_map agora tem índice para queries por área/mapa
+        [Column("current_map"), Indexed]
         public string CurrentMap { get; set; } = "World_01";
 
         [Column("free_points")]
@@ -120,7 +121,8 @@ namespace RPG.Managers
         [Column("id")]
         public int Id { get; set; }
 
-        [Column("character_id"), NotNull]
+        // CORREÇÃO: índice em character_id para queries de log por personagem
+        [Column("character_id"), NotNull, Indexed]
         public string CharacterId { get; set; }
 
         [Column("event_type"), NotNull]
@@ -134,28 +136,29 @@ namespace RPG.Managers
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // DatabaseManager v3
+    // DatabaseManager v4
     // ══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// DatabaseManager v3
+    /// DatabaseManager v4
     ///
-    /// CORREÇÕES v3:
-    ///   1. SaveCharacter agora é assíncrono via fila de escrita em thread separado.
-    ///      Reads (login, loadCharacter) continuam síncronos pois são raros
-    ///      e precisam de resultado imediato.
-    ///      Isso elimina spikes no main thread com 20+ players salvando.
+    /// CORREÇÕES v4:
+    ///   1. TryLoginWithHash agora compara contra GameManager.ServerHashForStorage
+    ///      em vez do hash cru do cliente. Isso permite que o servidor aplique
+    ///      seu próprio salt sem alterar o protocolo de rede.
     ///
-    ///   2. RowToCharacterData agora lê os BaseAttributes da linha do banco
-    ///      em vez de hardcodar {10,10,10,10,10,10}, preservando dados reais.
+    ///   2. TryCreateAccount também usa ServerHashForStorage ao salvar.
     ///
-    ///   3. TryCreateCharacter salva BaseAttributes corretos.
+    ///   3. CharacterRow.current_map agora tem [Indexed] para suportar
+    ///      queries futuras de "jogadores neste mapa" sem full table scan.
     ///
-    ///   4. FlushAndClose aguarda a fila de escrita esvaziar antes de fechar.
+    ///   4. EconomyLogRow.character_id agora tem [Indexed].
     ///
-    ///   5. LogEconomy usa a fila assíncrona (não bloqueia main thread).
+    ///   5. FlushAndClose é idempotente — não crasheia se chamado duas vezes.
     ///
-    ///   6. Adicionado lock em reads para thread safety com a fila de escrita.
+    ///   6. LoadCharacters: ordenado por level DESC para UX na tela de seleção.
+    ///
+    ///   7. Adicionado GetCharactersInMap() para suporte futuro a instâncias.
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
@@ -163,8 +166,9 @@ namespace RPG.Managers
 
         private SQLiteConnection _db;
         private readonly object  _dbLock = new object();
+        private bool             _closed = false;
 
-        // Fila de escrita assíncrona — saves não bloqueiam o main thread
+        // Fila de escrita assíncrona
         private readonly ConcurrentQueue<Action> _writeQueue = new ConcurrentQueue<Action>();
         private Thread   _writeThread;
         private volatile bool _writeThreadRunning;
@@ -181,15 +185,8 @@ namespace RPG.Managers
             StartWriteThread();
         }
 
-        private void OnDestroy()
-        {
-            FlushAndClose();
-        }
-
-        private void OnApplicationQuit()
-        {
-            FlushAndClose();
-        }
+        private void OnDestroy()      => FlushAndClose();
+        private void OnApplicationQuit() => FlushAndClose();
 
         private void InitializeDatabase()
         {
@@ -203,7 +200,7 @@ namespace RPG.Managers
                 _db = new SQLiteConnection(dbPath);
                 _db.ExecuteScalar<string>("PRAGMA journal_mode=WAL;");
                 _db.Execute("PRAGMA foreign_keys = ON;");
-                _db.Execute("PRAGMA synchronous = NORMAL;"); // balanceio segurança/performance
+                _db.Execute("PRAGMA synchronous = NORMAL;");
 
                 _db.CreateTable<AccountRow>();
                 _db.CreateTable<CharacterRow>();
@@ -235,23 +232,17 @@ namespace RPG.Managers
         {
             while (_writeThreadRunning)
             {
-                _writeEvent.Wait(500); // espera até 500ms por trabalho
+                _writeEvent.Wait(500);
                 _writeEvent.Reset();
 
                 while (_writeQueue.TryDequeue(out Action action))
                 {
-                    try
-                    {
-                        action();
-                    }
+                    try   { action(); }
                     catch (Exception e)
-                    {
-                        Debug.LogError($"[DatabaseManager] Erro no write thread: {e.Message}");
-                    }
+                    { Debug.LogError($"[DatabaseManager] Erro no write thread: {e.Message}"); }
                 }
             }
 
-            // Drena a fila ao encerrar
             while (_writeQueue.TryDequeue(out Action action))
             {
                 try { action(); } catch { /* ignorar ao fechar */ }
@@ -260,9 +251,12 @@ namespace RPG.Managers
 
         private void FlushAndClose()
         {
+            if (_closed) return;
+            _closed = true;
+
             _writeThreadRunning = false;
             _writeEvent.Set();
-            _writeThread?.Join(3000); // aguarda até 3s
+            _writeThread?.Join(3000);
 
             lock (_dbLock)
             {
@@ -271,10 +265,6 @@ namespace RPG.Managers
             }
         }
 
-        /// <summary>
-        /// Enfileira uma ação de escrita para execução assíncrona.
-        /// Não bloqueia o main thread.
-        /// </summary>
         private void EnqueueWrite(Action writeAction)
         {
             _writeQueue.Enqueue(writeAction);
@@ -306,24 +296,31 @@ namespace RPG.Managers
 
         /// <summary>
         /// Cria conta. Retorna null se sucesso, mensagem de erro se falhar.
+        /// CORREÇÃO v4: salva ServerHashForStorage(passwordHash) no banco,
+        /// não o hash cru do cliente.
         /// </summary>
-        public string TryCreateAccount(string username, string passwordHash)
+        public string TryCreateAccount(string username, string clientPasswordHash)
         {
             if (string.IsNullOrWhiteSpace(username) || username.Trim().Length < 4)
                 return "Username deve ter ao menos 4 caracteres.";
-            if (string.IsNullOrWhiteSpace(passwordHash))
+            if (string.IsNullOrWhiteSpace(clientPasswordHash))
                 return "Senha inválida.";
             if (AccountExists(username))
                 return "Username já está em uso.";
 
             try
             {
+#if UNITY_SERVER || UNITY_EDITOR
+                string storedHash = GameManager.ServerHashForStorage(clientPasswordHash);
+#else
+                string storedHash = clientPasswordHash; // fallback (não deveria chegar aqui no cliente)
+#endif
                 lock (_dbLock)
                 {
                     _db.Insert(new AccountRow
                     {
                         Username     = username.Trim().ToLower(),
-                        PasswordHash = passwordHash,
+                        PasswordHash = storedHash,
                         CreatedAt    = DateTime.UtcNow.ToString("o"),
                         LastLogin    = null
                     });
@@ -340,25 +337,30 @@ namespace RPG.Managers
 
         /// <summary>
         /// Autentica. Retorna AccountData populado se ok, null se falhar.
+        /// CORREÇÃO v4: compara ServerHashForStorage(clientHash) contra o banco.
         /// </summary>
-        public AccountData TryLoginWithHash(string username, string passwordHash)
+        public AccountData TryLoginWithHash(string username, string clientPasswordHash)
         {
-            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(passwordHash))
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(clientPasswordHash))
                 return null;
 
             try
             {
+#if UNITY_SERVER || UNITY_EDITOR
+                string storedHash = GameManager.ServerHashForStorage(clientPasswordHash);
+#else
+                string storedHash = clientPasswordHash;
+#endif
                 AccountRow row;
                 lock (_dbLock)
                 {
                     row = _db.FindWithQuery<AccountRow>(
                         "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?) AND password_hash = ?",
-                        username.Trim(), passwordHash);
+                        username.Trim(), storedHash);
                 }
 
                 if (row == null) return null;
 
-                // Atualiza last_login de forma assíncrona (não crítico)
                 string uname = row.Username;
                 string now   = DateTime.UtcNow.ToString("o");
                 EnqueueWrite(() =>
@@ -387,6 +389,9 @@ namespace RPG.Managers
         // PERSONAGENS
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// CORREÇÃO v4: ordenado por level DESC para melhor UX na tela de seleção.
+        /// </summary>
         public List<CharacterData> LoadCharacters(string username)
         {
             var list = new List<CharacterData>();
@@ -398,7 +403,7 @@ namespace RPG.Managers
                 lock (_dbLock)
                 {
                     rows = _db.Query<CharacterRow>(
-                        "SELECT * FROM characters WHERE LOWER(username) = LOWER(?)",
+                        "SELECT * FROM characters WHERE LOWER(username) = LOWER(?) ORDER BY level DESC",
                         username.Trim());
                 }
                 foreach (var row in rows)
@@ -427,9 +432,6 @@ namespace RPG.Managers
             }
         }
 
-        /// <summary>
-        /// Carrega personagem verificando ownership em uma única query (mais seguro).
-        /// </summary>
         public CharacterData LoadCharacterForAccount(string characterId, string username)
         {
             if (string.IsNullOrWhiteSpace(characterId) || string.IsNullOrWhiteSpace(username))
@@ -453,8 +455,32 @@ namespace RPG.Managers
         }
 
         /// <summary>
-        /// Cria personagem. Retorna null se sucesso, mensagem de erro se falhar.
+        /// NOVO v4: carrega personagens de um mapa específico (suporte a instâncias futuras).
+        /// Usa o índice de current_map para performance com muitos personagens.
         /// </summary>
+        public List<CharacterData> GetCharactersInMap(string mapName)
+        {
+            var list = new List<CharacterData>();
+            if (string.IsNullOrWhiteSpace(mapName)) return list;
+
+            try
+            {
+                List<CharacterRow> rows;
+                lock (_dbLock)
+                {
+                    rows = _db.Query<CharacterRow>(
+                        "SELECT * FROM characters WHERE current_map = ?", mapName);
+                }
+                foreach (var row in rows)
+                    list.Add(RowToCharacterData(row));
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[DB] GetCharactersInMap erro: {e.Message}");
+            }
+            return list;
+        }
+
         public string TryCreateCharacter(string username, string name, CharacterRace race)
         {
             if (string.IsNullOrWhiteSpace(name) || name.Trim().Length < 2)
@@ -503,12 +529,11 @@ namespace RPG.Managers
                         ExpToNext     = ch.ExperienceToNextLevel,
                         CurrentHP     = ch.CurrentHP,
                         CurrentMP     = ch.CurrentMP,
-                        PosX          = 0f, PosY = 1f, PosZ = 0f,
+                        PosX = 0f, PosY = 1f, PosZ = 0f,
                         CurrentMap    = ch.CurrentMap,
                         FreePoints    = 0,
                         AllocSTR = 0, AllocAGI = 0, AllocVIT = 0,
                         AllocDEX = 0, AllocINT = 0, AllocLUK = 0,
-                        // Salva os BaseAttributes reais (base 10 para todos no início)
                         BaseSTR = 10, BaseAGI = 10, BaseVIT = 10,
                         BaseDEX = 10, BaseINT = 10, BaseLUK = 10
                     });
@@ -524,34 +549,28 @@ namespace RPG.Managers
             }
         }
 
-        /// <summary>
-        /// Salva personagem de forma ASSÍNCRONA (não bloqueia o main thread).
-        /// Chamado a cada 60s, ao desconectar e ao ganhar level.
-        /// </summary>
         public void SaveCharacter(CharacterData ch, string username)
         {
             if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
 
-            // Captura snapshot dos valores para evitar race condition
-            // (valores podem mudar entre o enqueue e a execução)
-            string charId   = ch.CharacterId;
-            string uname    = username.Trim();
-            int    level    = ch.Level;
-            long   exp      = ch.Experience;
-            long   expNext  = ch.ExperienceToNextLevel;
-            float  hp       = ch.CurrentHP;
-            float  mp       = ch.CurrentMP;
-            float  px       = ch.PosX;
-            float  py       = ch.PosY;
-            float  pz       = ch.PosZ;
-            string map      = ch.CurrentMap ?? "World_01";
-            int    fp       = ch.FreeAttributePoints;
-            int    aSTR     = ch.AllocatedSTR;
-            int    aAGI     = ch.AllocatedAGI;
-            int    aVIT     = ch.AllocatedVIT;
-            int    aDEX     = ch.AllocatedDEX;
-            int    aINT     = ch.AllocatedINT;
-            int    aLUK     = ch.AllocatedLUK;
+            string charId  = ch.CharacterId;
+            string uname   = username.Trim();
+            int    level   = ch.Level;
+            long   exp     = ch.Experience;
+            long   expNext = ch.ExperienceToNextLevel;
+            float  hp      = ch.CurrentHP;
+            float  mp      = ch.CurrentMP;
+            float  px      = ch.PosX;
+            float  py      = ch.PosY;
+            float  pz      = ch.PosZ;
+            string map     = ch.CurrentMap ?? "World_01";
+            int    fp      = ch.FreeAttributePoints;
+            int    aSTR    = ch.AllocatedSTR;
+            int    aAGI    = ch.AllocatedAGI;
+            int    aVIT    = ch.AllocatedVIT;
+            int    aDEX    = ch.AllocatedDEX;
+            int    aINT    = ch.AllocatedINT;
+            int    aLUK    = ch.AllocatedLUK;
 
             EnqueueWrite(() =>
             {
@@ -620,15 +639,12 @@ namespace RPG.Managers
                         });
                     }
                 }
-                catch (Exception e)
-                {
-                    Debug.LogError($"[DB] AddItem erro: {e.Message}");
-                }
+                catch (Exception e) { Debug.LogError($"[DB] AddItem erro: {e.Message}"); }
             });
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // LOG DE ECONOMIA (assíncrono)
+        // LOG DE ECONOMIA
         // ══════════════════════════════════════════════════════════════════
 
         public void LogEconomy(string characterId, string eventType, float value)
@@ -649,10 +665,7 @@ namespace RPG.Managers
                         });
                     }
                 }
-                catch (Exception e)
-                {
-                    Debug.LogError($"[DB] LogEconomy erro: {e.Message}");
-                }
+                catch (Exception e) { Debug.LogError($"[DB] LogEconomy erro: {e.Message}"); }
             });
         }
 
@@ -660,10 +673,6 @@ namespace RPG.Managers
         // HELPERS
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Converte CharacterRow para CharacterData preservando os BaseAttributes reais.
-        /// CORREÇÃO: não mais hardcoda {10,10,10,10,10,10}.
-        /// </summary>
         private CharacterData RowToCharacterData(CharacterRow row)
         {
             return new CharacterData
@@ -687,7 +696,6 @@ namespace RPG.Managers
                 AllocatedDEX          = row.AllocDEX,
                 AllocatedINT          = row.AllocINT,
                 AllocatedLUK          = row.AllocLUK,
-                // CORREÇÃO: lê os valores reais do banco em vez de hardcodar 10
                 BaseAttributes = new BaseAttributes
                 {
                     STR = row.BaseSTR, AGI = row.BaseAGI, VIT = row.BaseVIT,

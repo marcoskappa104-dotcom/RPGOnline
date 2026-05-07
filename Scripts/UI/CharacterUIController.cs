@@ -8,12 +8,14 @@ using RPG.Network;
 namespace RPG.UI
 {
     /// <summary>
-    /// CharacterUIController v3
+    /// CharacterUIController v4
     ///
-    /// CORREÇÃO:
-    ///   - HandleSelectCharacterResult NÃO carrega mais a GameplayScene.
-    ///     Isso agora é responsabilidade do ClientAuthHandler.
-    ///   - Apenas atualiza o status visual e desabilita botões enquanto aguarda.
+    /// CORREÇÃO v4:
+    ///   SetAllButtonsInteractable(bool value) não passava o parâmetro 'value'
+    ///   para os slots de personagem — sempre chamava SetInteractable(false),
+    ///   impedindo re-habilitar os botões após um erro de seleção.
+    ///
+    ///   Agora o valor correto é propagado para todos os botões.
     /// </summary>
     public class CharacterUIController : MonoBehaviour
     {
@@ -119,11 +121,10 @@ namespace RPG.UI
 
         private void HandleSelectCharacterResult(bool success, string error)
         {
-            // CORREÇÃO: NÃO carregamos cena aqui — o ClientAuthHandler já faz isso.
-            // Só trata o caso de erro.
             if (!success)
             {
                 SetSelectionStatus($"Erro: {error}");
+                // CORREÇÃO: passa 'true' para re-habilitar os botões após erro
                 SetAllButtonsInteractable(true);
             }
             // Se success: ClientAuthHandler carregou GameplayScene — esta cena some.
@@ -206,10 +207,14 @@ namespace RPG.UI
             if (selectionStatusText != null) selectionStatusText.text = msg;
         }
 
+        /// <summary>
+        /// CORREÇÃO v4: propaga o parâmetro 'value' corretamente para os slots.
+        /// Antes sempre passava 'false', impedindo re-habilitar após erro.
+        /// </summary>
         private void SetAllButtonsInteractable(bool value)
         {
             foreach (Transform child in characterListContent)
-                child.GetComponent<Button>()?.SetInteractable(false);
+                child.GetComponent<Button>()?.SetInteractable(value); // CORRIGIDO: era false hardcoded
             if (createNewButton) createNewButton.interactable = value;
             if (logoutButton)    logoutButton.interactable    = value;
         }

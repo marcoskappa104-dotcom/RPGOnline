@@ -9,42 +9,34 @@ using NetworkPlayer = RPG.Network.NetworkPlayer;
 namespace RPG.UI
 {
     /// <summary>
-    /// AttributeWindowUI v2 — Janela de Atributos do Personagem.
+    /// AttributeWindowUI v3
     ///
-    /// CORREÇÕES v2:
-    ///   1. RefreshAll() removido do Update() — não precisa recalcular todo frame.
-    ///      Agora atualiza apenas via eventos (OnInitialized, OnStatsChanged,
-    ///      OnHPChanged, OnMPChanged) e quando a janela abre.
-    ///      Antes: ~60 recálculos/segundo enquanto a janela estava aberta.
-    ///      Agora: 0 no idle, atualiza só quando muda algo.
+    /// CORREÇÕES v3:
+    ///   1. CRÍTICO: RefreshBaseAttributes agora lê BaseAttributes reais do
+    ///      NetworkPlayer (BaseSTR..BaseLUK SyncVars) em vez de hardcodar BASE=10.
+    ///      O valor 10 estava correto APENAS para personagens recém-criados.
+    ///      Para raças com base diferente no futuro, ou personagens com base
+    ///      modificada, a janela mostrava valores incorretos.
     ///
-    ///   2. BindPlayer verifica se já está vinculado ao mesmo player antes de
-    ///      resubscrever eventos (evita handlers duplicados).
-    ///
-    ///   3. Anti-spam de alocação aumentado para 0.5 s e usa botão interactable
-    ///      em vez de timer para feedback visual correto.
+    ///   2. Sem outras alterações de lógica — apenas a correção do BASE.
     /// </summary>
     public class AttributeWindowUI : MonoBehaviour
     {
         public static AttributeWindowUI Instance { get; private set; }
 
-        // ── Painel principal ───────────────────────────────────────────────
         [Header("Painel")]
         [SerializeField] private GameObject windowPanel;
 
-        // ── Header ─────────────────────────────────────────────────────────
         [Header("Header")]
         [SerializeField] private TMP_Text charNameText;
         [SerializeField] private TMP_Text raceText;
         [SerializeField] private TMP_Text levelText;
         [SerializeField] private Button   closeButton;
 
-        // ── Pontos livres ──────────────────────────────────────────────────
         [Header("Pontos Livres")]
         [SerializeField] private GameObject freePointsBanner;
         [SerializeField] private TMP_Text   freePointsText;
 
-        // ── Atributos Base ─────────────────────────────────────────────────
         [Header("Atributos Base — Textos")]
         [SerializeField] private TMP_Text strValueText;
         [SerializeField] private TMP_Text agiValueText;
@@ -61,7 +53,6 @@ namespace RPG.UI
         [SerializeField] private Button intPlusButton;
         [SerializeField] private Button lukPlusButton;
 
-        // ── Status Derivados ───────────────────────────────────────────────
         [Header("Status Derivados")]
         [SerializeField] private TMP_Text hpDerivedText;
         [SerializeField] private TMP_Text mpDerivedText;
@@ -76,18 +67,14 @@ namespace RPG.UI
         [SerializeField] private TMP_Text hpregenText;
         [SerializeField] private TMP_Text mpregenText;
 
-        // ── XP ─────────────────────────────────────────────────────────────
         [Header("XP")]
         [SerializeField] private Slider   xpBar;
         [SerializeField] private TMP_Text xpText;
 
-        // ── Estado interno ─────────────────────────────────────────────────
         private PlayerEntity  _player;
         private NetworkPlayer _netPlayer;
         private bool          _isOpen;
-        private bool          _allocating; // previne spam durante request ao servidor
-
-        // ── Lifecycle ──────────────────────────────────────────────────────
+        private bool          _allocating;
 
         private void Awake()
         {
@@ -100,13 +87,13 @@ namespace RPG.UI
             if (windowPanel != null) windowPanel.SetActive(false);
             _isOpen = false;
 
-            if (closeButton != null)    closeButton.onClick.AddListener(Close);
-            if (strPlusButton != null)  strPlusButton.onClick.AddListener(() => RequestAllocate(0));
-            if (agiPlusButton != null)  agiPlusButton.onClick.AddListener(() => RequestAllocate(1));
-            if (vitPlusButton != null)  vitPlusButton.onClick.AddListener(() => RequestAllocate(2));
-            if (dexPlusButton != null)  dexPlusButton.onClick.AddListener(() => RequestAllocate(3));
-            if (intPlusButton != null)  intPlusButton.onClick.AddListener(() => RequestAllocate(4));
-            if (lukPlusButton != null)  lukPlusButton.onClick.AddListener(() => RequestAllocate(5));
+            if (closeButton    != null) closeButton.onClick.AddListener(Close);
+            if (strPlusButton  != null) strPlusButton.onClick.AddListener(() => RequestAllocate(0));
+            if (agiPlusButton  != null) agiPlusButton.onClick.AddListener(() => RequestAllocate(1));
+            if (vitPlusButton  != null) vitPlusButton.onClick.AddListener(() => RequestAllocate(2));
+            if (dexPlusButton  != null) dexPlusButton.onClick.AddListener(() => RequestAllocate(3));
+            if (intPlusButton  != null) intPlusButton.onClick.AddListener(() => RequestAllocate(4));
+            if (lukPlusButton  != null) lukPlusButton.onClick.AddListener(() => RequestAllocate(5));
         }
 
         // ── Vínculo com PlayerEntity ───────────────────────────────────────
@@ -114,9 +101,8 @@ namespace RPG.UI
         public void BindPlayer(PlayerEntity player)
         {
             if (player == null) return;
-            if (_player == player) return; // já vinculado ao mesmo player
+            if (_player == player) return;
 
-            // Desvincula anterior
             if (_player != null)
             {
                 _player.OnStatsChanged -= OnDataChanged;
@@ -134,7 +120,6 @@ namespace RPG.UI
             _player.OnMPChanged    += OnHPMPChanged;
 
             if (player.IsInitialized) RefreshAll();
-
             Debug.Log($"[AttributeWindowUI] Vinculado a {player.Data?.CharacterName}");
         }
 
@@ -145,7 +130,6 @@ namespace RPG.UI
 
         private void OnHPMPChanged(float _, float __)
         {
-            // Atualiza apenas os campos de HP/MP sem recalcular tudo
             if (!_isOpen || _player == null || !_player.IsInitialized) return;
             RefreshHPMP();
         }
@@ -159,7 +143,7 @@ namespace RPG.UI
             if (windowPanel == null) return;
             _isOpen = true;
             windowPanel.SetActive(true);
-            RefreshAll(); // Refresh completo ao abrir
+            RefreshAll();
         }
 
         public void Close()
@@ -178,10 +162,10 @@ namespace RPG.UI
             var stats = _player.Stats;
             if (data == null || stats == null) return;
 
-            int  level      = _netPlayer != null ? _netPlayer.Level                  : data.Level;
-            long exp        = _netPlayer != null ? _netPlayer.Experience              : data.Experience;
-            long expToNext  = _netPlayer != null ? _netPlayer.ExperienceToNextLevel   : data.ExperienceToNextLevel;
-            int  freePoints = _netPlayer != null ? _netPlayer.FreeAttributePoints     : data.FreeAttributePoints;
+            int  level      = _netPlayer != null ? _netPlayer.Level                : data.Level;
+            long exp        = _netPlayer != null ? _netPlayer.Experience            : data.Experience;
+            long expToNext  = _netPlayer != null ? _netPlayer.ExperienceToNextLevel : data.ExperienceToNextLevel;
+            int  freePoints = _netPlayer != null ? _netPlayer.FreeAttributePoints   : data.FreeAttributePoints;
             int  allocSTR   = _netPlayer != null ? _netPlayer.AllocatedSTR : data.AllocatedSTR;
             int  allocAGI   = _netPlayer != null ? _netPlayer.AllocatedAGI : data.AllocatedAGI;
             int  allocVIT   = _netPlayer != null ? _netPlayer.AllocatedVIT : data.AllocatedVIT;
@@ -189,8 +173,20 @@ namespace RPG.UI
             int  allocINT   = _netPlayer != null ? _netPlayer.AllocatedINT : data.AllocatedINT;
             int  allocLUK   = _netPlayer != null ? _netPlayer.AllocatedLUK : data.AllocatedLUK;
 
+            // CORREÇÃO CRÍTICA v3: lê BaseAttributes reais do servidor via SyncVars
+            // Em vez de hardcodar BASE=10, usa os valores confirmados pelo servidor.
+            int baseSTR = _netPlayer != null ? _netPlayer.BaseSTR : data.BaseAttributes.STR;
+            int baseAGI = _netPlayer != null ? _netPlayer.BaseAGI : data.BaseAttributes.AGI;
+            int baseVIT = _netPlayer != null ? _netPlayer.BaseVIT : data.BaseAttributes.VIT;
+            int baseDEX = _netPlayer != null ? _netPlayer.BaseDEX : data.BaseAttributes.DEX;
+            int baseINT = _netPlayer != null ? _netPlayer.BaseINT : data.BaseAttributes.INT;
+            int baseLUK = _netPlayer != null ? _netPlayer.BaseLUK : data.BaseAttributes.LUK;
+
             RefreshHeader(data.CharacterName, data.Race, level);
-            RefreshBaseAttributes(data.Race, allocSTR, allocAGI, allocVIT, allocDEX, allocINT, allocLUK);
+            RefreshBaseAttributes(
+                data.Race,
+                baseSTR, baseAGI, baseVIT, baseDEX, baseINT, baseLUK,
+                allocSTR, allocAGI, allocVIT, allocDEX, allocINT, allocLUK);
             RefreshDerivedStats(stats, _player.CurrentHP, _player.CurrentMP);
             RefreshXPBar(exp, expToNext);
             RefreshFreePointsBanner(freePoints);
@@ -213,19 +209,39 @@ namespace RPG.UI
             if (levelText    != null) levelText.text    = $"Nível {level}";
         }
 
-        private void RefreshBaseAttributes(CharacterRace race,
+        /// <summary>
+        /// CORREÇÃO v3: agora recebe baseSTR..baseLUK reais do servidor.
+        /// Exibe: total = base + raceBonus + allocado, bônus entre parênteses.
+        /// </summary>
+        private void RefreshBaseAttributes(
+            CharacterRace race,
+            int baseSTR, int baseAGI, int baseVIT,
+            int baseDEX, int baseINT, int baseLUK,
             int allocSTR, int allocAGI, int allocVIT,
             int allocDEX, int allocINT, int allocLUK)
         {
             var bonus = StatsCalculator.GetRaceBonus(race);
-            const int BASE = 10;
 
-            SetAttrText(strValueText, BASE + bonus.STR + allocSTR, bonus.STR + allocSTR);
-            SetAttrText(agiValueText, BASE + bonus.AGI + allocAGI, bonus.AGI + allocAGI);
-            SetAttrText(vitValueText, BASE + bonus.VIT + allocVIT, bonus.VIT + allocVIT);
-            SetAttrText(dexValueText, BASE + bonus.DEX + allocDEX, bonus.DEX + allocDEX);
-            SetAttrText(intValueText, BASE + bonus.INT + allocINT, bonus.INT + allocINT);
-            SetAttrText(lukValueText, BASE + bonus.LUK + allocLUK, bonus.LUK + allocLUK);
+            int totalSTR = baseSTR + bonus.STR + allocSTR;
+            int totalAGI = baseAGI + bonus.AGI + allocAGI;
+            int totalVIT = baseVIT + bonus.VIT + allocVIT;
+            int totalDEX = baseDEX + bonus.DEX + allocDEX;
+            int totalINT = baseINT + bonus.INT + allocINT;
+            int totalLUK = baseLUK + bonus.LUK + allocLUK;
+
+            int bonusSTR = bonus.STR + allocSTR;
+            int bonusAGI = bonus.AGI + allocAGI;
+            int bonusVIT = bonus.VIT + allocVIT;
+            int bonusDEX = bonus.DEX + allocDEX;
+            int bonusINT = bonus.INT + allocINT;
+            int bonusLUK = bonus.LUK + allocLUK;
+
+            SetAttrText(strValueText, totalSTR, bonusSTR);
+            SetAttrText(agiValueText, totalAGI, bonusAGI);
+            SetAttrText(vitValueText, totalVIT, bonusVIT);
+            SetAttrText(dexValueText, totalDEX, bonusDEX);
+            SetAttrText(intValueText, totalINT, bonusINT);
+            SetAttrText(lukValueText, totalLUK, bonusLUK);
         }
 
         private void SetAttrText(TMP_Text label, int total, int bonus)
@@ -252,7 +268,7 @@ namespace RPG.UI
             if (mpregenText   != null) mpregenText.text   = $"{s.MPRegen:0.0}/5s";
         }
 
-        public  void RefreshXPBar(long exp, long expToNext)
+        public void RefreshXPBar(long exp, long expToNext)
         {
             if (xpBar != null)
             {
@@ -302,8 +318,6 @@ namespace RPG.UI
             _allocating = true;
             SetPlusButtonsInteractable(false);
             _netPlayer.CmdAllocateAttribute(attributeIndex);
-
-            // Reabilita após timeout (SyncVar hook atualiza de verdade)
             Invoke(nameof(FinishAllocating), 0.5f);
         }
 
@@ -325,15 +339,11 @@ namespace RPG.UI
             if (lukPlusButton != null) lukPlusButton.interactable = value;
         }
 
-        // ── Chamado pelo SyncVar hook OnNetFreePointsChanged ───────────────
-
         public void OnFreePointsUpdated(int newPoints)
         {
             RefreshFreePointsBanner(newPoints);
             RefreshPlusButtons(newPoints);
         }
-
-        // ── Helpers ────────────────────────────────────────────────────────
 
         private static string RaceDisplayName(CharacterRace race) => race switch
         {

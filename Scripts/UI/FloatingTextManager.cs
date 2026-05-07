@@ -1,4 +1,4 @@
-	using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
@@ -6,43 +6,31 @@ using TMPro;
 namespace RPG.UI
 {
     /// <summary>
-    /// FloatingTextManager v2
+    /// FloatingTextManager v3
     ///
-    /// CORREÇÃO DO PREFAB:
-    ///   O prefab NÃO deve ter Canvas. Deve ser um GameObject vazio com
-    ///   filho TextMeshPro (não UI, mas o componente 3D world space).
+    /// CORREÇÃO v3:
+    ///   Camera.main era chamada TODO frame dentro da coroutine ShowCoroutine,
+    ///   para CADA texto flutuante ativo ao mesmo tempo. Com 10 textos simultâneos
+    ///   e 60fps = 600 buscas por segundo.
     ///
-    ///   COMO CRIAR O PREFAB CORRETAMENTE:
+    ///   Solução: câmera buscada UMA VEZ em Show() e passada para a coroutine.
+    ///   Cache global atualizado apenas quando a câmera for null (troca de cena).
     ///
-    ///   1. Hierarchy → clique direito → Create Empty
-    ///      Renomeie para: FloatingTextPrefab
-    ///
-    ///   2. Com FloatingTextPrefab selecionado:
-    ///      Add Component → TextMeshPro - Text (NÃO o UI Text, o 3D Text)
-    ///      Ou: clique direito no FloatingTextPrefab → 3D Object → Text - TextMeshPro
-    ///
-    ///   3. Configure o TextMeshPro 3D:
-    ///      Font Size:  5
-    ///      Bold:       sim
-    ///      Alignment:  Center
-    ///      Color:      branco
-    ///
-    ///   4. Salve como prefab em Assets/Prefabs/UI/FloatingTextPrefab
-    ///
-    ///   ATENÇÃO: Se criar via UI → Text - TextMeshPro, ele cria um Canvas
-    ///   automaticamente e o texto vai aparecer no canto da tela, não no mundo.
-    ///   Use sempre o 3D Text (TextMeshPro component diretamente no GameObject).
+    ///   Adicionado: proteção contra pool vazio quando poolSize = 0.
     /// </summary>
     public class FloatingTextManager : MonoBehaviour
     {
         public static FloatingTextManager Instance { get; private set; }
 
         [SerializeField] private GameObject floatingTextPrefab;
-        [SerializeField] private int        poolSize   = 20;
-        [SerializeField] private float      riseSpeed  = 2f;
-        [SerializeField] private float      lifetime   = 1.2f;
+        [SerializeField] private int        poolSize  = 20;
+        [SerializeField] private float      riseSpeed = 2f;
+        [SerializeField] private float      lifetime  = 1.2f;
 
         private Queue<GameObject> _pool = new Queue<GameObject>();
+
+        // CORREÇÃO: câmera cacheada globalmente no manager
+        private Camera _cachedCamera;
 
         private void Awake()
         {
@@ -52,16 +40,21 @@ namespace RPG.UI
             PrewarmPool();
         }
 
+        private void Start()
+        {
+            // Cache inicial — evita busca na primeira chamada de Show()
+            _cachedCamera = Camera.main;
+        }
+
         private void PrewarmPool()
         {
             if (floatingTextPrefab == null)
             {
-                Debug.LogWarning("[FloatingTextManager] floatingTextPrefab não configurado! " +
-                                 "Arraste o prefab no Inspector.");
+                Debug.LogWarning("[FloatingTextManager] floatingTextPrefab não configurado!");
                 return;
             }
 
-            for (int i = 0; i < poolSize; i++)
+            for (int i = 0; i < Mathf.Max(poolSize, 1); i++)
             {
                 var obj = Instantiate(floatingTextPrefab, transform);
                 obj.SetActive(false);
@@ -72,25 +65,25 @@ namespace RPG.UI
         public void Show(string text, Vector3 worldPos, Color color)
         {
             if (floatingTextPrefab == null) return;
-            StartCoroutine(ShowCoroutine(text, worldPos, color));
+
+            // CORREÇÃO: câmera buscada aqui (uma vez por Show), não dentro da coroutine
+            if (_cachedCamera == null) _cachedCamera = Camera.main;
+
+            StartCoroutine(ShowCoroutine(text, worldPos, color, _cachedCamera));
         }
 
-        private IEnumerator ShowCoroutine(string text, Vector3 worldPos, Color color)
+        private IEnumerator ShowCoroutine(string text, Vector3 worldPos, Color color, Camera cam)
         {
-            // Pega do pool ou instancia novo se o pool estiver vazio
             GameObject obj = _pool.Count > 0
                 ? _pool.Dequeue()
                 : Instantiate(floatingTextPrefab, transform);
 
-            // Posição inicial: acima do ponto de origem, com offset horizontal aleatório
             obj.transform.position = worldPos + new Vector3(
                 Random.Range(-0.3f, 0.3f), 0f, 0f);
             obj.SetActive(true);
 
-            // Tenta achar o TMP no próprio objeto ou em filhos
-            var tmp = obj.GetComponent<TextMeshPro>();
-            if (tmp == null)
-                tmp = obj.GetComponentInChildren<TextMeshPro>();
+            var tmp = obj.GetComponent<TextMeshPro>()
+                   ?? obj.GetComponentInChildren<TextMeshPro>();
 
             if (tmp != null)
             {
@@ -99,8 +92,7 @@ namespace RPG.UI
             }
             else
             {
-                Debug.LogWarning("[FloatingTextManager] Prefab não tem TextMeshPro (3D)! " +
-                                 "Verifique se usou o componente 3D, não o UI.");
+                Debug.LogWarning("[FloatingTextManager] Prefab não tem TextMeshPro (3D)!");
             }
 
             float   elapsed  = 0f;
@@ -111,24 +103,22 @@ namespace RPG.UI
                 elapsed += Time.deltaTime;
                 float t = elapsed / lifetime;
 
-                // Sobe progressivamente
                 obj.transform.position = startPos + Vector3.up * (riseSpeed * t);
 
-                // Fade out no final
                 if (tmp != null)
                 {
                     var c = tmp.color;
-                    c.a       = 1f - Mathf.Pow(t, 2f); // fade quadrático (mais suave)
+                    c.a       = 1f - Mathf.Pow(t, 2f);
                     tmp.color = c;
                 }
 
-// Billboard — texto sempre vira para a câmera
-if (Camera.main != null)
-{
-    Vector3 dir = obj.transform.position - Camera.main.transform.position;
-    if (dir.sqrMagnitude > 0.001f)
-        obj.transform.forward = dir.normalized;
-}
+                // CORREÇÃO: usa 'cam' (parâmetro da coroutine), não Camera.main
+                if (cam != null)
+                {
+                    Vector3 dir = obj.transform.position - cam.transform.position;
+                    if (dir.sqrMagnitude > 0.001f)
+                        obj.transform.forward = dir.normalized;
+                }
 
                 yield return null;
             }

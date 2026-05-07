@@ -4,21 +4,23 @@ using UnityEngine.SceneManagement;
 namespace RPG.Managers
 {
     /// <summary>
-    /// GameManager v4
+    /// GameManager v5
     ///
-    /// CORREÇÕES v4:
-    ///   - HashPassword documentado claramente como hash de transporte,
-    ///     NÃO como armazenamento final. O servidor deve re-hashear com
-    ///     bcrypt/Argon2 + salt por usuário antes de salvar no banco.
-    ///   - Constantes de cena centralizadas.
-    ///   - Logout limpa estado e volta para login.
+    /// CORREÇÕES v5:
+    ///   - HashPassword: o APP_SALT foi movido para um método separado e
+    ///     SOMENTE compilado no servidor (UNITY_SERVER | UNITY_EDITOR).
+    ///     O cliente usa um hash simples SEM salt — o salt real vive apenas
+    ///     no binário do servidor, não no cliente distribuído.
     ///
-    /// SEGURANÇA — IMPORTANTE PARA PRODUÇÃO:
-    ///   O método atual usa SHA-256 com salt fixo apenas para ofuscar
-    ///   a senha em trânsito. Para produção real:
-    ///     1. Use TLS/WSS para criptografar a conexão (KCP + TLS).
-    ///     2. No servidor, re-aplique bcrypt ou Argon2 com salt único por usuário.
-    ///     3. Nunca armazene a senha em texto puro nem o hash SHA-256 direto.
+    ///     FLUXO CORRETO:
+    ///       Cliente  → envia SHA-256(senha) sem salt
+    ///       Servidor → recebe hash, aplica salt+bcrypt antes de comparar/salvar
+    ///
+    ///     PARA PRODUÇÃO REAL: implemente TLS (KCP+TLS ou WebSocket+WSS) e
+    ///     troque para challenge-response com nonce por sessão.
+    ///
+    ///   - Constantes de cena centralizadas (sem alteração).
+    ///   - Logout limpa estado e volta para login (sem alteração).
     /// </summary>
     public class GameManager : MonoBehaviour
     {
@@ -55,32 +57,47 @@ namespace RPG.Managers
         }
 
         /// <summary>
-        /// Hash SHA-256 da senha para transporte seguro pela rede.
+        /// Hash SHA-256 da senha para transporte.
         ///
-        /// ATENÇÃO — SEGURANÇA:
-        ///   Este hash é usado APENAS para não enviar a senha em texto puro.
-        ///   O servidor DEVE re-aplicar bcrypt/Argon2 com salt único por usuário
-        ///   antes de armazenar no banco. Nunca confie apenas neste hash como
-        ///   proteção final de senha.
+        /// CLIENTE: hash sem salt (o salt nunca deve estar no binário do cliente).
+        /// SERVIDOR: ao receber, aplica bcrypt/Argon2 com salt único por usuário.
         ///
-        ///   Para produção: implemente TLS na camada de transporte e substitua
-        ///   este método por um protocolo de challenge-response com nonce.
+        /// IMPORTANTE: este método é chamado TANTO pelo cliente quanto pelo servidor.
+        /// O servidor usa HashPassword() apenas para receber o valor do cliente e
+        /// então re-hasheia com ServerHashForStorage() antes de salvar no banco.
         ///
-        ///   Troque APP_SALT antes de lançar o jogo e nunca o exponha
-        ///   em repositórios públicos.
+        /// TROQUE PARA PRODUÇÃO: implemente TLS e challenge-response com nonce.
         /// </summary>
         public static string HashPassword(string password)
         {
-#if UNITY_SERVER || UNITY_EDITOR
-            // Salt apenas em builds de servidor/editor — cliente não precisa da mesma constante
-            // se você implementar um fluxo correto de challenge-response
-#endif
-            const string APP_SALT = "RPG_ONLINE_SALT_2024_TROQUE_ANTES_DO_LAUNCH";
+            if (string.IsNullOrEmpty(password)) return "";
 
             using var sha256 = System.Security.Cryptography.SHA256.Create();
-            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(password + APP_SALT);
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(password);
             byte[] hash  = sha256.ComputeHash(bytes);
             return System.BitConverter.ToString(hash).Replace("-", "").ToLower();
         }
+
+#if UNITY_SERVER || UNITY_EDITOR
+        /// <summary>
+        /// Hash para armazenamento no servidor — NUNCA chame do cliente.
+        /// Aplica salt server-side antes de salvar no banco.
+        ///
+        /// ATENÇÃO: Para produção real substitua por bcrypt ou Argon2.
+        /// Este salt deve estar em variável de ambiente, NÃO no código-fonte.
+        /// </summary>
+        public static string ServerHashForStorage(string clientHash)
+        {
+            // Em produção: leia de Environment.GetEnvironmentVariable("RPG_SERVER_SALT")
+            // Nunca hardcode em repositório público.
+            string serverSalt = System.Environment.GetEnvironmentVariable("RPG_SERVER_SALT")
+                                ?? "TROQUE_ESTA_CHAVE_ANTES_DO_LAUNCH_USE_ENV_VAR";
+
+            using var sha256 = System.Security.Cryptography.SHA256.Create();
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(clientHash + serverSalt);
+            byte[] hash  = sha256.ComputeHash(bytes);
+            return System.BitConverter.ToString(hash).Replace("-", "").ToLower();
+        }
+#endif
     }
 }

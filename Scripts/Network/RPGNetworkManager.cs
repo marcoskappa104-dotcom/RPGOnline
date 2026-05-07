@@ -9,28 +9,28 @@ using RPG.Data;
 namespace RPG.Network
 {
     /// <summary>
-    /// RPGNetworkManager v7
+    /// RPGNetworkManager v8
     ///
-    /// NOVIDADES:
-    ///   - Spawn points por raça definidos por código (Vector3), sem Transform no Inspector.
-    ///     Para mudar, edite o dicionário RaceSpawnPoints abaixo.
+    /// CORREÇÕES v8:
+    ///   1. TIMEOUT em _pendingSpawns: se o cliente cair após selecionar personagem
+    ///      mas antes de enviar MsgClientSceneReady, a entrada ficava no dicionário
+    ///      para sempre — vazamento de memória e potencial bug de spawn tardio.
+    ///      Agora cada entrada tem um timeout de PENDING_SPAWN_TIMEOUT segundos.
+    ///      Se expirar, a entrada é removida automaticamente.
     ///
-    ///   - CORREÇÃO PRINCIPAL: servidor aguarda MsgClientSceneReady antes de spawnar.
-    ///     Antes o servidor spawnava imediatamente após OnSelectCharacter, mas o cliente
-    ///     ainda estava carregando a GameplayScene → NavMeshAgent falhava, objetos não
-    ///     apareciam. Agora o cliente confirma quando a cena está pronta.
+    ///   2. OnServerDisconnect agora cancela coroutines de spawn pendentes
+    ///      para a conexão que caiu, evitando spawn de ghost players.
     ///
-    ///   - ServerAuthManager NÃO envia mais MsgSelectCharacterResponse — isso é feito
-    ///     aqui após colocar o spawn na fila. Leia os comentários em SpawnPlayerForConnection.
+    ///   3. DoSpawnPlayer verifica conn.isReady antes E depois do yield para
+    ///      cobrir desconexões durante a espera pelo NavMesh.
+    ///
+    ///   4. RegisterSpawnablePrefabs: proteção contra prefabs null na lista.
     /// </summary>
     public class RPGNetworkManager : NetworkManager
     {
         public static new RPGNetworkManager singleton =>
             NetworkManager.singleton as RPGNetworkManager;
 
-        // ── Spawn points por raça ──────────────────────────────────────────
-        // Edite as coordenadas X/Z conforme o seu mapa.
-        // O Y é ajustado automaticamente pelo NavMesh.
         private static readonly Dictionary<CharacterRace, Vector3> RaceSpawnPoints = new()
         {
             { CharacterRace.Human,  new Vector3(   0f, 1f,   0f) },
@@ -40,16 +40,22 @@ namespace RPG.Network
             { CharacterRace.Undead, new Vector3( -20f, 1f, -10f) },
         };
 
-        // Raio de busca no NavMesh ao redor do ponto da raça
-        private const float SPAWN_NAVMESH_RADIUS = 15f;
+        private const float SPAWN_NAVMESH_RADIUS    = 15f;
+
+        /// <summary>
+        /// CORREÇÃO v8: tempo máximo que um spawn pode ficar pendente.
+        /// Se o cliente não confirmar a cena em 30s, o spawn é cancelado.
+        /// </summary>
+        private const float PENDING_SPAWN_TIMEOUT = 30f;
 
         [Header("Spawnable Prefabs")]
         [Tooltip("Todos os prefabs de monstro (precisam ter NetworkIdentity)")]
         [SerializeField] private List<GameObject> spawnablePrefabs = new List<GameObject>();
 
-        // Spawns pendentes: servidor guardou os dados mas ainda não spawnouF
-        // porque o cliente não confirmou que a cena carregou.
         private readonly Dictionary<int, PendingSpawn> _pendingSpawns = new();
+
+        // CORREÇÃO v8: rastreia coroutines de spawn por connectionId para cancelamento
+        private readonly Dictionary<int, Coroutine> _spawnCoroutines = new();
 
         private ServerAuthManager _authManager;
 
@@ -58,14 +64,10 @@ namespace RPG.Network
             public NetworkConnectionToClient Conn;
             public CharacterData            CharData;
             public string                   AccountUsername;
+            public float                    ExpiresAt; // CORREÇÃO v8: timestamp de expiração
         }
 
         // ── Lifecycle ──────────────────────────────────────────────────────
-
-        public override void Awake()
-        {
-            base.Awake();
-        }
 
         public override void Start()
         {
@@ -83,8 +85,10 @@ namespace RPG.Network
 
             _authManager.RegisterHandlers();
 
-            // Registra handler que recebe confirmação de cena pronta vinda do cliente
             NetworkServer.RegisterHandler<MsgClientSceneReady>(OnClientSceneReady, false);
+
+            // CORREÇÃO v8: coroutine que limpa spawns expirados
+            StartCoroutine(CleanExpiredPendingSpawns());
 
             Debug.Log("[RPGNetworkManager] Servidor iniciado.");
         }
@@ -105,7 +109,16 @@ namespace RPG.Network
 
         public override void OnServerDisconnect(NetworkConnectionToClient conn)
         {
+            // CORREÇÃO v8: cancela spawn pendente da conexão que caiu
             _pendingSpawns.Remove(conn.connectionId);
+
+            if (_spawnCoroutines.TryGetValue(conn.connectionId, out var coroutine))
+            {
+                if (coroutine != null) StopCoroutine(coroutine);
+                _spawnCoroutines.Remove(conn.connectionId);
+                Debug.Log($"[RPGNetworkManager] Spawn cancelado para conn:{conn.connectionId} (desconectou).");
+            }
+
             _authManager?.OnServerDisconnect(conn);
             base.OnServerDisconnect(conn);
             Debug.Log($"[Server] Player desconectado: connId={conn.connectionId}");
@@ -137,18 +150,6 @@ namespace RPG.Network
 
         // ── Spawn do player ────────────────────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo ServerAuthManager quando o jogador selecionou um personagem.
-        ///
-        /// FLUXO CORRETO:
-        ///   1. Servidor coloca os dados na fila _pendingSpawns.
-        ///   2. Servidor envia MsgSelectCharacterResponse { Success=true } ao cliente.
-        ///   3. Cliente recebe → carrega GameplayScene → ao terminar, envia MsgClientSceneReady.
-        ///   4. Servidor recebe MsgClientSceneReady → spawna o player.
-        ///
-        /// IMPORTANTE: o ServerAuthManager não deve mais enviar MsgSelectCharacterResponse.
-        ///             Essa mensagem agora é enviada aqui.
-        /// </summary>
         [Server]
         public void SpawnPlayerForConnection(
             NetworkConnectionToClient conn,
@@ -157,7 +158,7 @@ namespace RPG.Network
         {
             if (playerPrefab == null)
             {
-                Debug.LogError("[RPGNetworkManager] playerPrefab não configurado no Inspector!");
+                Debug.LogError("[RPGNetworkManager] playerPrefab não configurado!");
                 conn.Send(new MsgSelectCharacterResponse { Success = false, Error = "Erro interno do servidor." });
                 return;
             }
@@ -166,35 +167,40 @@ namespace RPG.Network
             {
                 Conn            = conn,
                 CharData        = charData,
-                AccountUsername = accountUsername
+                AccountUsername = accountUsername,
+                ExpiresAt       = Time.time + PENDING_SPAWN_TIMEOUT // CORREÇÃO v8
             };
 
-            // Avisa o cliente para carregar a GameplayScene.
-            // O cliente só confirma quando a cena estiver completamente carregada.
             conn.Send(new MsgSelectCharacterResponse { Success = true });
 
-            Debug.Log($"[RPGNetworkManager] {charData.CharacterName} ({charData.Race}) " +
-                      "na fila. Aguardando cliente confirmar GameplayScene pronta.");
+            Debug.Log($"[RPGNetworkManager] {charData.CharacterName} na fila. " +
+                      $"Timeout em {PENDING_SPAWN_TIMEOUT}s. Aguardando cena pronta.");
         }
 
-        /// <summary>
-        /// Recebido do cliente quando a GameplayScene terminou de carregar.
-        /// Agora é seguro spawnar o player.
-        /// </summary>
         [Server]
         private void OnClientSceneReady(NetworkConnectionToClient conn, MsgClientSceneReady msg)
         {
             if (!_pendingSpawns.TryGetValue(conn.connectionId, out var pending))
             {
-                Debug.LogWarning($"[RPGNetworkManager] MsgClientSceneReady recebido de " +
-                                 $"conn:{conn.connectionId} sem spawn pendente. Ignorando.");
+                Debug.LogWarning($"[RPGNetworkManager] MsgClientSceneReady de conn:{conn.connectionId} " +
+                                 "sem spawn pendente (talvez já expirou). Ignorando.");
+                return;
+            }
+
+            // CORREÇÃO v8: verifica se ainda não expirou
+            if (Time.time > pending.ExpiresAt)
+            {
+                Debug.LogWarning($"[RPGNetworkManager] Spawn de {pending.CharData.CharacterName} expirou. " +
+                                 "Cliente demorou mais de 30s para confirmar a cena.");
+                _pendingSpawns.Remove(conn.connectionId);
                 return;
             }
 
             _pendingSpawns.Remove(conn.connectionId);
-            Debug.Log($"[RPGNetworkManager] Cliente {conn.connectionId} confirmou cena pronta. Spawnando {pending.CharData.CharacterName}...");
+            Debug.Log($"[RPGNetworkManager] Cena confirmada. Spawnando {pending.CharData.CharacterName}...");
 
-            StartCoroutine(DoSpawnPlayer(conn, pending.CharData, pending.AccountUsername));
+            var coroutine = StartCoroutine(DoSpawnPlayer(conn, pending.CharData, pending.AccountUsername));
+            _spawnCoroutines[conn.connectionId] = coroutine;
         }
 
         [Server]
@@ -203,9 +209,16 @@ namespace RPG.Network
             CharacterData charData,
             string accountUsername)
         {
+            // CORREÇÃO v8: verifica antes de começar a esperar
+            if (conn == null || !conn.isReady)
+            {
+                Debug.LogWarning("[RPGNetworkManager] Conexão perdida antes de iniciar spawn.");
+                _spawnCoroutines.Remove(conn?.connectionId ?? -1);
+                yield break;
+            }
+
             Vector3 spawnPos = GetSpawnPositionForRace(charData.Race, charData);
 
-            // Aguarda NavMesh confirmar a posição (até 5s)
             float elapsed = 0f;
             while (elapsed < 5f)
             {
@@ -218,9 +231,11 @@ namespace RPG.Network
                 yield return null;
             }
 
+            // CORREÇÃO v8: verifica novamente após yield (pode ter desconectado durante espera)
             if (conn == null || !conn.isReady)
             {
-                Debug.LogWarning("[RPGNetworkManager] Conexão perdida antes do spawn.");
+                Debug.LogWarning("[RPGNetworkManager] Conexão perdida durante espera de NavMesh.");
+                _spawnCoroutines.Remove(conn?.connectionId ?? -1);
                 yield break;
             }
 
@@ -231,17 +246,43 @@ namespace RPG.Network
             if (netPlayer != null)
                 netPlayer.ServerInitialize(charData, accountUsername);
             else
-                Debug.LogError("[RPGNetworkManager] playerPrefab não tem componente NetworkPlayer!");
+                Debug.LogError("[RPGNetworkManager] playerPrefab não tem NetworkPlayer!");
 
-            Debug.Log($"[Server] Player spawnado: {charData.CharacterName} ({charData.Race}) " +
+            _spawnCoroutines.Remove(conn.connectionId);
+
+            Debug.Log($"[Server] Spawnado: {charData.CharacterName} ({charData.Race}) " +
                       $"| connId={conn.connectionId} | pos={spawnPos}");
         }
 
-        // ── Lógica de spawn point por raça ─────────────────────────────────
+        // ── CORREÇÃO v8: limpeza de spawns expirados ───────────────────────
 
-        public  Vector3 GetSpawnPositionForRace(CharacterRace race, CharacterData charData)
+        [Server]
+        private IEnumerator CleanExpiredPendingSpawns()
         {
-            // 1. Posição salva do personagem
+            var wait = new WaitForSeconds(5f);
+            while (true)
+            {
+                yield return wait;
+
+                var toRemove = new List<int>();
+                foreach (var kv in _pendingSpawns)
+                {
+                    if (Time.time > kv.Value.ExpiresAt)
+                    {
+                        toRemove.Add(kv.Key);
+                        Debug.LogWarning($"[RPGNetworkManager] Spawn expirado removido: " +
+                                         $"connId={kv.Key} char={kv.Value.CharData?.CharacterName}");
+                    }
+                }
+                foreach (var id in toRemove)
+                    _pendingSpawns.Remove(id);
+            }
+        }
+
+        // ── Spawn point por raça ───────────────────────────────────────────
+
+        public Vector3 GetSpawnPositionForRace(CharacterRace race, CharacterData charData)
+        {
             var saved = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
             if (saved.sqrMagnitude > 0.01f &&
                 NavMesh.SamplePosition(saved, out NavMeshHit savedHit, 5f, NavMesh.AllAreas))
@@ -250,14 +291,12 @@ namespace RPG.Network
                 return savedHit.position;
             }
 
-            // 2. Spawn point da raça
             if (RaceSpawnPoints.TryGetValue(race, out Vector3 racePos))
             {
                 Debug.Log($"[RPGNetworkManager] {charData.CharacterName} ({race}): spawn da raça em {racePos}");
                 return racePos;
             }
 
-            // 3. Fallback
             Debug.LogWarning($"[RPGNetworkManager] Raça {race} sem spawn point. Usando origem.");
             return Vector3.zero;
         }
@@ -268,7 +307,8 @@ namespace RPG.Network
         {
             foreach (var prefab in spawnablePrefabs)
             {
-                if (prefab == null) continue;
+                if (prefab == null) continue; // CORREÇÃO v8: proteção contra null
+
                 var identity = prefab.GetComponent<NetworkIdentity>();
                 if (identity == null)
                 {
