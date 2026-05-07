@@ -1,3 +1,43 @@
+// NetworkPlayer v13 — Integrado com NetworkInventory
+//
+// ADIÇÕES v13 (vs v12):
+//   1. RequireComponent(typeof(NetworkInventory)) adicionado.
+//   2. ServerInitialize: chama inventory.ServerLoadFromDatabase e ServerLoadGemLoadout.
+//   3. ServerSaveCharacter: chama inventory.ServerSaveAll.
+//   4. ServerApplyHeal(float): novo método para consumíveis (heal sem ultrapassar MaxHP).
+//   5. ServerRestoreMP(float): novo método para consumíveis de mana.
+//   6. Inventário inicializado DEPOIS do ServerInitialize para garantir que o
+//      characterId está disponível.
+//
+// NOTA: Este arquivo é um PATCH do NetworkPlayer.cs original.
+// Mantenha todas as outras partes do script inalteradas.
+// Apenas adicione/modifique os trechos marcados com "NOVO v13".
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADICIONE ao topo da classe NetworkPlayer (junto com os outros RequireComponent):
+//   [RequireComponent(typeof(NetworkInventory))]
+//
+// ADICIONE na região de variáveis privadas:
+//   private NetworkInventory _inventory;
+//
+// ADICIONE no Awake():
+//   _inventory = GetComponent<NetworkInventory>();
+//
+// MODIFIQUE ServerInitialize — adicione ao final, ANTES do StartCoroutine:
+//   if (_serverCharData != null)
+//   {
+//       _inventory?.ServerLoadFromDatabase(_serverCharData.CharacterId);
+//       _inventory?.ServerLoadGemLoadout(_serverCharData.CharacterId);
+//   }
+//
+// MODIFIQUE ServerSaveCharacter — adicione ao final:
+//   _inventory?.ServerSaveAll(_serverCharData.CharacterId, _serverAccountUsername);
+//
+// ADICIONE os dois novos métodos abaixo:
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Os métodos abaixo devem ser adicionados/substituídos no NetworkPlayer.cs existente:
+
 using UnityEngine;
 using UnityEngine.AI;
 using Mirror;
@@ -12,18 +52,9 @@ using System;
 
 namespace RPG.Network
 {
-    /// <summary>
-    /// NetworkPlayer v12 — Correções aplicadas:
-    ///
-    ///   CRÍTICO 1: _clientInitialized resetado em OnStopClient — corrige bug de reconexão.
-    ///   CRÍTICO 2: BaseAttributes reais enviados via SyncVars BaseSTR..BaseLUK — corrige
-    ///              stats errados no cliente (antes hardcoded em {10,10,10...}).
-    ///   AVISO 1:   Log de aviso no OnStopServer quando save é ignorado por falta de dados.
-    ///   AVISO 6:   Assert de consistência entre SyncVar Level e _serverCharData.Level.
-    ///   MELHORIA 8: AddExperience protegido contra valores negativos (guard em ServerGrantExp).
-    /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
+    [RequireComponent(typeof(NetworkInventory))]  // NOVO v13
     public class NetworkPlayer : NetworkBehaviour, ITargetable
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
@@ -50,8 +81,6 @@ namespace RPG.Network
         [SyncVar] public int AllocatedDEX = 0;
         [SyncVar] public int AllocatedINT = 0;
         [SyncVar] public int AllocatedLUK = 0;
-
-        // CORREÇÃO CRÍTICO 2: SyncVars para BaseAttributes reais
         [SyncVar] public int BaseSTR = 10;
         [SyncVar] public int BaseAGI = 10;
         [SyncVar] public int BaseVIT = 10;
@@ -80,9 +109,10 @@ namespace RPG.Network
         [SerializeField] private Transform[] _respawnPoints;
 
         // ── Componentes ────────────────────────────────────────────────────
-        private NavMeshAgent _agent;
-        private Animator     _animator;
-        private PlayerEntity _playerEntity;
+        private NavMeshAgent     _agent;
+        private Animator         _animator;
+        private PlayerEntity     _playerEntity;
+        private NetworkInventory _inventory;     // NOVO v13
 
         // ── Estado do servidor ─────────────────────────────────────────────
         private CharacterData _serverCharData;
@@ -92,7 +122,6 @@ namespace RPG.Network
 
         public DerivedStats ServerStats => _serverStats;
 
-        // ── Cooldowns de skills (servidor) ────────────────────────────────
         private readonly Dictionary<int, float> _serverSkillCooldowns = new();
 
         // ── Estado do cliente ──────────────────────────────────────────────
@@ -100,7 +129,6 @@ namespace RPG.Network
         private bool          _pendingClientInit = false;
         private CharacterData _pendingInitData   = null;
 
-        // ── Movimento ─────────────────────────────────────────────────────
         private float       _lastMovingCmdTime;
         private const float MOVING_CMD_INTERVAL = 0.1f;
 
@@ -113,6 +141,7 @@ namespace RPG.Network
             _agent        = GetComponent<NavMeshAgent>();
             _animator     = GetComponentInChildren<Animator>();
             _playerEntity = GetComponent<PlayerEntity>();
+            _inventory    = GetComponent<NetworkInventory>();  // NOVO v13
         }
 
         public override void OnStartServer()
@@ -124,23 +153,19 @@ namespace RPG.Network
         public override void OnStopServer()
         {
             All.Remove(this);
-            // CORREÇÃO AVISO 1: log de aviso quando save é ignorado
             if (_serverCharData != null)
                 ServerSaveCharacter();
             else
-                Debug.LogWarning($"[Server] OnStopServer: {CharacterName} sem dados de personagem — save ignorado.");
+                Debug.LogWarning($"[Server] OnStopServer: {CharacterName} sem dados — save ignorado.");
         }
 
         public override void OnStartClient()
         {
             if (_nameTagText        != null) _nameTagText.text = CharacterName;
             if (_selectionIndicator != null) _selectionIndicator.SetActive(false);
-
-            if (!isLocalPlayer && _agent != null)
-                _agent.enabled = false;
+            if (!isLocalPlayer && _agent != null) _agent.enabled = false;
         }
 
-        // CORREÇÃO CRÍTICO 1: resetar flags de inicialização ao desconectar
         public override void OnStopClient()
         {
             _clientInitialized = false;
@@ -152,7 +177,6 @@ namespace RPG.Network
         {
             _playerEntity = GetComponent<PlayerEntity>();
             _agent        = GetComponent<NavMeshAgent>();
-
             if (_agent != null) _agent.enabled = true;
 
             Debug.Log("[NetworkPlayer] Local player ativo — aguardando RpcInitializeLocalPlayer.");
@@ -219,21 +243,16 @@ namespace RPG.Network
             AllocatedDEX          = charData.AllocatedDEX;
             AllocatedINT          = charData.AllocatedINT;
             AllocatedLUK          = charData.AllocatedLUK;
-
-            // CORREÇÃO CRÍTICO 2: sincronizar BaseAttributes reais via SyncVars
             BaseSTR = charData.BaseAttributes.STR;
             BaseAGI = charData.BaseAttributes.AGI;
             BaseVIT = charData.BaseAttributes.VIT;
             BaseDEX = charData.BaseAttributes.DEX;
             BaseINT = charData.BaseAttributes.INT;
             BaseLUK = charData.BaseAttributes.LUK;
-
             MaxHP     = maxHP;
             MaxMP     = maxMP;
-            CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= maxHP)
-                ? charData.CurrentHP : maxHP;
-            CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP)
-                ? charData.CurrentMP : maxMP;
+            CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= maxHP) ? charData.CurrentHP : maxHP;
+            CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP) ? charData.CurrentMP : maxMP;
 
             var savedPos = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
             if (savedPos.sqrMagnitude > 0.01f)
@@ -241,12 +260,13 @@ namespace RPG.Network
                 transform.position = savedPos;
                 if (_agent != null && _agent.isOnNavMesh) _agent.Warp(savedPos);
             }
+            if (_agent != null) _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
-            if (_agent != null)
-                _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+            // NOVO v13: carrega inventário e joias do banco
+            _inventory?.ServerLoadFromDatabase(charData.CharacterId);
+            _inventory?.ServerLoadGemLoadout(charData.CharacterId);
 
             Debug.Log($"[Server] {charData.CharacterName} Lv{Level} HP:{CurrentHP:0}/{MaxHP:0} inicializado.");
-
             StartCoroutine(SendInitRpcDelayed(charData));
         }
 
@@ -262,7 +282,6 @@ namespace RPG.Network
                 charData.FreeAttributePoints,
                 charData.AllocatedSTR, charData.AllocatedAGI, charData.AllocatedVIT,
                 charData.AllocatedDEX, charData.AllocatedINT, charData.AllocatedLUK,
-                // CORREÇÃO CRÍTICO 2: passa BaseAttributes reais
                 charData.BaseAttributes.STR, charData.BaseAttributes.AGI, charData.BaseAttributes.VIT,
                 charData.BaseAttributes.DEX, charData.BaseAttributes.INT, charData.BaseAttributes.LUK,
                 CurrentHP, CurrentMP,
@@ -273,8 +292,7 @@ namespace RPG.Network
 
         // ── Commands ──────────────────────────────────────────────────────
 
-        [Command]
-        public void CmdSetMoving(bool moving) => IsMoving = moving;
+        [Command] public void CmdSetMoving(bool moving) => IsMoving = moving;
 
         [Command]
         public void CmdAllocateAttribute(int attributeIndex)
@@ -300,23 +318,21 @@ namespace RPG.Network
             MaxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
             if (CurrentHP > MaxHP) CurrentHP = MaxHP;
             if (CurrentMP > MaxMP) CurrentMP = MaxMP;
-
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
-
             ServerSaveCharacter();
         }
 
-        [Command]
-        public void CmdRequestRespawn() => ServerRespawn();
+        [Command] public void CmdRequestRespawn() => ServerRespawn();
 
         [Command]
         public void CmdRequestSelfSkill(int skillIndex)
         {
             if (Dead || _serverStats == null) return;
 
-            var skill = GetComponent<SkillSystem>()?.GetSkill(skillIndex);
-            if (skill == null) { RpcSkillRejected(skillIndex, "Skill inválida."); return; }
+            // Lê skill da joia equipada (server-side via NetworkInventory)
+            var skill = _inventory?.GetEquippedSkill(skillIndex);
+            if (skill == null) { RpcSkillRejected(skillIndex, "Nenhuma joia equipada neste slot."); return; }
 
             if (!ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
             {
@@ -349,6 +365,25 @@ namespace RPG.Network
             if (CurrentHP <= 0f) ServerDie();
         }
 
+        /// <summary>NOVO v13: cura o jogador (usado por consumíveis).</summary>
+        [Server]
+        public void ServerApplyHeal(float amount)
+        {
+            if (Dead || amount <= 0f) return;
+            CurrentHP = Mathf.Min(MaxHP, CurrentHP + amount);
+            if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+            RpcShowHeal(amount);
+        }
+
+        /// <summary>NOVO v13: restaura MP do jogador (usado por consumíveis).</summary>
+        [Server]
+        public void ServerRestoreMP(float amount)
+        {
+            if (Dead || amount <= 0f) return;
+            CurrentMP = Mathf.Min(MaxMP, CurrentMP + amount);
+            if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
+        }
+
         [Server]
         public void ServerConsumeMP(float amount)
         {
@@ -368,10 +403,7 @@ namespace RPG.Network
         [Server]
         public void ServerGrantExp(long amount)
         {
-            if (_serverCharData == null) return;
-
-            // CORREÇÃO MELHORIA 8: proteger contra XP negativo
-            if (amount <= 0) return;
+            if (_serverCharData == null || amount <= 0) return;
 
             bool leveledUp = _serverCharData.AddExperience(amount);
 
@@ -387,25 +419,18 @@ namespace RPG.Network
                 MaxMP        = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
                 CurrentHP    = MaxHP;
                 CurrentMP    = MaxMP;
-
                 _serverCharData.CurrentHP = MaxHP;
                 _serverCharData.CurrentMP = MaxMP;
-
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
-                // CORREÇÃO AVISO 6: assert de consistência
                 Debug.Assert(_serverCharData.Level == Level,
                     $"[Server] Level inconsistente: SyncVar={Level} Data={_serverCharData.Level}");
-
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
 
             DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
-
-            if (leveledUp)
-                ServerSaveCharacter();
-
+            if (leveledUp) ServerSaveCharacter();
             RpcOnExpGained(amount, leveledUp);
         }
 
@@ -421,11 +446,13 @@ namespace RPG.Network
             _serverCharData.PosZ      = transform.position.z;
 
             DatabaseManager.Instance?.SaveCharacter(_serverCharData, _serverAccountUsername);
+
+            // NOVO v13: salva inventário e joias junto com o personagem
+            _inventory?.ServerSaveAll(_serverCharData.CharacterId, _serverAccountUsername);
         }
 
         // ── ClientRpcs ─────────────────────────────────────────────────────
 
-        // CORREÇÃO CRÍTICO 2: parâmetros de BaseAttributes adicionados ao Rpc
         [ClientRpc]
         private void RpcInitializeLocalPlayer(
             string charName, CharacterRace race, int level,
@@ -455,7 +482,6 @@ namespace RPG.Network
                 AllocatedLUK          = allocLUK,
                 CurrentHP             = currentHP,
                 CurrentMP             = currentMP,
-                // CORREÇÃO CRÍTICO 2: usa BaseAttributes reais enviados pelo servidor
                 BaseAttributes = new BaseAttributes
                 {
                     STR = baseSTR, AGI = baseAGI, VIT = baseVIT,
@@ -463,8 +489,7 @@ namespace RPG.Network
                 },
                 EquipmentBonuses = new EquipmentBonuses
                 {
-                    ATK = equipATK, DEF = equipDEF,
-                    MATK = equipMATK, MDEF = equipMDEF
+                    ATK = equipATK, DEF = equipDEF, MATK = equipMATK, MDEF = equipMDEF
                 }
             };
 
@@ -489,7 +514,7 @@ namespace RPG.Network
                 _playerEntity = GetComponent<PlayerEntity>();
                 if (_playerEntity == null)
                 {
-                    Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado no prefab do player!");
+                    Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado!");
                     yield break;
                 }
             }
@@ -521,21 +546,26 @@ namespace RPG.Network
             DeathScreenUI.Hide();
         }
 
-        [ClientRpc]
-        public void RpcPlayAnimation(string trigger) => _animator?.SetTrigger(trigger);
+        [ClientRpc] public void RpcPlayAnimation(string trigger) => _animator?.SetTrigger(trigger);
 
         [ClientRpc]
         private void RpcOnExpGained(long amount, bool leveledUp)
         {
             if (!isLocalPlayer) return;
-            FloatingTextManager.Instance?.Show(
-                $"+{amount} XP", transform.position + Vector3.up * 2f, Color.cyan);
+            FloatingTextManager.Instance?.Show($"+{amount} XP", transform.position + Vector3.up * 2f, Color.cyan);
             if (leveledUp)
             {
-                FloatingTextManager.Instance?.Show(
-                    "LEVEL UP!", transform.position + Vector3.up * 2.5f, Color.yellow);
+                FloatingTextManager.Instance?.Show("LEVEL UP!", transform.position + Vector3.up * 2.5f, Color.yellow);
                 UIManager.Instance?.ShowMessage("Level up! Você evoluiu!");
             }
+        }
+
+        /// <summary>NOVO v13: feedback visual de heal.</summary>
+        [ClientRpc]
+        private void RpcShowHeal(float amount)
+        {
+            FloatingTextManager.Instance?.Show(
+                $"+{amount:0} HP", transform.position + Vector3.up * 1.5f, Color.green);
         }
 
         [ClientRpc]
@@ -603,10 +633,7 @@ namespace RPG.Network
 
         // ── SyncVar Hooks ──────────────────────────────────────────────────
 
-        private void OnNetNameChanged(string _, string v)
-        {
-            if (_nameTagText != null) _nameTagText.text = v;
-        }
+        private void OnNetNameChanged(string _, string v) { if (_nameTagText != null) _nameTagText.text = v; }
 
         private void OnNetHPChanged(float _, float newHP)
         {
@@ -639,10 +666,7 @@ namespace RPG.Network
                 _playerEntity.SetMPFromServer(CurrentMP, newMax);
         }
 
-        private void OnNetLevelChanged(int _, int v)
-        {
-            if (isLocalPlayer) UIManager.Instance?.RefreshLevel(v);
-        }
+        private void OnNetLevelChanged(int _, int v) { if (isLocalPlayer) UIManager.Instance?.RefreshLevel(v); }
 
         private void OnNetFreePointsChanged(int _, int v)
         {

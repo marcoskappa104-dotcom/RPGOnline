@@ -87,6 +87,16 @@ namespace RPG.Network
         [Header("Recompensa")]
         [SerializeField] private long expReward = 50;
 
+		[Tooltip("Chance de dropar algum item (0-100%).")]
+		[Range(0f, 100f)]
+		[SerializeField] private float dropChance = 50f;
+		
+		[Tooltip("Tabela de drop específica deste monstro. Vazia = usa a global do ItemDropManager.")]
+		[SerializeField] private List<RPG.Data.ItemData> dropTable = new List<RPG.Data.ItemData>();
+		
+		[Tooltip("ItemIds de drops garantidos ao morrer. Pode ficar vazio.")]
+		[SerializeField] private List<string> guaranteedDropIds = new List<string>();
+		
         [Header("Visuals")]
         [SerializeField] private GameObject         selectionIndicator;
         [SerializeField] private MonsterHealthBarUI healthBarUI;
@@ -680,27 +690,35 @@ _attackAccumulator = attackInterval * 0.3f;
 
         // ── Morte / Respawn ────────────────────────────────────────────────
 
-        [Server]
-        private void ServerDie()
-        {
-            if (_isDead || _deathProcessed) return;
-            _isDead         = true;
-            _deathProcessed = true;
-            _state          = AIState.Dead;
-
-            StopAllCoroutines();
-            _aggroScanCoroutine = _pathUpdateCoroutine = _patrolWaitCoroutine = _regenCoroutine = null;
-
-            if (_agent != null)
-            {
-                if (_agent.isOnNavMesh) _agent.ResetPath();
-                _agent.enabled = false;
-            }
-
-            Debug.Log("[NetworkMonster] Monstro morreu!");
-            ServerDistributeExp();
-            StartCoroutine(ServerDeathSequence());
-        }
+		[Server]
+		private void ServerDie()
+		{
+			if (_isDead || _deathProcessed) return;
+			_isDead         = true;
+			_deathProcessed = true;
+			_state          = AIState.Dead;
+		
+			StopAllCoroutines();
+			_aggroScanCoroutine = _pathUpdateCoroutine = _patrolWaitCoroutine = _regenCoroutine = null;
+		
+			if (_agent != null)
+			{
+				if (_agent.isOnNavMesh) _agent.ResetPath();
+				_agent.enabled = false;
+			}
+		
+			Debug.Log("[NetworkMonster] Monstro morreu!");
+			ServerDistributeExp();
+		
+			// Drop de itens
+			RPG.Managers.ItemDropManager.Instance?.ServerSpawnDrop(
+				transform.position,
+				dropChance,
+				dropTable.Count > 0 ? dropTable : null,
+				guaranteedDropIds.Count > 0 ? guaranteedDropIds : null);
+		
+			StartCoroutine(ServerDeathSequence());
+		}
 
         [Server]
         private void ServerDistributeExp()

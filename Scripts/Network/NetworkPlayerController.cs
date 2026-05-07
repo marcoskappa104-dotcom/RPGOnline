@@ -1,3 +1,14 @@
+// NetworkPlayerController v8 — adicionado suporte a pickup de WorldItem
+//
+// ADIÇÕES v8 (vs v7):
+//   1. TryPickupItem: ao clicar no chão ou em um WorldItem (layer "Item"),
+//      tenta fazer pickup enviando CmdPickUp para o WorldItem.
+//   2. A tecla I abre/fecha o InventoryUI.
+//   3. A tecla P abre/fecha o PowerGemUI.
+//   4. Layer "Item" deve ser configurado no Inspector (itemLayer).
+//
+// MANTER INALTERADO: toda a lógica de câmera, movimento e skills.
+
 using UnityEngine;
 using UnityEngine.AI;
 using Mirror;
@@ -7,39 +18,16 @@ using RPG.Combat;
 
 namespace RPG.Network
 {
-    /// <summary>
-    /// NetworkPlayerController v7 — Corrigido para RPG Online profissional.
-    ///
-    /// CORREÇÕES v7:
-    ///
-    ///   1. NETWORKтранsform AWARENESS:
-    ///      Este controller usa predição local de movimento (cliente move imediatamente,
-    ///      servidor valida). Para que isso funcione sem jitter, o componente
-    ///      NetworkTransform no prefab do PLAYER LOCAL deve estar configurado com:
-    ///        - Client Authority: TRUE  (ou usar NetworkTransformReliable com isOwned)
-    ///      Caso contrário, o servidor vai sobrescrever a posição local todo frame,
-    ///      causando o efeito de "andar travado".
-    ///
-    ///      CONFIGURAÇÃO OBRIGATÓRIA NO PREFAB:
-    ///        NetworkTransform → Sync Direction: Client To Server
-    ///        (Mirror 2022+: NetworkTransformReliable com syncDirection = ClientToServer)
-    ///
-    ///   2. Velocidade do NavMeshAgent do player configurada a partir dos stats
-    ///      (MoveSpeed de DerivedStats, não ASPD).
-    ///
-    ///   3. Anti-cheat de CmdMoveTo com distância máxima de 80 unidades (jogador
-    ///      não pode teleportar, mas o limite anterior de 100 era grande demais).
-    ///
-    ///   4. LateUpdate de câmera mantido para evitar jitter pós-movimento.
-    /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
     {
         [Header("Layers — configure no Inspector")]
-        [Tooltip("Layer do terreno/chão. Se 0, usa Physics.Raycast sem filtro.")]
+        [Tooltip("Layer do terreno/chão.")]
         [SerializeField] private LayerMask terrainLayer;
         [Tooltip("Layer de entidades selecionáveis (monstros, NPCs, players).")]
         [SerializeField] private LayerMask targetableLayer;
+        [Tooltip("Layer dos itens no chão (WorldItem).")]
+        [SerializeField] private LayerMask itemLayer;
 
         [Header("Câmera")]
         [SerializeField] private float orbitSensitivity = 3f;
@@ -67,19 +55,11 @@ namespace RPG.Network
         private const float DIST_MIN  = 3f;
         private const float DIST_MAX  = 30f;
 
-        // ── Constantes ─────────────────────────────────────────────────────
-        /// <summary>
-        /// Distância máxima permitida para um CmdMoveTo.
-        /// Previne teleporte via cheat. 80u cobre cliques em mapas grandes.
-        /// </summary>
         private const float MAX_MOVE_DIST = 80f;
 
         // ── Awake ──────────────────────────────────────────────────────────
 
-        private void Awake()
-        {
-            _agent = GetComponent<NavMeshAgent>();
-        }
+        private void Awake() => _agent = GetComponent<NavMeshAgent>();
 
         private void OnEnable()
         {
@@ -105,23 +85,21 @@ namespace RPG.Network
             if (_cam == null)
                 Debug.LogWarning("[NetworkPlayerController] Camera.main não encontrada!");
 
-            // Configura velocidade do agente a partir dos stats do player
-            // (será atualizado novamente quando InitializeFromServer rodar)
             if (_agent != null && _playerEntity != null && _playerEntity.Stats != null)
                 _agent.speed = Mathf.Clamp(_playerEntity.Stats.MoveSpeed, 3f, 7f);
 
-Cursor.visible   = true;
-Cursor.lockState = CursorLockMode.None;
+            Cursor.visible   = true;
+            Cursor.lockState = CursorLockMode.None;
 
-if (terrainLayer == 0)
-    Debug.LogWarning("[NetworkPlayerController] terrainLayer não configurado no Inspector! " +
-                     "O raycast de movimento vai acertar qualquer collider.");
-if (targetableLayer == 0)
-    Debug.LogWarning("[NetworkPlayerController] targetableLayer não configurado no Inspector! " +
-                     "A seleção de alvos vai acertar qualquer collider.");
+            if (terrainLayer == 0)
+                Debug.LogWarning("[NetworkPlayerController] terrainLayer não configurado!");
+            if (targetableLayer == 0)
+                Debug.LogWarning("[NetworkPlayerController] targetableLayer não configurado!");
+            if (itemLayer == 0)
+                Debug.LogWarning("[NetworkPlayerController] itemLayer não configurado! Pickup não vai funcionar.");
 
-UIManager.Instance?.BindLocalPlayer(_playerEntity);
-Debug.Log("[NetworkPlayerController] Controller local iniciado.");
+            UIManager.Instance?.BindLocalPlayer(_playerEntity);
+            Debug.Log("[NetworkPlayerController] Controller local iniciado.");
         }
 
         // ── Update / LateUpdate ────────────────────────────────────────────
@@ -132,6 +110,7 @@ Debug.Log("[NetworkPlayerController] Controller local iniciado.");
             HandleMouseInput();
             HandleSkillInput();
             HandleCameraOrbit();
+            HandleUIInput();          // NOVO v8
         }
 
         private void LateUpdate()
@@ -140,7 +119,7 @@ Debug.Log("[NetworkPlayerController] Controller local iniciado.");
             UpdateCameraPosition();
         }
 
-        // ── Movimento e Seleção ────────────────────────────────────────────
+        // ── Mouse Input ────────────────────────────────────────────────────
 
         private void HandleMouseInput()
         {
@@ -153,8 +132,31 @@ Debug.Log("[NetworkPlayerController] Controller local iniciado.");
 
             Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
+            // Tenta coletar item primeiro
+            if (TryPickupItem(ray)) return;
+
+            // Depois seleção de alvo
             if (TrySelectTargetable(ray)) return;
+
+            // Por último: mover para o chão
             TryMoveToGround(ray);
+        }
+
+        /// <summary>
+        /// NOVO v8: verifica se o raycast acertou um WorldItem e envia pickup.
+        /// </summary>
+        private bool TryPickupItem(Ray ray)
+        {
+            if (itemLayer == 0) return false;
+
+            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, itemLayer)) return false;
+
+            var worldItem = hit.collider.GetComponentInParent<WorldItem>();
+            if (worldItem == null) return false;
+
+            uint myNetId = GetComponent<NetworkIdentity>().netId;
+            worldItem.CmdPickUp(myNetId);
+            return true;
         }
 
         private bool TrySelectTargetable(Ray ray)
@@ -175,19 +177,15 @@ Debug.Log("[NetworkPlayerController] Controller local iniciado.");
             return true;
         }
 
-private void TryMoveToGround(Ray ray)
-{
-    RaycastHit hit;
+        private void TryMoveToGround(Ray ray)
+        {
+            RaycastHit hit;
+            int moveLayerMask = terrainLayer != 0
+                ? terrainLayer
+                : ~(1 << LayerMask.NameToLayer("Targetable"));
 
-    // Exclui o layer Targetable do raycast de movimento
-    // para não mover ao clicar em monstros ou players
-    int moveLayerMask = terrainLayer != 0
-        ? terrainLayer
-        : ~(1 << LayerMask.NameToLayer("Targetable"));
+            if (!Physics.Raycast(ray, out hit, 300f, moveLayerMask)) return;
 
-    bool didHit = Physics.Raycast(ray, out hit, 300f, moveLayerMask);
-
-    if (!didHit) return;
             _skillSystem?.CancelPendingWalk();
             _playerEntity?.ClearTarget();
             UIManager.Instance?.ClearTargetPanel();
@@ -196,13 +194,9 @@ private void TryMoveToGround(Ray ray)
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
 
-            // Predição local: cliente move imediatamente para UX responsivo
-            // IMPORTANTE: NetworkTransform do player DEVE ter syncDirection = ClientToServer
-            // para que esta posição local não seja sobrescrita pelo servidor.
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.SetDestination(dest);
 
-            // Confirma no servidor (servidor valida e aplica)
             CmdMoveTo(dest);
             SpawnMoveIndicator(hit.point);
         }
@@ -217,6 +211,16 @@ private void TryMoveToGround(Ray ray)
             if (Input.GetKeyDown(KeyCode.E)) _skillSystem.TryUseSkill(2);
             if (Input.GetKeyDown(KeyCode.R)) _skillSystem.TryUseSkill(3);
             if (Input.GetKeyDown(KeyCode.C)) AttributeWindowUI.Instance?.Toggle();
+        }
+
+        /// <summary>NOVO v8: atalhos de teclado para inventário e joias.</summary>
+        private void HandleUIInput()
+        {
+            if (Input.GetKeyDown(KeyCode.I))
+                InventoryUI.Instance?.Toggle();
+
+            if (Input.GetKeyDown(KeyCode.P))
+                PowerGemUI.Instance?.Toggle();
         }
 
         // ── Câmera ─────────────────────────────────────────────────────────
@@ -240,7 +244,6 @@ private void TryMoveToGround(Ray ray)
         private void UpdateCameraPosition()
         {
             if (_cam == null) return;
-
             Quaternion rot    = Quaternion.Euler(_pitch, _yaw, 0f);
             Vector3    offset = rot * new Vector3(0f, 0f, -_distance);
             Vector3    pivot  = transform.position + Vector3.up * 1.5f;
@@ -253,15 +256,6 @@ private void TryMoveToGround(Ray ray)
 
         // ── Commands ───────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Movimento server-authoritative com anti-teleport.
-        ///
-        /// NOTA SOBRE SINCRONIZAÇÃO:
-        /// O cliente já moveu o agente localmente (predição). O servidor valida
-        /// e aplica o mesmo destino. Como o NetworkTransform está configurado com
-        /// ClientToServer, o servidor NÃO sobrescreve a posição do cliente local —
-        /// apenas registra e transmite para outros jogadores.
-        /// </summary>
         [Command]
         public void CmdMoveTo(Vector3 destination)
         {
@@ -277,28 +271,27 @@ private void TryMoveToGround(Ray ray)
 
             if (_agent == null) return;
 
-Vector3 finalDest = destination;
-if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas))
-{
-    finalDest = hit.position;
-    _agent.SetDestination(finalDest);
-}
-else
-{
-    _agent.SetDestination(finalDest);
-}
+            Vector3 finalDest = destination;
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas))
+            {
+                finalDest = hit.position;
+                _agent.SetDestination(finalDest);
+            }
+            else
+            {
+                _agent.SetDestination(finalDest);
+            }
 
-// Confirma posição final ao cliente owner para corrigir dessincronia
-RpcMoveConfirmed(finalDest);
+            RpcMoveConfirmed(finalDest);
         }
-		
-[TargetRpc]
-private void RpcMoveConfirmed(Vector3 destination)
-{
-    // Corrige posição do agente local caso o servidor tenha ajustado o destino
-    if (_agent != null && _agent.isOnNavMesh)
-        _agent.SetDestination(destination);
-}
+
+        [TargetRpc]
+        private void RpcMoveConfirmed(Vector3 destination)
+        {
+            if (_agent != null && _agent.isOnNavMesh)
+                _agent.SetDestination(destination);
+        }
+
         // ── API pública ────────────────────────────────────────────────────
 
         public void SetEnabled(bool value)
@@ -317,10 +310,7 @@ private void RpcMoveConfirmed(Vector3 destination)
         private void SpawnMoveIndicator(Vector3 pos)
         {
             if (moveIndicatorPrefab == null) return;
-            var go = Instantiate(
-                moveIndicatorPrefab,
-                pos + Vector3.up * 0.02f,
-                Quaternion.Euler(90f, 0f, 0f));
+            var go = Instantiate(moveIndicatorPrefab, pos + Vector3.up * 0.02f, Quaternion.Euler(90f, 0f, 0f));
             Destroy(go, 0.8f);
         }
     }
