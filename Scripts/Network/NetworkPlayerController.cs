@@ -1,14 +1,3 @@
-// NetworkPlayerController v8 — adicionado suporte a pickup de WorldItem
-//
-// ADIÇÕES v8 (vs v7):
-//   1. TryPickupItem: ao clicar no chão ou em um WorldItem (layer "Item"),
-//      tenta fazer pickup enviando CmdPickUp para o WorldItem.
-//   2. A tecla I abre/fecha o InventoryUI.
-//   3. A tecla P abre/fecha o PowerGemUI.
-//   4. Layer "Item" deve ser configurado no Inspector (itemLayer).
-//
-// MANTER INALTERADO: toda a lógica de câmera, movimento e skills.
-
 using UnityEngine;
 using UnityEngine.AI;
 using Mirror;
@@ -38,10 +27,11 @@ namespace RPG.Network
         [SerializeField] private GameObject moveIndicatorPrefab;
 
         // ── Componentes ────────────────────────────────────────────────────
-        private NavMeshAgent _agent;
-        private PlayerEntity _playerEntity;
-        private SkillSystem  _skillSystem;
-        private Camera       _cam;
+        private NavMeshAgent       _agent;
+        private PlayerEntity       _playerEntity;
+        private SkillSystem        _skillSystem;
+        private BasicAttackSystem  _basicAttack;   // v9
+        private Camera             _cam;
 
         // ── Câmera ─────────────────────────────────────────────────────────
         private float   _yaw         = 45f;
@@ -50,16 +40,19 @@ namespace RPG.Network
         private bool    _orbiting;
         private Vector3 _camVelocity = Vector3.zero;
 
-        private const float PITCH_MIN = 10f;
-        private const float PITCH_MAX = 80f;
-        private const float DIST_MIN  = 3f;
-        private const float DIST_MAX  = 30f;
-
+        private const float PITCH_MIN     = 10f;
+        private const float PITCH_MAX     = 80f;
+        private const float DIST_MIN      = 3f;
+        private const float DIST_MAX      = 30f;
         private const float MAX_MOVE_DIST = 80f;
 
         // ── Awake ──────────────────────────────────────────────────────────
 
-        private void Awake() => _agent = GetComponent<NavMeshAgent>();
+        private void Awake()
+        {
+            _agent       = GetComponent<NavMeshAgent>();
+            _basicAttack = GetComponent<BasicAttackSystem>(); // v9
+        }
 
         private void OnEnable()
         {
@@ -80,6 +73,7 @@ namespace RPG.Network
         {
             _playerEntity = GetComponent<PlayerEntity>();
             _skillSystem  = GetComponent<SkillSystem>();
+            _basicAttack  = GetComponent<BasicAttackSystem>(); // v9
             _cam          = Camera.main;
 
             if (_cam == null)
@@ -99,7 +93,7 @@ namespace RPG.Network
                 Debug.LogWarning("[NetworkPlayerController] itemLayer não configurado! Pickup não vai funcionar.");
 
             UIManager.Instance?.BindLocalPlayer(_playerEntity);
-            Debug.Log("[NetworkPlayerController] Controller local iniciado.");
+            Debug.Log("[NetworkPlayerController] Controlador local iniciado.");
         }
 
         // ── Update / LateUpdate ────────────────────────────────────────────
@@ -110,7 +104,7 @@ namespace RPG.Network
             HandleMouseInput();
             HandleSkillInput();
             HandleCameraOrbit();
-            HandleUIInput();          // NOVO v8
+            HandleUIInput();
         }
 
         private void LateUpdate()
@@ -132,18 +126,50 @@ namespace RPG.Network
 
             Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-            // Tenta coletar item primeiro
+            // 1. Pickup de item (prioridade mais alta)
             if (TryPickupItem(ray)) return;
 
-            // Depois seleção de alvo
+            // 2. Clique em monstro — detecta duplo clique para auto-ataque
+            if (TryHandleMonsterClick(ray)) return;
+
+            // 3. Seleção de outros alvos (NPCs, players)
             if (TrySelectTargetable(ray)) return;
 
-            // Por último: mover para o chão
+            // 4. Mover para o chão
             TryMoveToGround(ray);
         }
 
         /// <summary>
-        /// NOVO v8: verifica se o raycast acertou um WorldItem e envia pickup.
+        /// v9: verifica se o raycast acertou um monstro.
+        /// Clique simples → seleciona alvo.
+        /// Duplo clique  → inicia auto-ataque via BasicAttackSystem.
+        /// Retorna true se acertou um monstro (consome o evento de qualquer forma).
+        /// </summary>
+        private bool TryHandleMonsterClick(Ray ray)
+        {
+            if (targetableLayer == 0) return false;
+
+            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
+
+            var monster = hit.collider.GetComponentInParent<NetworkMonsterEntity>();
+            if ((UnityEngine.Object)monster == null) return false;
+            if (monster.IsDead) return false;
+
+            // Sempre seleciona o alvo visualmente (clique simples ou duplo)
+            _skillSystem?.CancelPendingWalk();
+            _playerEntity?.SetTarget(monster);
+            UIManager.Instance?.UpdateTargetPanel(monster);
+
+            // Tenta registrar duplo clique no BasicAttackSystem
+            if (_basicAttack != null)
+                _basicAttack.TryRegisterClick(monster);
+
+            // Retorna true independentemente — o evento pertence ao monstro
+            return true;
+        }
+
+        /// <summary>
+        /// v8: verifica se o raycast acertou um WorldItem e envia pickup.
         /// </summary>
         private bool TryPickupItem(Ray ray)
         {
@@ -172,6 +198,7 @@ namespace RPG.Network
             if (targetable == null || targetable.IsDead) return false;
 
             _skillSystem?.CancelPendingWalk();
+            _basicAttack?.CancelAutoAttack();  // v9
             _playerEntity?.SetTarget(targetable);
             UIManager.Instance?.UpdateTargetPanel(targetable);
             return true;
@@ -187,6 +214,7 @@ namespace RPG.Network
             if (!Physics.Raycast(ray, out hit, 300f, moveLayerMask)) return;
 
             _skillSystem?.CancelPendingWalk();
+            _basicAttack?.CancelAutoAttack();  // v9
             _playerEntity?.ClearTarget();
             UIManager.Instance?.ClearTargetPanel();
 
@@ -213,7 +241,6 @@ namespace RPG.Network
             if (Input.GetKeyDown(KeyCode.C)) AttributeWindowUI.Instance?.Toggle();
         }
 
-        /// <summary>NOVO v8: atalhos de teclado para inventário e joias.</summary>
         private void HandleUIInput()
         {
             if (Input.GetKeyDown(KeyCode.I))

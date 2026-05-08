@@ -13,29 +13,14 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v15 — Corrigido para RPG Online profissional.
+    /// NetworkMonsterEntity v16 — Adiciona CmdBasicAttack para ataque básico do jogador.
     ///
-    /// CORREÇÕES v15:
-    ///
-    ///   1. _agent.speed agora usa _stats.MoveSpeed (3~7 m/s), NÃO _stats.ASPD.
-    ///      ASPD é a cadência de ataque (ataques/segundo), não velocidade de movimento.
-    ///      Antes: monstro com AGI=8 andava a 6.6 m/s (ASPD). Agora: ~4.2 m/s.
-    ///
-    ///   2. pathUpdateRate aumentado para 0.15s (máx ~7 updates/s por monstro).
-    ///      Antes: 0.05s = 20 updates/s por monstro. Com 5 monstros = 100 pacotes/s
-    ///      saindo do servidor apenas para posições — causava travamento nos clientes.
-    ///      Com 0.15s e 5 monstros = ~33 pacotes/s de posição. Muito mais razoável.
-    ///
-    ///   3. aggroScanInterval aumentado para 0.5s (não precisa de varredura mais rápida).
-    ///
-    ///   4. Cooldown de ataque baseado em _stats.ASPD (1/ASPD = segundos entre ataques).
-    ///      ASPD = 1.0 → ataca a cada 1s. ASPD = 2.0 → ataca a cada 0.5s.
-    ///      Isso usa o campo como sempre deveria ter sido usado.
-    ///
-    ///   5. Interpolação de posição no cliente: NetworkTransform deve ser configurado
-    ///      com interpolation enabled para suavizar o movimento entre updates do servidor.
-    ///
-    ///   6. ServerReset preserva flag _serverResetDone corretamente no ciclo de respawn.
+    /// MUDANÇAS v16 (vs v15):
+    ///   1. CmdBasicAttack adicionado: recebe ataque básico sem skill do BasicAttackSystem.
+    ///      - Sem custo de MP, sem validação de joia, sem multiplicador de skill.
+    ///      - Cooldown server-side pelo ASPD do atacante (índice 99 no dicionário).
+    ///      - Roll de hit/crit e distribuição de XP idênticos ao CmdRequestSkill.
+    ///      - Reação de IA (agro) igual ao CmdRequestSkill por disposition.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -87,16 +72,16 @@ namespace RPG.Network
         [Header("Recompensa")]
         [SerializeField] private long expReward = 50;
 
-		[Tooltip("Chance de dropar algum item (0-100%).")]
-		[Range(0f, 100f)]
-		[SerializeField] private float dropChance = 50f;
-		
-		[Tooltip("Tabela de drop específica deste monstro. Vazia = usa a global do ItemDropManager.")]
-		[SerializeField] private List<RPG.Data.ItemData> dropTable = new List<RPG.Data.ItemData>();
-		
-		[Tooltip("ItemIds de drops garantidos ao morrer. Pode ficar vazio.")]
-		[SerializeField] private List<string> guaranteedDropIds = new List<string>();
-		
+        [Tooltip("Chance de dropar algum item (0-100%).")]
+        [Range(0f, 100f)]
+        [SerializeField] private float dropChance = 50f;
+
+        [Tooltip("Tabela de drop específica deste monstro. Vazia = usa a global do ItemDropManager.")]
+        [SerializeField] private List<RPG.Data.ItemData> dropTable = new List<RPG.Data.ItemData>();
+
+        [Tooltip("ItemIds de drops garantidos ao morrer. Pode ficar vazio.")]
+        [SerializeField] private List<string> guaranteedDropIds = new List<string>();
+
         [Header("Visuals")]
         [SerializeField] private GameObject         selectionIndicator;
         [SerializeField] private MonsterHealthBarUI healthBarUI;
@@ -138,10 +123,6 @@ namespace RPG.Network
         private NetworkPlayer _aggroTarget;
         private bool          _wasAttacked;
 
-        /// <summary>
-        /// Acumulador de tempo de ataque. Quando >= (1f / _stats.ASPD), ataca.
-        /// Usando ASPD como ataques/segundo (correto).
-        /// </summary>
         private float _attackAccumulator;
         private float _fleeTimer;
 
@@ -161,8 +142,8 @@ namespace RPG.Network
 
         private bool _deathProcessed = false;
 
-        private const float REGEN_INTERVAL  = 3f;
-        private const float REGEN_PERCENT   = 0.05f;
+        private const float REGEN_INTERVAL = 3f;
+        private const float REGEN_PERCENT  = 0.05f;
 
         // ── Awake / OnStartServer ──────────────────────────────────────────
 
@@ -226,9 +207,8 @@ namespace RPG.Network
 
             if (_agent != null)
             {
-                _agent.enabled   = true;
-                // CORREÇÃO: usa MoveSpeed, não ASPD
-                _agent.speed     = _stats.MoveSpeed;
+                _agent.enabled      = true;
+                _agent.speed        = _stats.MoveSpeed;
                 _agent.angularSpeed = 360f;
                 _agent.acceleration = 12f;
                 if (_agent.isOnNavMesh)
@@ -267,17 +247,16 @@ namespace RPG.Network
 
             if (_isDead) return;
 
-            // CORREÇÃO: acumula tempo para atacar baseado em ASPD (ataques/segundo)
             _attackAccumulator += Time.deltaTime;
 
             switch (_state)
             {
                 case AIState.Idle:       break;
                 case AIState.Patrol:     if (usePatrolPoints) ServerPatrolWaypoints(); break;
-                case AIState.Chase:      ServerChaseCheck();       break;
-                case AIState.Combat:     ServerCombat();           break;
-                case AIState.Flee:       ServerFleeCheck();        break;
-                case AIState.ReturnHome: ServerReturnHomeCheck();  break;
+                case AIState.Chase:      ServerChaseCheck();      break;
+                case AIState.Combat:     ServerCombat();          break;
+                case AIState.Flee:       ServerFleeCheck();       break;
+                case AIState.ReturnHome: ServerReturnHomeCheck(); break;
             }
         }
 
@@ -303,7 +282,6 @@ namespace RPG.Network
         [Server]
         private IEnumerator PathUpdateLoop()
         {
-            // Tick imediato para a primeira atualização de path
             yield return null;
 
             var wait = new WaitForSeconds(pathUpdateRate);
@@ -354,7 +332,6 @@ namespace RPG.Network
         {
             if (patrolPoints == null || patrolPoints.Length == 0) return;
             if (!_agent.isOnNavMesh) return;
-
             if (_patrolWaiting) return;
 
             if (!_agent.pathPending && _agent.remainingDistance < 0.5f)
@@ -375,15 +352,13 @@ namespace RPG.Network
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
             if (dist > aggroRange * 2.5f) { ResetAggro(); return; }
 
-if (dist <= attackRange)
-{
-    // Zera o acumulador mas deixa um tempo mínimo para não atacar instantaneamente
-    // ao entrar em combat. O primeiro ataque acontece após metade do intervalo normal.
-    float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-    _attackAccumulator = attackInterval * 0.5f;
-    _state             = AIState.Combat;
-    if (_agent.isOnNavMesh) _agent.ResetPath();
-}
+            if (dist <= attackRange)
+            {
+                float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+                _attackAccumulator   = attackInterval * 0.5f;
+                _state               = AIState.Combat;
+                if (_agent.isOnNavMesh) _agent.ResetPath();
+            }
         }
 
         private void ServerCombat()
@@ -406,18 +381,16 @@ if (dist <= attackRange)
                 else _agent.ResetPath();
             }
 
-            // Rotação suave em direção ao alvo
             Vector3 dir = _aggroTarget.transform.position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.Slerp(
                     transform.rotation, Quaternion.LookRotation(dir), 8f * Time.deltaTime);
 
-            // CORREÇÃO: usa ASPD como ataques/segundo (1/ASPD = segundos por ataque)
-            float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-            if (_attackAccumulator >= attackInterval)
+            float attackIntervalCombat = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+            if (_attackAccumulator >= attackIntervalCombat)
             {
-                _attackAccumulator -= attackInterval; // subtrai em vez de zerar para manter precisão
+                _attackAccumulator -= attackIntervalCombat;
                 ServerAttack();
             }
         }
@@ -503,36 +476,35 @@ if (dist <= attackRange)
         }
 
         // ── Aggro ──────────────────────────────────────────────────────────
-[Server]
-private void TryAggro()
-{
-    // Usa layer Targetable que está tanto no player quanto no monstro
-    // Filtra apenas players verificando o componente NetworkPlayer
-    int targetableLayer = 1 << LayerMask.NameToLayer("Targetable");
-    var cols = Physics.OverlapSphere(transform.position, aggroRange, targetableLayer);
 
-    NetworkPlayer found = null;
-    float closest = aggroRange;
+        [Server]
+        private void TryAggro()
+        {
+            int targetableLayer = 1 << LayerMask.NameToLayer("Targetable");
+            var cols = Physics.OverlapSphere(transform.position, aggroRange, targetableLayer);
 
-    foreach (var col in cols)
-    {
-        // Só aggroa players, não outros monstros
-        var np = col.GetComponent<NetworkPlayer>();
-        if (np == null || np.Dead) continue;
+            NetworkPlayer found   = null;
+            float         closest = aggroRange;
 
-        float d = Vector3.Distance(transform.position, np.transform.position);
-        if (d < closest) { closest = d; found = np; }
-    }
+            foreach (var col in cols)
+            {
+                var np = col.GetComponent<NetworkPlayer>();
+                if (np == null || np.Dead) continue;
 
-    if (found != null)
-    {
-        _aggroTarget = found;
-        _state       = AIState.Chase;
-        float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-_attackAccumulator = attackInterval * 0.3f;
-        CancelPatrolWait();
-    }
-}
+                float d = Vector3.Distance(transform.position, np.transform.position);
+                if (d < closest) { closest = d; found = np; }
+            }
+
+            if (found != null)
+            {
+                _aggroTarget = found;
+                _state       = AIState.Chase;
+                float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+                _attackAccumulator   = attackInterval * 0.3f;
+                CancelPatrolWait();
+            }
+        }
+
         [Server]
         private void ResetAggro()
         {
@@ -543,8 +515,8 @@ _attackAccumulator = attackInterval * 0.3f;
                 _agent.stoppingDistance = 0.3f;
             }
             float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-_attackAccumulator = attackInterval * 0.3f;
-            _patrolTargetSet   = false;
+            _attackAccumulator   = attackInterval * 0.3f;
+            _patrolTargetSet     = false;
 
             if (Vector3.Distance(transform.position, _homePosition) > leashRange * 0.5f)
                 EnterReturnHome();
@@ -564,11 +536,15 @@ _attackAccumulator = attackInterval * 0.3f;
 
         private void CancelPatrolWait()
         {
-            if (_patrolWaitCoroutine != null) { StopCoroutine(_patrolWaitCoroutine); _patrolWaitCoroutine = null; }
+            if (_patrolWaitCoroutine != null)
+            {
+                StopCoroutine(_patrolWaitCoroutine);
+                _patrolWaitCoroutine = null;
+            }
             _patrolWaiting = false;
         }
 
-        // ── Ataque ─────────────────────────────────────────────────────────
+        // ── Ataque do monstro ──────────────────────────────────────────────
 
         [Server]
         private void ServerAttack()
@@ -580,7 +556,7 @@ _attackAccumulator = attackInterval * 0.3f;
             float dmg  = StatsCalculator.CalculatePhysicalDamage(
                 _stats.ATK, _aggroTarget.ServerStats?.DEF ?? 10f, crit, _stats.CritDMG);
             if (!_aggroTarget.Dead)
-    _aggroTarget.ServerApplyDamage(dmg);
+                _aggroTarget.ServerApplyDamage(dmg);
             RpcPlayAnim("Attack");
         }
 
@@ -591,7 +567,7 @@ _attackAccumulator = attackInterval * 0.3f;
             if (_currentHP <= 0f) ServerDie();
         }
 
-        // ── CmdRequestSkill ────────────────────────────────────────────────
+        // ── CmdRequestSkill (skill com joia) ───────────────────────────────
 
         [Command(requiresAuthority = false)]
         public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
@@ -626,6 +602,113 @@ _attackAccumulator = attackInterval * 0.3f;
             attacker.RpcSkillConfirmed(skillIndex, skill.Cooldown);
         }
 
+        // ── CmdBasicAttack (ataque básico sem skill) ───────────────────────
+
+        /// <summary>
+        /// Ataque básico sem skill — chamado pelo BasicAttackSystem do cliente.
+        ///
+        /// Diferenças vs CmdRequestSkill:
+        ///   - Sem custo de MP.
+        ///   - Sem validação de joia equipada.
+        ///   - Sem multiplicador de skill (usa ATK puro).
+        ///   - Cooldown interno calculado pelo ASPD do atacante (índice 99).
+        ///
+        /// Validações mantidas:
+        ///   - Monstro vivo, atacante válido e vivo.
+        ///   - Cooldown server-side (evita flood de ataques do cliente).
+        ///   - Roll de hit e crit normais.
+        ///   - Agro e distribuição de XP idênticos ao CmdRequestSkill.
+        /// </summary>
+        [Command(requiresAuthority = false)]
+        public void CmdBasicAttack(uint attackerNetId)
+        {
+            if (_isDead) return;
+
+            NetworkPlayer attacker = null;
+            foreach (var np in NetworkPlayer.All)
+            {
+                if (np != null && np.netId == attackerNetId) { attacker = np; break; }
+            }
+
+            if (attacker == null || attacker.Dead) return;
+
+            var atkStats = attacker.ServerStats;
+            if (atkStats == null) return;
+
+            // Cooldown server-side baseado no ASPD do atacante.
+            // Índice 99 é reservado para ataque básico — não conflita com skills (0-3).
+            float attackInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
+            attackInterval       = Mathf.Clamp(attackInterval, 0.25f, 3f);
+
+            const int BASIC_ATTACK_CD_KEY = 99;
+            if (!attacker.ServerCheckAndSetCooldown(BASIC_ATTACK_CD_KEY, attackInterval))
+                return; // ainda em cooldown — ignora silenciosamente
+
+            // Roll de hit
+            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
+            if (!hit)
+            {
+                RpcShowMiss(transform.position);
+                return;
+            }
+
+            // Cálculo de dano físico puro (sem multiplicador de skill)
+            bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
+            float dmg  = StatsCalculator.CalculatePhysicalDamage(
+                atkStats.ATK, _stats.DEF, crit, atkStats.CritDMG);
+            dmg = Mathf.Max(1f, dmg);
+
+            // Registra dano para distribuição de XP
+            if (!_damageLog.ContainsKey(attacker.netId))
+                _damageLog[attacker.netId] = 0f;
+            _damageLog[attacker.netId] += dmg;
+
+            // Aplica dano e feedback visual
+            _currentHP = Mathf.Max(0f, _currentHP - dmg);
+            RpcShowDamage(dmg, crit, transform.position);
+
+            // Reação de IA conforme disposition
+            switch (disposition)
+            {
+                case MonsterDisposition.Passive:
+                    if (_state != AIState.Flee && _state != AIState.ReturnHome && _state != AIState.Dead)
+                    {
+                        _aggroTarget = attacker;
+                        _fleeTimer   = 0f;
+                        _state       = AIState.Flee;
+                        if (_agent != null) _agent.speed = _stats.MoveSpeed * fleeSpeedMult;
+                    }
+                    break;
+
+                case MonsterDisposition.Neutral:
+                    _wasAttacked = true;
+                    if (_state == AIState.Idle || _state == AIState.Patrol || _state == AIState.ReturnHome)
+                    {
+                        CancelPatrolWait();
+                        _aggroTarget       = attacker;
+                        _state             = AIState.Chase;
+                        float ai           = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+                        _attackAccumulator = ai * 0.3f;
+                    }
+                    break;
+
+                case MonsterDisposition.Aggressive:
+                    if (_state == AIState.Idle || _state == AIState.Patrol)
+                    {
+                        CancelPatrolWait();
+                        _aggroTarget       = attacker;
+                        _state             = AIState.Chase;
+                        float ai           = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+                        _attackAccumulator = ai * 0.3f;
+                    }
+                    break;
+            }
+
+            if (_currentHP <= 0f) ServerDie();
+        }
+
+        // ── ServerTakeDamageFromPlayer (dano por skill) ────────────────────
+
         [Server]
         private void ServerTakeDamageFromPlayer(
             NetworkPlayer attacker, DerivedStats atkStats,
@@ -655,7 +738,6 @@ _attackAccumulator = attackInterval * 0.3f;
                         _aggroTarget = attacker;
                         _fleeTimer   = 0f;
                         _state       = AIState.Flee;
-                        // CORREÇÃO: velocidade de fuga usa MoveSpeed, não ASPD
                         if (_agent != null) _agent.speed = _stats.MoveSpeed * fleeSpeedMult;
                     }
                     break;
@@ -668,7 +750,7 @@ _attackAccumulator = attackInterval * 0.3f;
                         _aggroTarget       = attacker;
                         _state             = AIState.Chase;
                         float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-_attackAccumulator = attackInterval * 0.3f;
+                        _attackAccumulator   = attackInterval * 0.3f;
                     }
                     break;
 
@@ -678,9 +760,8 @@ _attackAccumulator = attackInterval * 0.3f;
                         CancelPatrolWait();
                         _aggroTarget       = attacker;
                         _state             = AIState.Chase;
-                        // Delay inicial ao aggrar — monstro não ataca instantaneamente ao detectar o player
-float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-_attackAccumulator = attackInterval * 0.3f;
+                        float attackInterval = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
+                        _attackAccumulator   = attackInterval * 0.3f;
                     }
                     break;
             }
@@ -690,35 +771,34 @@ _attackAccumulator = attackInterval * 0.3f;
 
         // ── Morte / Respawn ────────────────────────────────────────────────
 
-		[Server]
-		private void ServerDie()
-		{
-			if (_isDead || _deathProcessed) return;
-			_isDead         = true;
-			_deathProcessed = true;
-			_state          = AIState.Dead;
-		
-			StopAllCoroutines();
-			_aggroScanCoroutine = _pathUpdateCoroutine = _patrolWaitCoroutine = _regenCoroutine = null;
-		
-			if (_agent != null)
-			{
-				if (_agent.isOnNavMesh) _agent.ResetPath();
-				_agent.enabled = false;
-			}
-		
-			Debug.Log("[NetworkMonster] Monstro morreu!");
-			ServerDistributeExp();
-		
-			// Drop de itens
-			RPG.Managers.ItemDropManager.Instance?.ServerSpawnDrop(
-				transform.position,
-				dropChance,
-				dropTable.Count > 0 ? dropTable : null,
-				guaranteedDropIds.Count > 0 ? guaranteedDropIds : null);
-		
-			StartCoroutine(ServerDeathSequence());
-		}
+        [Server]
+        private void ServerDie()
+        {
+            if (_isDead || _deathProcessed) return;
+            _isDead         = true;
+            _deathProcessed = true;
+            _state          = AIState.Dead;
+
+            StopAllCoroutines();
+            _aggroScanCoroutine = _pathUpdateCoroutine = _patrolWaitCoroutine = _regenCoroutine = null;
+
+            if (_agent != null)
+            {
+                if (_agent.isOnNavMesh) _agent.ResetPath();
+                _agent.enabled = false;
+            }
+
+            Debug.Log("[NetworkMonster] Monstro morreu!");
+            ServerDistributeExp();
+
+            RPG.Managers.ItemDropManager.Instance?.ServerSpawnDrop(
+                transform.position,
+                dropChance,
+                dropTable.Count > 0 ? dropTable : null,
+                guaranteedDropIds.Count > 0 ? guaranteedDropIds : null);
+
+            StartCoroutine(ServerDeathSequence());
+        }
 
         [Server]
         private void ServerDistributeExp()
@@ -746,13 +826,15 @@ _attackAccumulator = attackInterval * 0.3f;
             yield return new WaitForSeconds(respawnDelay);
             if (isServer) StartCoroutine(DelayedRespawn());
         }
-[Server]
-private IEnumerator DelayedRespawn()
-{
-    yield return null;
-    _serverResetDone = false;
-    ServerReset();
-}
+
+        [Server]
+        private IEnumerator DelayedRespawn()
+        {
+            yield return null;
+            _serverResetDone = false;
+            ServerReset();
+        }
+
         // ── NavMesh Helper ─────────────────────────────────────────────────
 
         private bool TryGetRandomAreaPoint(Vector3 center, float radius, out Vector3 result)
@@ -813,10 +895,10 @@ private IEnumerator DelayedRespawn()
         }
 
         private void OnCurrentHPChanged(float _, float v)
-{
-    healthBarUI?.UpdateBar(v, _maxHP);
-    UIManager.Instance?.RefreshTargetPanel(this);
-}
+        {
+            healthBarUI?.UpdateBar(v, _maxHP);
+            UIManager.Instance?.RefreshTargetPanel(this);
+        }
 
         private void OnDeadChanged(bool _, bool dead)
         {
@@ -828,9 +910,9 @@ private IEnumerator DelayedRespawn()
         {
             Gizmos.color = disposition switch
             {
-                MonsterDisposition.Passive  => Color.green,
-                MonsterDisposition.Neutral  => Color.yellow,
-                _                           => Color.red
+                MonsterDisposition.Passive => Color.green,
+                MonsterDisposition.Neutral => Color.yellow,
+                _                          => Color.red
             };
             Gizmos.DrawWireSphere(transform.position, aggroRange);
             Gizmos.color = new Color(1f, 0.3f, 0.3f);
