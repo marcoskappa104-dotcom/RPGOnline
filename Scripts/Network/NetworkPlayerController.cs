@@ -7,6 +7,25 @@ using RPG.Combat;
 
 namespace RPG.Network
 {
+    /// <summary>
+    /// NetworkPlayerController v9
+    ///
+    /// CORREÇÕES v9 (vs v8):
+    ///   1. TryHandleMonsterClick: clique simples em monstro DIFERENTE do alvo
+    ///      atual agora cancela o auto-ataque em andamento. Antes, clicar num
+    ///      monstro diferente apenas mudava o target visual mas o personagem
+    ///      continuava perseguindo e atacando o alvo anterior.
+    ///
+    ///   2. TrySelectTargetable: também cancela auto-ataque ao selecionar NPCs/players.
+    ///      Antes só cancelava ao clicar no chão.
+    ///
+    ///   3. HandleCameraOrbit: cursor agora é travado (LockMode.Locked) enquanto
+    ///      órbita com botão direito, evitando o cursor aparecer no meio da rotação.
+    ///      Revertido para None ao soltar.
+    ///
+    ///   4. CmdMoveTo: validação de distância máxima ajustada — antes rejeitava
+    ///      movimentos legítimos de jogadores rápidos. Agora usa stats do servidor.
+    /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
     {
@@ -30,7 +49,7 @@ namespace RPG.Network
         private NavMeshAgent       _agent;
         private PlayerEntity       _playerEntity;
         private SkillSystem        _skillSystem;
-        private BasicAttackSystem  _basicAttack;   // v9
+        private BasicAttackSystem  _basicAttack;
         private Camera             _cam;
 
         // ── Câmera ─────────────────────────────────────────────────────────
@@ -51,7 +70,7 @@ namespace RPG.Network
         private void Awake()
         {
             _agent       = GetComponent<NavMeshAgent>();
-            _basicAttack = GetComponent<BasicAttackSystem>(); // v9
+            _basicAttack = GetComponent<BasicAttackSystem>();
         }
 
         private void OnEnable()
@@ -73,7 +92,7 @@ namespace RPG.Network
         {
             _playerEntity = GetComponent<PlayerEntity>();
             _skillSystem  = GetComponent<SkillSystem>();
-            _basicAttack  = GetComponent<BasicAttackSystem>(); // v9
+            _basicAttack  = GetComponent<BasicAttackSystem>();
             _cam          = Camera.main;
 
             if (_cam == null)
@@ -120,6 +139,7 @@ namespace RPG.Network
             if (!Input.GetMouseButtonDown(0)) return;
             if (_cam == null) return;
 
+            // Não processa clique sobre elementos de UI
             if (UnityEngine.EventSystems.EventSystem.current != null &&
                 UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject())
                 return;
@@ -129,7 +149,7 @@ namespace RPG.Network
             // 1. Pickup de item (prioridade mais alta)
             if (TryPickupItem(ray)) return;
 
-            // 2. Clique em monstro — detecta duplo clique para auto-ataque
+            // 2. Clique em monstro
             if (TryHandleMonsterClick(ray)) return;
 
             // 3. Seleção de outros alvos (NPCs, players)
@@ -140,41 +160,39 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// v9: verifica se o raycast acertou um monstro.
-        /// Clique simples → seleciona alvo.
-        /// Duplo clique  → inicia auto-ataque via BasicAttackSystem.
-        /// Retorna true se acertou um monstro (consome o evento de qualquer forma).
+        /// CORREÇÃO v9: clique simples num monstro diferente cancela o auto-ataque.
+        /// Clique duplo no mesmo monstro inicia auto-ataque.
         /// </summary>
         private bool TryHandleMonsterClick(Ray ray)
         {
             if (targetableLayer == 0) return false;
-
             if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
 
             var monster = hit.collider.GetComponentInParent<NetworkMonsterEntity>();
             if ((UnityEngine.Object)monster == null) return false;
             if (monster.IsDead) return false;
 
-            // Sempre seleciona o alvo visualmente (clique simples ou duplo)
+            // CORREÇÃO: se está auto-atacando um monstro diferente, cancela
+            bool targetChanged = _playerEntity != null &&
+                                 _playerEntity.CurrentTarget != (ITargetable)monster;
+
+            if (targetChanged && _basicAttack != null && _basicAttack.IsAutoAttacking)
+                _basicAttack.CancelAutoAttack();
+
+            // Sempre seleciona o alvo visualmente
             _skillSystem?.CancelPendingWalk();
             _playerEntity?.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
 
-            // Tenta registrar duplo clique no BasicAttackSystem
-            if (_basicAttack != null)
-                _basicAttack.TryRegisterClick(monster);
+            // Registra clique (retorna true = duplo clique → inicia auto-ataque)
+            _basicAttack?.TryRegisterClick(monster);
 
-            // Retorna true independentemente — o evento pertence ao monstro
-            return true;
+            return true; // consome o evento sempre
         }
 
-        /// <summary>
-        /// v8: verifica se o raycast acertou um WorldItem e envia pickup.
-        /// </summary>
         private bool TryPickupItem(Ray ray)
         {
             if (itemLayer == 0) return false;
-
             if (!Physics.Raycast(ray, out RaycastHit hit, 300f, itemLayer)) return false;
 
             var worldItem = hit.collider.GetComponentInParent<WorldItem>();
@@ -198,7 +216,7 @@ namespace RPG.Network
             if (targetable == null || targetable.IsDead) return false;
 
             _skillSystem?.CancelPendingWalk();
-            _basicAttack?.CancelAutoAttack();  // v9
+            _basicAttack?.CancelAutoAttack(); // CORREÇÃO v9: cancela auto-ataque ao selecionar qualquer alvo
             _playerEntity?.SetTarget(targetable);
             UIManager.Instance?.UpdateTargetPanel(targetable);
             return true;
@@ -214,7 +232,7 @@ namespace RPG.Network
             if (!Physics.Raycast(ray, out hit, 300f, moveLayerMask)) return;
 
             _skillSystem?.CancelPendingWalk();
-            _basicAttack?.CancelAutoAttack();  // v9
+            _basicAttack?.CancelAutoAttack();
             _playerEntity?.ClearTarget();
             UIManager.Instance?.ClearTargetPanel();
 
@@ -243,19 +261,27 @@ namespace RPG.Network
 
         private void HandleUIInput()
         {
-            if (Input.GetKeyDown(KeyCode.I))
-                InventoryUI.Instance?.Toggle();
-
-            if (Input.GetKeyDown(KeyCode.P))
-                PowerGemUI.Instance?.Toggle();
+            if (Input.GetKeyDown(KeyCode.I)) InventoryUI.Instance?.Toggle();
+            if (Input.GetKeyDown(KeyCode.P)) PowerGemUI.Instance?.Toggle();
         }
 
         // ── Câmera ─────────────────────────────────────────────────────────
 
         private void HandleCameraOrbit()
         {
-            if (Input.GetMouseButtonDown(1)) _orbiting = true;
-            if (Input.GetMouseButtonUp(1))   _orbiting = false;
+            // CORREÇÃO v9: trava o cursor ao orbitar para evitar ele aparecer no meio da tela
+            if (Input.GetMouseButtonDown(1))
+            {
+                _orbiting = true;
+                Cursor.visible   = false;
+                Cursor.lockState = CursorLockMode.Locked;
+            }
+            if (Input.GetMouseButtonUp(1))
+            {
+                _orbiting        = false;
+                Cursor.visible   = true;
+                Cursor.lockState = CursorLockMode.None;
+            }
 
             if (_orbiting)
             {

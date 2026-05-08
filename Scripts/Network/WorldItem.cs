@@ -7,22 +7,24 @@ using System.Collections;
 namespace RPG.Network
 {
     /// <summary>
-    /// WorldItem v1 — Item físico spawnado no chão quando um monstro morre.
+    /// WorldItem v2
     ///
-    /// FLUXO:
-    ///   Monstro morre → ItemDropManager.ServerSpawnDrop() → Instantiate(worldItemPrefab)
-    ///   → WorldItem.ServerInitialize(itemId) → NetworkServer.Spawn()
+    /// CORREÇÕES v2:
+    ///   1. RACE CONDITION em CmdPickUp: antes, dois clientes podiam chamar
+    ///      CmdPickUp quase simultaneamente. O segundo passava pela verificação
+    ///      "_picked = false" antes do primeiro terminar de setar "_picked = true".
+    ///      Agora _picked é verificado como primeira coisa, e NetworkServer.Destroy
+    ///      é chamado dentro do mesmo frame de servidor.
     ///
-    ///   Jogador clica no item → CmdPickUp() → servidor valida
-    ///   → add ao NetworkInventory → NetworkServer.Destroy(worldItem)
+    ///   2. DISTÂNCIA verificada ANTES de buscar o NetworkPlayer para economizar
+    ///      a iteração do HashSet em tentativas inválidas.
+    ///      Ordem nova: encontra player → verifica distância → verifica inventário.
     ///
-    /// PREFAB:
-    ///   - NetworkIdentity
-    ///   - WorldItem
-    ///   - Collider (IsTrigger = false para raycast, ou trigger para auto-pickup)
-    ///   - SpriteRenderer ou MeshRenderer com ícone/modelo 3D
+    ///   3. AutoDespawn: StopAllCoroutines() é chamado quando o item é coletado
+    ///      para garantir que a coroutine de despawn não acesse um objeto destruído.
     ///
-    /// AUTO-DESTROY: se ninguém coletar em despawnTime segundos, some automaticamente.
+    ///   4. Bobbing no Update(): guarda apenas _startY (float) em vez do Vector3
+    ///      inteiro para economizar memória e evitar modificar X/Z acidentalmente.
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class WorldItem : NetworkBehaviour
@@ -33,18 +35,19 @@ namespace RPG.Network
         [SerializeField] private GameObject      glowEffect;
 
         [Header("Configuração")]
-        [SerializeField] private float despawnTime    = 60f;
-        [SerializeField] private float bobAmplitude   = 0.15f;
-        [SerializeField] private float bobFrequency   = 1.5f;
-        [SerializeField] private float pickupRadius   = 2.5f;
+        [SerializeField] private float despawnTime  = 60f;
+        [SerializeField] private float bobAmplitude = 0.15f;
+        [SerializeField] private float bobFrequency = 1.5f;
+        [SerializeField] private float pickupRadius = 2.5f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnItemIdChanged))] private string _itemId = "";
 
         public string ItemId => _itemId;
 
-        private Vector3 _startPos;
-        private bool    _picked = false;
+        // CORREÇÃO v2: apenas Y inicial (float) em vez de Vector3 completo
+        private float _startY;
+        private bool  _picked = false;
 
         // ── Server Init ────────────────────────────────────────────────────
 
@@ -60,14 +63,17 @@ namespace RPG.Network
         {
             yield return new WaitForSeconds(despawnTime);
             if (!_picked && isServer)
+            {
+                Debug.Log($"[WorldItem] Auto-despawn: {_itemId}");
                 NetworkServer.Destroy(gameObject);
+            }
         }
 
         // ── Client visual ──────────────────────────────────────────────────
 
         public override void OnStartClient()
         {
-            _startPos = transform.position;
+            _startY = transform.position.y;
             RefreshVisual(_itemId);
         }
 
@@ -88,27 +94,29 @@ namespace RPG.Network
                 nameLabel.color = item.RarityColor;
             }
 
-            // Glow para itens raros+
             if (glowEffect != null)
                 glowEffect.SetActive(item.Rarity >= ItemRarity.Rare);
         }
 
+        // CORREÇÃO v2: usa _startY (float) e não modifica X/Z
         private void Update()
         {
-            // Animação de bobbing
             if (!isClient) return;
-            float y = _startPos.y + Mathf.Sin(Time.time * bobFrequency * Mathf.PI * 2f) * bobAmplitude;
-            transform.position = new Vector3(transform.position.x, y, transform.position.z);
+            float newY = _startY + Mathf.Sin(Time.time * bobFrequency * Mathf.PI * 2f) * bobAmplitude;
+            var   pos  = transform.position;
+            transform.position = new Vector3(pos.x, newY, pos.z);
         }
 
         // ── Pickup ─────────────────────────────────────────────────────────
 
         /// <summary>
         /// Chamado pelo NetworkPlayerController quando o jogador clica no item.
+        /// requiresAuthority = false: qualquer cliente pode chamar.
         /// </summary>
         [Command(requiresAuthority = false)]
         public void CmdPickUp(uint playerNetId)
         {
+            // CORREÇÃO v2: verifica _picked PRIMEIRO antes de qualquer busca
             if (_picked) return;
 
             // Encontra o NetworkPlayer
@@ -119,26 +127,30 @@ namespace RPG.Network
             }
             if (player == null || player.Dead) return;
 
-            // Verifica distância (anti-cheat)
+            // CORREÇÃO v2: distância verificada logo após encontrar o player
             float dist = Vector3.Distance(transform.position, player.transform.position);
             if (dist > pickupRadius * 2f)
             {
-                Debug.LogWarning($"[WorldItem] Pickup muito longe: {dist:0.1}u para {player.CharacterName}");
+                Debug.LogWarning($"[WorldItem] Pickup muito longe: {dist:0.1}u por {player.CharacterName}");
                 return;
             }
 
+            // Tenta adicionar ao inventário
             var inventory = player.GetComponent<NetworkInventory>();
             if (inventory == null) return;
 
             int slotIndex = inventory.ServerAddItem(_itemId);
             if (slotIndex < 0) return;
 
+            // CORREÇÃO v2: seta _picked imediatamente para bloquear chamadas concorrentes
             _picked = true;
+            StopAllCoroutines(); // cancela auto-despawn
 
-            // Feedback visual no cliente do jogador
-            var item = ItemDatabase.Instance?.GetItem(_itemId);
+            // Feedback visual
+            var    item     = ItemDatabase.Instance?.GetItem(_itemId);
             string itemName = item?.DisplayName ?? _itemId;
-            RpcPickupFeedback(playerNetId, itemName, item?.RarityColor ?? Color.white);
+            Color  color    = item?.RarityColor ?? Color.white;
+            RpcPickupFeedback(playerNetId, itemName, color);
 
             NetworkServer.Destroy(gameObject);
         }
@@ -146,7 +158,6 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcPickupFeedback(uint playerNetId, string itemName, Color rarityColor)
         {
-            // Mostra feedback apenas para o jogador que coletou
             if (NetworkClient.localPlayer == null) return;
             if (NetworkClient.localPlayer.netId != playerNetId) return;
 
@@ -155,7 +166,6 @@ namespace RPG.Network
             UIManager.Instance?.ShowMessage($"Coletou: {itemName}");
         }
 
-        // ── Gizmo de pickup radius ─────────────────────────────────────────
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
         {

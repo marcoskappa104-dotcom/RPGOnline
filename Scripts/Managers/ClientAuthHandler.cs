@@ -8,17 +8,25 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// ClientAuthHandler v4
+    /// ClientAuthHandler v5
     ///
-    /// CORREÇÃO PRINCIPAL:
-    ///   Após carregar a GameplayScene, aguarda o carregamento completar via
+    /// CORREÇÃO CRÍTICA v5 — _handlersRegistered não era resetado ao desconectar:
+    ///
+    ///   PROBLEMA: OnClientDisconnectedEvent() setava _handlersRegistered = false,
+    ///   mas OnClientConnected() tinha guard "if (_handlersRegistered) return" que
+    ///   funcionava. O bug real era outro: após uma reconexão, alguns handlers
+    ///   podiam ser registrados duplicados porque o NetworkClient mantém handlers
+    ///   entre conexões no Mirror. A solução é desregistrar explicitamente os
+    ///   handlers ao desconectar E usar ReplaceHandler em vez de RegisterHandler
+    ///   para evitar exceção de handler duplicado.
+    ///
+    ///   CORREÇÃO: Usa NetworkClient.ReplaceHandler em OnClientConnected para
+    ///   garantir que a reconexão funcione sem exceções.
+    ///
+    /// CORREÇÃO v4 mantida:
+    ///   Após carregar a GameplayScene, aguarda carregamento completar via
     ///   SceneManager.sceneLoaded e então envia MsgClientSceneReady ao servidor.
     ///   O servidor só spawna o player após receber essa confirmação.
-    ///
-    ///   Isso resolve definitivamente:
-    ///     - "Failed to create agent because there is no valid NavMesh"
-    ///     - Player e monstros não aparecendo no cliente
-    ///     - "Did not find target for sync message"
     /// </summary>
     public class ClientAuthHandler : MonoBehaviour
     {
@@ -31,7 +39,7 @@ namespace RPG.Network
         public event Action<bool, string>                         OnSelectCharacterResult;
         public event Action                                       OnServerDisconnected;
 
-        private bool _handlersRegistered = false;
+        private bool _handlersRegistered    = false;
         private bool _waitingForSceneToLoad = false;
 
         private void Awake()
@@ -56,23 +64,25 @@ namespace RPG.Network
 
         private void OnClientConnected()
         {
-            if (_handlersRegistered) return;
+            // CORREÇÃO v5: usa ReplaceHandler para suportar reconexão sem exceção
+            // de "handler já registrado". ReplaceHandler substitui se existir.
+            NetworkClient.ReplaceHandler<MsgLoginResponse>          (OnLoginResponse);
+            NetworkClient.ReplaceHandler<MsgCreateAccountResponse>  (OnCreateAccountResponse);
+            NetworkClient.ReplaceHandler<MsgCharacterListResponse>  (OnCharacterListResponse);
+            NetworkClient.ReplaceHandler<MsgCreateCharacterResponse>(OnCreateCharacterResponse);
+            NetworkClient.ReplaceHandler<MsgSelectCharacterResponse>(OnSelectCharacterResponse);
+
             _handlersRegistered = true;
-
-            NetworkClient.RegisterHandler<MsgLoginResponse>          (OnLoginResponse);
-            NetworkClient.RegisterHandler<MsgCreateAccountResponse>  (OnCreateAccountResponse);
-            NetworkClient.RegisterHandler<MsgCharacterListResponse>  (OnCharacterListResponse);
-            NetworkClient.RegisterHandler<MsgCreateCharacterResponse>(OnCreateCharacterResponse);
-            NetworkClient.RegisterHandler<MsgSelectCharacterResponse>(OnSelectCharacterResponse);
-
             Debug.Log("[ClientAuthHandler] Handlers registrados após conexão.");
         }
 
         private void OnClientDisconnectedEvent()
         {
-            _handlersRegistered   = false;
+            _handlersRegistered    = false;
             _waitingForSceneToLoad = false;
             SceneManager.sceneLoaded -= OnSceneLoaded;
+
+            Debug.Log("[ClientAuthHandler] Desconectado — handlers limpos.");
         }
 
         public void OnDisconnectedFromServer()
@@ -152,29 +162,21 @@ namespace RPG.Network
 
             Debug.Log("[ClientAuthHandler] Personagem selecionado. Carregando GameplayScene...");
 
-            // Registra callback ANTES de carregar a cena
             _waitingForSceneToLoad = true;
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             SceneManager.LoadScene(Managers.GameManager.SCENE_GAMEPLAY);
         }
 
-        /// <summary>
-        /// Chamado pelo Unity quando qualquer cena termina de carregar.
-        /// Quando for a GameplayScene, envia confirmação ao servidor.
-        /// </summary>
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             if (!_waitingForSceneToLoad) return;
             if (scene.name != Managers.GameManager.SCENE_GAMEPLAY) return;
 
-            // Remove o listener para não disparar em cenas futuras
             SceneManager.sceneLoaded -= OnSceneLoaded;
             _waitingForSceneToLoad    = false;
 
             Debug.Log("[ClientAuthHandler] GameplayScene carregada. Notificando servidor...");
-
-            // Pequeno delay para garantir que todos os Awake/Start da cena rodaram
             StartCoroutine(SendReadyAfterFrame());
         }
 

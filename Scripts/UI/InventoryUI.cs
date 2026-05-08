@@ -9,7 +9,18 @@ using System.Collections.Generic;
 namespace RPG.UI
 {
     /// <summary>
-    /// InventoryUI v1 — Janela de inventário do jogador.
+    /// InventoryUI v2
+    ///
+    /// CORREÇÕES v2:
+    ///   - TryBindInventory() não é mais chamada no Update() — isso custava uma
+    ///     verificação de null + GetComponent todo frame. Agora usa evento e retry
+    ///     via InvokeRepeating apenas enquanto não vinculou.
+    ///   - RefreshAll() guarda referência local dos Slots para evitar enumeração
+    ///     dupla do SyncList.
+    ///   - EnsurePoolSize() não destrói e recria slots — apenas expande o pool.
+    ///   - DeselectAll() limpa _selectedSlot antes de chamar SetSelected(false)
+    ///     para evitar double-call em caso de refresh simultâneo.
+    ///   - OnDestroy() para o InvokeRepeating corretamente.
     ///
     /// FUNCIONALIDADES:
     ///   - Grid dinâmico de slots (sem limite).
@@ -17,54 +28,37 @@ namespace RPG.UI
     ///   - Tooltip ao passar o mouse (via ItemTooltipUI).
     ///   - Tecla I (ou botão X) fecha a janela.
     ///   - Atualiza automaticamente quando o SyncList muda (OnInventoryChanged).
-    ///
-    /// SETUP DA CENA (hierarquia sugerida):
-    ///   InventoryCanvas (Canvas ScreenSpace-Overlay, Sort Order 50)
-    ///     └── InventoryPanel (Panel + InventoryUI)
-    ///           ├── Header
-    ///           │   ├── TitleText ("Inventário")
-    ///           │   └── CloseButton (X)
-    ///           ├── ScrollView
-    ///           │   └── Viewport
-    ///           │       └── Content (GridLayoutGroup + ContentSizeFitter)
-    ///           └── ActionPanel (aparece ao selecionar item)
-    ///               ├── ActionItemName (TMP_Text)
-    ///               ├── UseButton   ("Usar" — para consumíveis)
-    ///               ├── EquipButton ("Equipar Joia" — abre PowerGemUI)
-    ///               └── DiscardButton ("Descartar")
-    ///
-    /// GRID LAYOUT GROUP settings:
-    ///   Cell Size: 60x60   Spacing: 4x4   Constraint: Fixed Column Count = 6
     /// </summary>
     public class InventoryUI : MonoBehaviour
     {
         public static InventoryUI Instance { get; private set; }
 
         [Header("Painel raiz")]
-        [SerializeField] private GameObject    inventoryPanel;
-        [SerializeField] private Button        closeButton;
-        [SerializeField] private TMP_Text      titleText;
-        [SerializeField] private TMP_Text      itemCountText;
+        [SerializeField] private GameObject inventoryPanel;
+        [SerializeField] private Button     closeButton;
+        [SerializeField] private TMP_Text   titleText;
+        [SerializeField] private TMP_Text   itemCountText;
 
         [Header("Grid de slots")]
-        [SerializeField] private Transform     slotsContainer;
-        [SerializeField] private GameObject    slotPrefab;
+        [SerializeField] private Transform  slotsContainer;
+        [SerializeField] private GameObject slotPrefab;
 
         [Header("Painel de ação (ativo ao selecionar item)")]
-        [SerializeField] private GameObject    actionPanel;
-        [SerializeField] private TMP_Text      actionItemNameText;
-        [SerializeField] private TMP_Text      actionItemDescText;
-        [SerializeField] private Image         actionItemIcon;
-        [SerializeField] private Button        useButton;
-        [SerializeField] private Button        equipGemButton;
-        [SerializeField] private Button        discardButton;
-        [SerializeField] private TMP_Text      useButtonLabel;
+        [SerializeField] private GameObject actionPanel;
+        [SerializeField] private TMP_Text   actionItemNameText;
+        [SerializeField] private TMP_Text   actionItemDescText;
+        [SerializeField] private Image      actionItemIcon;
+        [SerializeField] private Button     useButton;
+        [SerializeField] private Button     equipGemButton;
+        [SerializeField] private Button     discardButton;
+        [SerializeField] private TMP_Text   useButtonLabel;
 
         // ── Estado ─────────────────────────────────────────────────────────
-        private NetworkInventory           _inventory;
-        private bool                       _isOpen = false;
-        private InventorySlotUI            _selectedSlot;
-        private List<InventorySlotUI>      _slotPool = new List<InventorySlotUI>();
+        private NetworkInventory       _inventory;
+        private bool                   _isOpen       = false;
+        private InventorySlotUI        _selectedSlot;
+        private readonly List<InventorySlotUI> _slotPool = new List<InventorySlotUI>();
+        private bool                   _bindRetrying = false;
 
         private void Awake()
         {
@@ -84,12 +78,17 @@ namespace RPG.UI
 
             if (titleText != null) titleText.text = "Inventário";
 
-            // Tenta vincular ao inventário do player local
-            TryBindInventory();
+            // Tenta vincular imediatamente (modo Host/Editor) ou agenda retry
+            if (!TryBindInventory())
+                StartBindRetry();
         }
 
         // ── Vínculo com NetworkInventory ───────────────────────────────────
 
+        /// <summary>
+        /// Chamado pelo NetworkInventory.OnStartLocalPlayer (via BindUIDelayed).
+        /// Também pode ser chamado diretamente por UIManager.BindLocalPlayer.
+        /// </summary>
         public void BindInventory(NetworkInventory inventory)
         {
             if (inventory == null) return;
@@ -101,23 +100,42 @@ namespace RPG.UI
             _inventory = inventory;
             _inventory.OnInventoryChanged += OnInventoryChanged;
 
+            StopBindRetry();
+
             if (_isOpen) RefreshAll();
             Debug.Log("[InventoryUI] Vinculado ao NetworkInventory.");
         }
 
-        private void TryBindInventory()
+        private bool TryBindInventory()
         {
-            if (_inventory != null) return;
-            if (NetworkClient.localPlayer == null) return;
+            if (_inventory != null) return true;
+            if (NetworkClient.localPlayer == null) return false;
 
             var inv = NetworkClient.localPlayer.GetComponent<NetworkInventory>();
-            if (inv != null) BindInventory(inv);
+            if (inv == null) return false;
+
+            BindInventory(inv);
+            return true;
         }
 
-        private void Update()
+        private void StartBindRetry()
         {
-            // Tenta vincular se ainda não vinculou
-            if (_inventory == null) TryBindInventory();
+            if (_bindRetrying) return;
+            _bindRetrying = true;
+            InvokeRepeating(nameof(RetryBind), 0.5f, 0.5f);
+        }
+
+        private void StopBindRetry()
+        {
+            if (!_bindRetrying) return;
+            _bindRetrying = false;
+            CancelInvoke(nameof(RetryBind));
+        }
+
+        private void RetryBind()
+        {
+            if (TryBindInventory())
+                StopBindRetry();
         }
 
         private void OnInventoryChanged()
@@ -152,9 +170,9 @@ namespace RPG.UI
         {
             if (_inventory == null) return;
 
+            // Copia o SyncList uma vez para evitar enumerar duas vezes
             var slots = new List<InventorySlotData>(_inventory.Slots);
 
-            // Ajusta o pool de slots UI
             EnsurePoolSize(slots.Count);
 
             // Esconde todos primeiro
@@ -171,11 +189,11 @@ namespace RPG.UI
                 _slotPool[i].Setup(slotData, itemData);
             }
 
-            // Contador
+            // Atualiza contador
             if (itemCountText != null)
                 itemCountText.text = $"{slots.Count} iten{(slots.Count != 1 ? "s" : "")}";
 
-            // Se o slot selecionado não existe mais, limpa
+            // Se o slot selecionado não existe mais, limpa o painel de ação
             if (_selectedSlot != null && _selectedSlot.IsEmpty)
             {
                 DeselectAll();
@@ -213,10 +231,8 @@ namespace RPG.UI
         {
             if (slot == null || slot.IsEmpty) return;
 
-            // Deseleciona anterior
             DeselectAll();
 
-            // Seleciona novo
             _selectedSlot = slot;
             slot.SetSelected(true);
 
@@ -236,18 +252,17 @@ namespace RPG.UI
 
         private void DeselectAll()
         {
-            if (_selectedSlot != null)
-            {
-                _selectedSlot.SetSelected(false);
-                _selectedSlot = null;
-            }
+            if (_selectedSlot == null) return;
+            var toDeselect = _selectedSlot;
+            _selectedSlot  = null;            // limpa antes de chamar SetSelected para evitar re-entrada
+            toDeselect.SetSelected(false);
         }
 
         // ── Painel de ação ─────────────────────────────────────────────────
 
         private void ShowActionPanel(ItemData itemData, InventorySlotData slotData)
         {
-            if (actionPanel == null) return;
+            if (actionPanel == null || itemData == null) return;
             actionPanel.SetActive(true);
 
             if (actionItemNameText != null)
@@ -265,15 +280,13 @@ namespace RPG.UI
                 actionItemIcon.enabled = itemData.Icon != null;
             }
 
-            // Configura botões conforme o tipo do item
             bool isConsumable = itemData.IsConsumable;
             bool isGem        = itemData.IsPowerGem;
 
             if (useButton != null)
             {
                 useButton.gameObject.SetActive(isConsumable);
-                if (useButtonLabel != null)
-                    useButtonLabel.text = "Usar";
+                if (useButtonLabel != null) useButtonLabel.text = "Usar";
             }
 
             if (equipGemButton != null)
@@ -287,11 +300,9 @@ namespace RPG.UI
 
         private void OnUseClicked()
         {
-            if (_selectedSlot == null || _selectedSlot.IsEmpty) return;
-            if (_inventory == null) return;
+            if (_selectedSlot == null || _selectedSlot.IsEmpty || _inventory == null) return;
 
-            var slotData = _selectedSlot.SlotData;
-            _inventory.CmdUseConsumable(slotData.SlotIndex);
+            _inventory.CmdUseConsumable(_selectedSlot.SlotData.SlotIndex);
 
             DeselectAll();
             if (actionPanel != null) actionPanel.SetActive(false);
@@ -302,26 +313,26 @@ namespace RPG.UI
             if (_selectedSlot == null || _selectedSlot.IsEmpty) return;
             if (!_selectedSlot.ItemData.IsPowerGem) return;
 
-            // Abre a janela de joias passando o slot de inventário selecionado
             PowerGemUI.Instance?.OpenForEquip(_selectedSlot.SlotData);
             Close();
         }
 
         private void OnDiscardClicked()
         {
-            if (_selectedSlot == null || _selectedSlot.IsEmpty) return;
-            if (_inventory == null) return;
+            if (_selectedSlot == null || _selectedSlot.IsEmpty || _inventory == null) return;
 
-            // Por segurança: apenas remove do inventário no servidor
-            // (numa versão futura: adicionar confirmação)
             _inventory.CmdRemoveItem(_selectedSlot.SlotData.SlotIndex);
 
             DeselectAll();
             if (actionPanel != null) actionPanel.SetActive(false);
         }
 
+        // ── Cleanup ────────────────────────────────────────────────────────
+
         private void OnDestroy()
         {
+            StopBindRetry();
+
             if (_inventory != null)
                 _inventory.OnInventoryChanged -= OnInventoryChanged;
         }

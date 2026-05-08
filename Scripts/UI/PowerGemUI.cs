@@ -8,7 +8,16 @@ using RPG.Network;
 namespace RPG.UI
 {
     /// <summary>
-    /// PowerGemUI v1 — Janela de encaixe das Joias do Poder (tecla P).
+    /// PowerGemUI v2 — Janela de encaixe das Joias do Poder (tecla P).
+    ///
+    /// MUDANÇAS v2:
+    ///   - GemSlotWidget movido para arquivo separado GemSlotWidget.cs.
+    ///     (O Unity exige arquivo próprio para MonoBehaviours usados em prefabs.)
+    ///   - TryBindInventory não é mais chamado no Update() — agora usa evento
+    ///     OnStartLocalPlayer via NetworkInventory para evitar custo por frame.
+    ///   - Close() agora também esconde o tooltip para evitar tooltip preso.
+    ///   - OpenForEquip() verifica se o item ainda existe no inventário antes
+    ///     de abrir, evitando modo equip com joia inválida.
     ///
     /// FUNCIONALIDADES:
     ///   - 4 slots visuais: Q, W, E, R — mostram joia equipada ou slot vazio.
@@ -26,19 +35,11 @@ namespace RPG.UI
     ///           │   └── CloseButton
     ///           ├── InstructionText (TMP_Text — muda conforme modo)
     ///           ├── SlotsRow (horizontal layout)
-    ///           │   ├── GemSlot_Q (GemSlotWidget)
-    ///           │   ├── GemSlot_W (GemSlotWidget)
-    ///           │   ├── GemSlot_E (GemSlotWidget)
-    ///           │   └── GemSlot_R (GemSlotWidget)
+    ///           │   ├── GemSlot_Q  (Button + GemSlotWidget)
+    ///           │   ├── GemSlot_W  (Button + GemSlotWidget)
+    ///           │   ├── GemSlot_E  (Button + GemSlotWidget)
+    ///           │   └── GemSlot_R  (Button + GemSlotWidget)
     ///           └── UnequipButton (só aparece quando slot está selecionado)
-    ///
-    /// GemSlotWidget (prefab de cada slot):
-    ///   GemSlotRoot (Button)
-    ///     ├── SlotBackground (Image)
-    ///     ├── GemIcon (Image — oculto se vazio)
-    ///     ├── HotkeyLabel (TMP_Text — "Q", "W", "E", "R")
-    ///     ├── GemNameLabel (TMP_Text — nome da joia ou "Vazio")
-    ///     └── SelectionBorder (Image — borda ao selecionar)
     /// </summary>
     public class PowerGemUI : MonoBehaviour
     {
@@ -66,13 +67,13 @@ namespace RPG.UI
 
         // Modo equip: quando vem do InventoryUI com uma joia selecionada
         private bool              _equipMode = false;
-        private InventorySlotData _pendingGemSlot;  // joia aguardando ser colocada
+        private InventorySlotData _pendingGemSlot;
 
         // Slot selecionado no modo browse (para desequipar)
         private int _selectedGemSlotIndex = -1;
 
-        private static readonly string[] SlotNames    = { "Q", "W", "E", "R" };
-        private static readonly string[] SlotLabels   = { "[Q]", "[W]", "[E]", "[R]" };
+        private static readonly string[] SlotNames  = { "Q", "W", "E", "R" };
+        private static readonly string[] SlotLabels = { "[Q]", "[W]", "[E]", "[R]" };
 
         // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -86,8 +87,8 @@ namespace RPG.UI
         {
             if (panel != null) panel.SetActive(false);
 
-            if (closeButton    != null) closeButton.onClick.AddListener(Close);
-            if (unequipButton  != null)
+            if (closeButton   != null) closeButton.onClick.AddListener(Close);
+            if (unequipButton != null)
             {
                 unequipButton.onClick.AddListener(OnUnequipClicked);
                 unequipButton.gameObject.SetActive(false);
@@ -99,25 +100,25 @@ namespace RPG.UI
             SetupSlotWidget(slotE, 2);
             SetupSlotWidget(slotR, 3);
 
+            // Tenta vincular se o player já existe (modo Host/Editor)
             TryBindInventory();
-        }
-
-        private void Update()
-        {
-            if (_inventory == null) TryBindInventory();
         }
 
         private void SetupSlotWidget(GemSlotWidget widget, int slotIndex)
         {
             if (widget == null) return;
             widget.SetHotkeyLabel(SlotLabels[slotIndex]);
-            widget.OnClicked      = () => OnGemSlotClicked(slotIndex);
-            widget.OnHoverEnter   = () => OnGemSlotHoverEnter(slotIndex);
-            widget.OnHoverExit    = () => ItemTooltipUI.Instance?.Hide();
+            widget.OnClicked    = () => OnGemSlotClicked(slotIndex);
+            widget.OnHoverEnter = () => OnGemSlotHoverEnter(slotIndex);
+            widget.OnHoverExit  = () => ItemTooltipUI.Instance?.Hide();
         }
 
-        // ── Vínculo ────────────────────────────────────────────────────────
+        // ── Vínculo com NetworkInventory ───────────────────────────────────
 
+        /// <summary>
+        /// Chamado pelo NetworkInventory.OnStartLocalPlayer (via BindUIDelayed)
+        /// e pelo UIManager.BindLocalPlayer. Evita chamada em Update().
+        /// </summary>
         public void BindInventory(NetworkInventory inventory)
         {
             if (inventory == null || _inventory == inventory) return;
@@ -129,52 +130,70 @@ namespace RPG.UI
             _inventory.OnGemLoadoutChanged += OnLoadoutChanged;
 
             if (_isOpen) RefreshSlots();
+            Debug.Log("[PowerGemUI] Vinculado ao NetworkInventory.");
         }
 
         private void TryBindInventory()
         {
             if (_inventory != null) return;
             if (NetworkClient.localPlayer == null) return;
+
             var inv = NetworkClient.localPlayer.GetComponent<NetworkInventory>();
             if (inv != null) BindInventory(inv);
         }
 
-        private void OnLoadoutChanged() { if (_isOpen) RefreshSlots(); }
+        private void OnLoadoutChanged()
+        {
+            if (_isOpen) RefreshSlots();
+        }
 
         // ── Abrir / Fechar ─────────────────────────────────────────────────
 
         public void Toggle()
         {
             if (_isOpen) Close();
-            else OpenBrowse();
+            else         OpenBrowse();
         }
 
         /// <summary>Abre em modo "visualizar/desequipar".</summary>
         public void OpenBrowse()
         {
             TryBindInventory();
-            _equipMode = false;
-            _pendingGemSlot = default;
+            _equipMode            = false;
+            _pendingGemSlot       = default;
             _selectedGemSlotIndex = -1;
 
             if (titleText       != null) titleText.text       = "Joias do Poder";
             if (instructionText != null) instructionText.text = "Clique em um slot para desequipar a joia.";
 
             _isOpen = true;
-            if (panel != null) panel.SetActive(true);
+            if (panel         != null) panel.SetActive(true);
             if (unequipButton != null) unequipButton.gameObject.SetActive(false);
             RefreshSlots();
         }
 
         /// <summary>
         /// Abre em modo "equipar" — chamado pelo InventoryUI com a joia selecionada.
-        /// O jogador clica no slot de skill (Q/W/E/R) onde quer colocar a joia.
         /// </summary>
         public void OpenForEquip(InventorySlotData gemSlotData)
         {
             TryBindInventory();
-            _equipMode      = true;
-            _pendingGemSlot = gemSlotData;
+
+            // Valida que o item ainda existe no inventário
+            if (_inventory != null)
+            {
+                bool found = false;
+                foreach (var s in _inventory.Slots)
+                    if (s.SlotIndex == gemSlotData.SlotIndex) { found = true; break; }
+                if (!found)
+                {
+                    Debug.LogWarning("[PowerGemUI] OpenForEquip: slot não encontrado no inventário.");
+                    return;
+                }
+            }
+
+            _equipMode            = true;
+            _pendingGemSlot       = gemSlotData;
             _selectedGemSlotIndex = -1;
 
             var itemData = ItemDatabase.Instance?.GetItem(gemSlotData.ItemId);
@@ -185,23 +204,23 @@ namespace RPG.UI
                 $"Escolha o slot para equipar:\n<color=#FFD700>{gemName}</color>";
 
             _isOpen = true;
-            if (panel != null) panel.SetActive(true);
+            if (panel         != null) panel.SetActive(true);
             if (unequipButton != null) unequipButton.gameObject.SetActive(false);
             RefreshSlots();
-
-            // Destaca os slots disponíveis
             HighlightAllSlots(true);
         }
 
         public void Close()
         {
-            _isOpen   = false;
-            _equipMode = false;
+            _isOpen               = false;
+            _equipMode            = false;
             _selectedGemSlotIndex = -1;
             HighlightAllSlots(false);
 
-            if (panel          != null) panel.SetActive(false);
-            if (unequipButton  != null) unequipButton.gameObject.SetActive(false);
+            if (panel         != null) panel.SetActive(false);
+            if (unequipButton != null) unequipButton.gameObject.SetActive(false);
+
+            // Garante que o tooltip feche junto
             ItemTooltipUI.Instance?.Hide();
         }
 
@@ -254,7 +273,7 @@ namespace RPG.UI
             else
             {
                 // Modo browse: seleciona para desequipar
-                string gemId = _inventory.GetGemItemId(slotIndex);
+                string gemId  = _inventory.GetGemItemId(slotIndex);
                 bool   hasGem = !string.IsNullOrEmpty(gemId);
 
                 if (hasGem)
@@ -302,86 +321,5 @@ namespace RPG.UI
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged -= OnLoadoutChanged;
         }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // GemSlotWidget — componente auxiliar para cada slot de joia
-    // ══════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// GemSlotWidget — representa visualmente um slot de joia (Q/W/E/R).
-    /// Adicione este componente no GameObject raiz de cada slot.
-    /// </summary>
-    public class GemSlotWidget : MonoBehaviour,
-        UnityEngine.EventSystems.IPointerEnterHandler,
-        UnityEngine.EventSystems.IPointerExitHandler,
-        UnityEngine.EventSystems.IPointerClickHandler
-    {
-        [Header("Referências visuais")]
-        [SerializeField] private Image    background;
-        [SerializeField] private Image    gemIcon;
-        [SerializeField] private TMP_Text hotkeyLabel;
-        [SerializeField] private TMP_Text gemNameLabel;
-        [SerializeField] private Image    selectionBorder;
-        [SerializeField] private Image    highlightOverlay;
-
-        [Header("Cores")]
-        [SerializeField] private Color emptyColor     = new Color(0.12f, 0.12f, 0.15f, 0.9f);
-        [SerializeField] private Color filledColor    = new Color(0.10f, 0.20f, 0.30f, 0.95f);
-        [SerializeField] private Color highlightColor = new Color(1f, 0.85f, 0.2f, 0.25f);
-
-        // ── Callbacks ──────────────────────────────────────────────────────
-        public System.Action OnClicked;
-        public System.Action OnHoverEnter;
-        public System.Action OnHoverExit;
-
-        // ── API ────────────────────────────────────────────────────────────
-
-        public void SetHotkeyLabel(string label)
-        {
-            if (hotkeyLabel != null) hotkeyLabel.text = label;
-        }
-
-        public void SetGem(ItemData item, string itemId)
-        {
-            bool isEmpty = item == null;
-
-            if (background != null)
-                background.color = isEmpty ? emptyColor : filledColor;
-
-            if (gemIcon != null)
-            {
-                gemIcon.gameObject.SetActive(!isEmpty);
-                if (!isEmpty && item?.Icon != null)
-                    gemIcon.sprite = item.Icon;
-            }
-
-            if (gemNameLabel != null)
-            {
-                gemNameLabel.text  = isEmpty ? "<color=#555>Vazio</color>" : item!.DisplayName;
-                if (!isEmpty) gemNameLabel.color = item!.RarityColor;
-            }
-        }
-
-        public void SetSelected(bool selected)
-        {
-            if (selectionBorder != null)
-                selectionBorder.gameObject.SetActive(selected);
-        }
-
-        public void SetHighlight(bool highlight)
-        {
-            if (highlightOverlay != null)
-            {
-                highlightOverlay.gameObject.SetActive(highlight);
-                if (highlight) highlightOverlay.color = highlightColor;
-            }
-        }
-
-        // ── Eventos ────────────────────────────────────────────────────────
-
-        public void OnPointerClick(UnityEngine.EventSystems.PointerEventData e) => OnClicked?.Invoke();
-        public void OnPointerEnter(UnityEngine.EventSystems.PointerEventData e) => OnHoverEnter?.Invoke();
-        public void OnPointerExit (UnityEngine.EventSystems.PointerEventData e) => OnHoverExit?.Invoke();
     }
 }
