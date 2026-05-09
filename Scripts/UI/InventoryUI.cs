@@ -9,25 +9,21 @@ using System.Collections.Generic;
 namespace RPG.UI
 {
     /// <summary>
-    /// InventoryUI v2
+    /// InventoryUI v3
     ///
-    /// CORREÇÕES v2:
-    ///   - TryBindInventory() não é mais chamada no Update() — isso custava uma
-    ///     verificação de null + GetComponent todo frame. Agora usa evento e retry
-    ///     via InvokeRepeating apenas enquanto não vinculou.
-    ///   - RefreshAll() guarda referência local dos Slots para evitar enumeração
-    ///     dupla do SyncList.
-    ///   - EnsurePoolSize() não destrói e recria slots — apenas expande o pool.
-    ///   - DeselectAll() limpa _selectedSlot antes de chamar SetSelected(false)
-    ///     para evitar double-call em caso de refresh simultâneo.
-    ///   - OnDestroy() para o InvokeRepeating corretamente.
+    /// CORREÇÕES v3:
     ///
-    /// FUNCIONALIDADES:
-    ///   - Grid dinâmico de slots (sem limite).
-    ///   - Slot selecionável com painel de ação (Usar / Equipar Joia / Descartar).
-    ///   - Tooltip ao passar o mouse (via ItemTooltipUI).
-    ///   - Tecla I (ou botão X) fecha a janela.
-    ///   - Atualiza automaticamente quando o SyncList muda (OnInventoryChanged).
+    ///   BUG-24 — OnDestroy só cancelava InvokeRepeating se _bindRetrying==true:
+    ///     Se StopBindRetry() fosse chamado com a flag false por qualquer razão,
+    ///     o InvokeRepeating continuava rodando mesmo após o objeto ser destruído.
+    ///     SOLUÇÃO: OnDestroy() sempre chama CancelInvoke(nameof(RetryBind))
+    ///     independente de _bindRetrying, garantindo limpeza completa.
+    ///
+    ///   Todas as correções v2 mantidas:
+    ///     - TryBindInventory() sem polling no Update().
+    ///     - RefreshAll() copia SyncList uma vez para evitar enumeração dupla.
+    ///     - EnsurePoolSize() só expande, não destrói.
+    ///     - DeselectAll() limpa _selectedSlot antes de SetSelected(false).
     /// </summary>
     public class InventoryUI : MonoBehaviour
     {
@@ -54,11 +50,11 @@ namespace RPG.UI
         [SerializeField] private TMP_Text   useButtonLabel;
 
         // ── Estado ─────────────────────────────────────────────────────────
-        private NetworkInventory       _inventory;
-        private bool                   _isOpen       = false;
-        private InventorySlotUI        _selectedSlot;
+        private NetworkInventory              _inventory;
+        private bool                          _isOpen    = false;
+        private InventorySlotUI               _selectedSlot;
         private readonly List<InventorySlotUI> _slotPool = new List<InventorySlotUI>();
-        private bool                   _bindRetrying = false;
+        private bool                          _bindRetrying = false;
 
         private void Awake()
         {
@@ -78,17 +74,12 @@ namespace RPG.UI
 
             if (titleText != null) titleText.text = "Inventário";
 
-            // Tenta vincular imediatamente (modo Host/Editor) ou agenda retry
             if (!TryBindInventory())
                 StartBindRetry();
         }
 
         // ── Vínculo com NetworkInventory ───────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo NetworkInventory.OnStartLocalPlayer (via BindUIDelayed).
-        /// Também pode ser chamado diretamente por UIManager.BindLocalPlayer.
-        /// </summary>
         public void BindInventory(NetworkInventory inventory)
         {
             if (inventory == null) return;
@@ -127,7 +118,6 @@ namespace RPG.UI
 
         private void StopBindRetry()
         {
-            if (!_bindRetrying) return;
             _bindRetrying = false;
             CancelInvoke(nameof(RetryBind));
         }
@@ -170,16 +160,13 @@ namespace RPG.UI
         {
             if (_inventory == null) return;
 
-            // Copia o SyncList uma vez para evitar enumerar duas vezes
             var slots = new List<InventorySlotData>(_inventory.Slots);
 
             EnsurePoolSize(slots.Count);
 
-            // Esconde todos primeiro
             for (int i = 0; i < _slotPool.Count; i++)
                 _slotPool[i].gameObject.SetActive(false);
 
-            // Popula com dados reais
             for (int i = 0; i < slots.Count; i++)
             {
                 var slotData = slots[i];
@@ -189,11 +176,9 @@ namespace RPG.UI
                 _slotPool[i].Setup(slotData, itemData);
             }
 
-            // Atualiza contador
             if (itemCountText != null)
                 itemCountText.text = $"{slots.Count} iten{(slots.Count != 1 ? "s" : "")}";
 
-            // Se o slot selecionado não existe mais, limpa o painel de ação
             if (_selectedSlot != null && _selectedSlot.IsEmpty)
             {
                 DeselectAll();
@@ -254,7 +239,7 @@ namespace RPG.UI
         {
             if (_selectedSlot == null) return;
             var toDeselect = _selectedSlot;
-            _selectedSlot  = null;            // limpa antes de chamar SetSelected para evitar re-entrada
+            _selectedSlot  = null;
             toDeselect.SetSelected(false);
         }
 
@@ -331,7 +316,9 @@ namespace RPG.UI
 
         private void OnDestroy()
         {
-            StopBindRetry();
+            // BUG-24 CORRIGIDO: sempre cancela, independente de _bindRetrying
+            CancelInvoke(nameof(RetryBind));
+            _bindRetrying = false;
 
             if (_inventory != null)
                 _inventory.OnInventoryChanged -= OnInventoryChanged;
