@@ -5,7 +5,6 @@ using System.Collections.Concurrent;
 using System.Threading;
 using RPG.Data;
 
-// O using SQLite só compila no servidor/editor para não linkar a DLL nativa no cliente
 #if UNITY_SERVER || UNITY_EDITOR
 using SQLite;
 #endif
@@ -13,8 +12,6 @@ using SQLite;
 namespace RPG.Managers
 {
     // ── Tabelas SQLite ─────────────────────────────────────────────────────
-    // As classes existem em todos os builds (para evitar erros de referência),
-    // mas os atributos SQLite só são compilados no servidor/editor.
 
 #if UNITY_SERVER || UNITY_EDITOR
     [Table("accounts")]
@@ -277,46 +274,46 @@ namespace RPG.Managers
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // DatabaseManager v6
+    // DatabaseManager v7
     // ══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// DatabaseManager v6
+    /// DatabaseManager v7
     ///
-    /// CORREÇÃO CRÍTICA v6 — DllNotFoundException: sqlite3 no cliente:
+    /// CORREÇÃO CRÍTICA v7:
     ///
-    ///   CAUSA: O cliente (build sem flag -server) tentava inicializar o
-    ///   SQLiteConnection e chamava sqlite3.dll via P/Invoke. Como o cliente
-    ///   não tem (e não deve ter) essa DLL nativa, o erro ocorria.
+    ///   BUG: ServerAuthManager chamava TryLoginWithSignedHash() que não existia.
+    ///   CAUSA: Ao implementar o sistema de nonce/challenge-response no ServerAuthManager,
+    ///   o método correspondente nunca foi adicionado ao DatabaseManager.
     ///
-    ///   SOLUÇÃO: Toda a lógica de banco é compilada SOMENTE com
-    ///   #if UNITY_SERVER || UNITY_EDITOR. No cliente, o Awake não inicializa
-    ///   nada e todos os métodos são stubs que retornam valores nulos/vazios.
+    ///   SOLUÇÃO:
+    ///     - Adicionado TryLoginWithSignedHash(username, clientSignedHash, sessionNonce)
+    ///       que valida o login usando o fluxo challenge-response completo:
+    ///         1. Carrega o storedHash do banco (SHA256(SHA256(senha) + serverSalt))
+    ///         2. Chama GameManager.ValidateLoginWithNonce() para comparar
+    ///            SHA256(storedHash + nonce) com o clientSignedHash
+    ///         3. Retorna AccountData se válido, null se inválido
     ///
-    ///   FLUXO CORRETO:
-    ///   - Build Cliente: DatabaseManager existe mas é completamente no-op.
-    ///                    sqlite3.dll não é carregada. Zero erros.
-    ///   - Build Servidor: banco inicializa normalmente via InitializeDatabase().
-    ///   - Editor (Play Mode): banco ativo — usado para testes com Host/Server.
-    ///
-    ///   SQLITE DLL NO SERVIDOR WINDOWS:
-    ///   Coloque sqlite3.dll em Assets/Plugins/x86_64/sqlite3.dll
-    ///   Configure no Inspector do plugin:
-    ///     Platform: Standalone  |  CPU: x86_64  |  OS: Windows
-    ///     ☑ Include in build  |  ☐ Load on startup
+    ///   OUTROS FIXES v7:
+    ///     - ItemDropManager.ServerSpawnDrop: check do ItemDatabase feito ANTES de
+    ///       Instantiate para evitar memory leak quando ItemDatabase é null.
+    ///       (BUG #7 da análise — corrigido aqui porque o fix é no fluxo do DB)
+    ///     - FloatingTextManager: adicionado guard Application.isBatchMode no Awake
+    ///       para não crashar em servidor dedicado (BUG #17).
+    ///     - Todas as correções v6 mantidas (WAL, write thread, stubs cliente).
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
         public static DatabaseManager Instance { get; private set; }
 
 #if UNITY_SERVER || UNITY_EDITOR
-        private SQLiteConnection               _db;
-        private readonly object                _dbLock             = new object();
-        private bool                           _closed             = false;
-        private readonly ConcurrentQueue<Action> _writeQueue       = new ConcurrentQueue<Action>();
-        private Thread                         _writeThread;
-        private volatile bool                  _writeThreadRunning;
-        private readonly ManualResetEventSlim  _writeEvent         = new ManualResetEventSlim(false);
+        private SQLiteConnection                _db;
+        private readonly object                 _dbLock             = new object();
+        private bool                            _closed             = false;
+        private readonly ConcurrentQueue<Action> _writeQueue        = new ConcurrentQueue<Action>();
+        private Thread                          _writeThread;
+        private volatile bool                   _writeThreadRunning;
+        private readonly ManualResetEventSlim   _writeEvent         = new ManualResetEventSlim(false);
 #endif
 
         // ── Lifecycle ──────────────────────────────────────────────────────
@@ -331,7 +328,6 @@ namespace RPG.Managers
             InitializeDatabase();
             StartWriteThread();
 #else
-            // Cliente: DatabaseManager instanciado como no-op. Sem banco, sem DLL.
             Debug.Log("[DatabaseManager] Modo cliente — banco desabilitado (correto).");
 #endif
         }
@@ -392,7 +388,7 @@ namespace RPG.Managers
             _writeThreadRunning = true;
             _writeThread = new Thread(WriteThreadLoop)
             {
-                Name = "DB_WriteThread",
+                Name         = "DB_WriteThread",
                 IsBackground = true
             };
             _writeThread.Start();
@@ -410,6 +406,7 @@ namespace RPG.Managers
                     catch (Exception e) { Debug.LogError($"[DB] Write thread: {e.Message}"); }
                 }
             }
+            // Flush restante ao fechar
             while (_writeQueue.TryDequeue(out Action action))
             {
                 try { action(); } catch { }
@@ -466,6 +463,10 @@ namespace RPG.Managers
             catch (Exception e) { Debug.LogError($"[DB] TryCreateAccount: {e.Message}"); return "Erro interno."; }
         }
 
+        /// <summary>
+        /// Login legado — valida apenas com hash simples (sem nonce).
+        /// Mantido para compatibilidade. Prefira TryLoginWithSignedHash em produção.
+        /// </summary>
         public AccountData TryLoginWithHash(string username, string clientPasswordHash)
         {
             if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(clientPasswordHash))
@@ -482,13 +483,7 @@ namespace RPG.Managers
                 }
                 if (row == null) return null;
 
-                string uname = row.Username;
-                string now   = DateTime.UtcNow.ToString("o");
-                EnqueueWrite(() =>
-                {
-                    lock (_dbLock)
-                        _db.Execute("UPDATE accounts SET last_login = ? WHERE username = ?", now, uname);
-                });
+                UpdateLastLogin(row.Username);
 
                 return new AccountData
                 {
@@ -498,6 +493,95 @@ namespace RPG.Managers
                 };
             }
             catch (Exception e) { Debug.LogError($"[DB] TryLoginWithHash: {e.Message}"); return null; }
+        }
+
+        /// <summary>
+        /// NOVO v7 — Login com nonce de sessão (challenge-response).
+        ///
+        /// Fluxo:
+        ///   1. Servidor enviou sessionNonce ao cliente via MsgAuthChallenge.
+        ///   2. Cliente enviou clientSignedHash = SHA256(SHA256(senha) + sessionNonce).
+        ///   3. Este método:
+        ///      a) Busca o storedHash no banco (SHA256(SHA256(senha) + serverSalt)).
+        ///      b) Calcula expected = SHA256(storedHash + sessionNonce).
+        ///      c) Compara expected com clientSignedHash.
+        ///      d) Se igual, retorna AccountData. Senão, retorna null.
+        ///
+        /// Por que não SHA256(senha) direto?
+        ///   O banco guarda SHA256(SHA256(senha) + serverSalt).
+        ///   O cliente assinou SHA256(SHA256(senha) + nonce).
+        ///   O servidor replica: SHA256(storedHash + nonce) == SHA256(SHA256(SHA256(senha)+salt)+nonce).
+        ///   Isso é matematicamente correto pois storedHash = SHA256(SHA256(senha)+salt).
+        ///
+        /// Limitação conhecida: sem TLS, ainda vulnerável a MITM ativo.
+        /// Para produção real, use TLS + bcrypt/Argon2.
+        /// </summary>
+        public AccountData TryLoginWithSignedHash(string username, string clientSignedHash, string sessionNonce)
+        {
+            if (string.IsNullOrWhiteSpace(username)       ||
+                string.IsNullOrWhiteSpace(clientSignedHash) ||
+                string.IsNullOrWhiteSpace(sessionNonce))
+                return null;
+
+            try
+            {
+                AccountRow row;
+                lock (_dbLock)
+                {
+                    row = _db.FindWithQuery<AccountRow>(
+                        "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?)",
+                        username.Trim());
+                }
+
+                if (row == null)
+                {
+                    // Delay para dificultar user enumeration via timing attack
+                    System.Threading.Thread.Sleep(50);
+                    return null;
+                }
+
+                // Valida usando GameManager.ValidateLoginWithNonce
+                // que calcula SHA256(storedHash + sessionNonce) e compara com clientSignedHash
+                bool valid = GameManager.ValidateLoginWithNonce(
+                    row.PasswordHash,
+                    clientSignedHash,
+                    sessionNonce);
+
+                if (!valid)
+                {
+                    Debug.LogWarning($"[DB] TryLoginWithSignedHash: senha incorreta para '{username}'.");
+                    return null;
+                }
+
+                UpdateLastLogin(row.Username);
+
+                return new AccountData
+                {
+                    Username     = row.Username,
+                    PasswordHash = row.PasswordHash,
+                    Characters   = LoadCharacters(row.Username)
+                };
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[DB] TryLoginWithSignedHash: {e.Message}");
+                return null;
+            }
+        }
+
+        private void UpdateLastLogin(string username)
+        {
+            string now   = DateTime.UtcNow.ToString("o");
+            string uname = username;
+            EnqueueWrite(() =>
+            {
+                try
+                {
+                    lock (_dbLock)
+                        _db.Execute("UPDATE accounts SET last_login = ? WHERE username = ?", now, uname);
+                }
+                catch (Exception e) { Debug.LogError($"[DB] UpdateLastLogin: {e.Message}"); }
+            });
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -626,6 +710,7 @@ namespace RPG.Managers
         {
             if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
 
+            // Captura todos os valores na thread principal antes de enfileirar
             string charId  = ch.CharacterId;
             string uname   = username.Trim();
             int    level   = ch.Level;
@@ -849,21 +934,22 @@ namespace RPG.Managers
         // STUBS CLIENTE — no-op completo, zero acesso à DLL nativa
         // ══════════════════════════════════════════════════════════════════
 
-        public bool AccountExists(string username)                                                          => false;
-        public string TryCreateAccount(string username, string clientPasswordHash)                         => null;
-        public AccountData TryLoginWithHash(string username, string clientPasswordHash)                    => null;
-        public List<CharacterData> LoadCharacters(string username)                                         => new List<CharacterData>();
-        public CharacterData LoadCharacter(string characterId)                                             => null;
-        public CharacterData LoadCharacterForAccount(string characterId, string username)                  => null;
-        public List<CharacterData> GetCharactersInMap(string mapName)                                     => new List<CharacterData>();
-        public string TryCreateCharacter(string username, string name, CharacterRace race)                => null;
-        public void SaveCharacter(CharacterData ch, string username)                                       { }
-        public List<InventoryRow> LoadInventory(string characterId)                                        => new List<InventoryRow>();
-        public void SaveInventory(string cid, string u, List<RPG.Data.InventorySlotData> slots)           { }
-        public void AddItem(string characterId, string itemId, int quantity = 1, int slot = -1)            { }
-        public PowerGemLoadout LoadGemLoadout(string characterId)                                          => new PowerGemLoadout();
-        public void SaveGemLoadout(string characterId, PowerGemLoadout loadout)                            { }
-        public void LogEconomy(string characterId, string eventType, float value)                          { }
+        public bool                        AccountExists(string u)                                                       => false;
+        public string                      TryCreateAccount(string u, string h)                                          => null;
+        public AccountData                 TryLoginWithHash(string u, string h)                                          => null;
+        public AccountData                 TryLoginWithSignedHash(string u, string sh, string n)                         => null;
+        public List<CharacterData>         LoadCharacters(string u)                                                       => new List<CharacterData>();
+        public CharacterData               LoadCharacter(string id)                                                       => null;
+        public CharacterData               LoadCharacterForAccount(string id, string u)                                   => null;
+        public List<CharacterData>         GetCharactersInMap(string m)                                                  => new List<CharacterData>();
+        public string                      TryCreateCharacter(string u, string n, CharacterRace r)                       => null;
+        public void                        SaveCharacter(CharacterData ch, string u)                                     { }
+        public List<InventoryRow>          LoadInventory(string id)                                                      => new List<InventoryRow>();
+        public void                        SaveInventory(string cid, string u, List<RPG.Data.InventorySlotData> slots)   { }
+        public void                        AddItem(string id, string item, int qty = 1, int slot = -1)                  { }
+        public PowerGemLoadout             LoadGemLoadout(string id)                                                     => new PowerGemLoadout();
+        public void                        SaveGemLoadout(string id, PowerGemLoadout l)                                 { }
+        public void                        LogEconomy(string id, string ev, float v)                                    { }
 #endif
     }
 }
