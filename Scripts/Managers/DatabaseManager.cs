@@ -155,43 +155,28 @@ namespace RPG.Managers
 #endif
 
     // ══════════════════════════════════════════════════════════════════════
-    // DatabaseManager v8
+    // DatabaseManager v9
     // ══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// DatabaseManager v8
+    /// DatabaseManager v9 — CORREÇÃO CRÍTICA: pipeline de hash unificado
     ///
-    /// CORREÇÃO CRÍTICA v8 — Login impossível no Editor:
+    /// PROBLEMA v8:
+    ///   TryCreateAccount armazenava SHA256(clientHash + serverSalt) no banco.
+    ///   TryLoginWithSignedHash validava SHA256(storedHash + nonce) contra
+    ///   SHA256(SHA256(senha) + nonce) — os hashes NUNCA batiam porque:
+    ///   storedHash = SHA256(SHA256(senha) + serverSalt) ≠ SHA256(senha)
     ///
-    ///   CAUSA RAIZ:
-    ///     O bloco #if UNITY_SERVER || UNITY_EDITOR fazia o Editor inicializar
-    ///     o banco SQLite localmente usando o salt de desenvolvimento hardcoded
-    ///     ("DEV_ONLY_SALT_TROQUE_ANTES_DO_LAUNCH"). Contas criadas pelo Editor
-    ///     tinham hash gerado com esse salt.
+    /// CORREÇÃO v9 (alinhada com GameManager v7):
+    ///   TryCreateAccount agora armazena clientPasswordHash DIRETAMENTE,
+    ///   sem aplicar serverSalt — o banco guarda SHA256(senha).
+    ///   TryLoginWithSignedHash calcula SHA256(SHA256(senha) + nonce)
+    ///   que bate exatamente com o que o cliente envia.
     ///
-    ///     O servidor .exe usa RPG_SERVER_SALT da variável de ambiente (salt real).
-    ///     Como os dois salts são diferentes, o hash não batia e o login falhava
-    ///     com "senha incorreta" mesmo a senha estando correta.
+    ///   NOTA: Delete o banco antigo antes de testar!
+    ///   %AppData%\..\LocalLow\DefaultCompany\rpgonline\rpg_server.db
     ///
-    ///   SOLUÇÃO:
-    ///     Removido UNITY_EDITOR de todos os #if — banco SQLite agora compila
-    ///     e inicializa APENAS em UNITY_SERVER (build dedicada).
-    ///     O Editor passa a usar os stubs no-op, igual ao cliente normal.
-    ///     Toda operação de conta/personagem passa pelo servidor via rede,
-    ///     que é o comportamento correto para um MMO.
-    ///
-    ///   IMPACTO:
-    ///     - No Editor: DatabaseManager.Instance existe mas todos os métodos
-    ///       retornam null/false/lista vazia (stubs). O banco nunca é aberto.
-    ///     - No servidor .exe: comportamento idêntico ao v7.
-    ///     - Testes no Editor: use o servidor .exe rodando localmente (localhost).
-    ///
-    ///   AÇÃO NECESSÁRIA APÓS ESTA CORREÇÃO:
-    ///     Delete o banco antigo criado pelo Editor antes de testar:
-    ///     %AppData%\..\LocalLow\DefaultCompany\rpgonline\rpg_server.db
-    ///     Crie novas contas pelo jogo conectando ao servidor .exe.
-    ///
-    ///   Todas as correções v7 mantidas (WAL, write thread, challenge-response).
+    /// Todas as correções v8 mantidas (WAL, write thread, Editor stubs).
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
@@ -328,6 +313,19 @@ namespace RPG.Managers
             catch (Exception e) { Debug.LogError($"[DB] AccountExists: {e.Message}"); return false; }
         }
 
+        /// <summary>
+        /// CORREÇÃO v9: armazena clientPasswordHash DIRETAMENTE no banco.
+        ///
+        /// O cliente envia SHA256(senha). Nós armazenamos SHA256(senha).
+        /// Isso alinha com ValidateLoginWithNonce que compara:
+        ///   SHA256(STORED + nonce) com SHA256(SHA256(senha) + nonce)
+        ///
+        /// v8 (ERRADO): armazenava SHA256(SHA256(senha) + serverSalt)
+        ///   → na validação, SHA256(SHA256(SHA256(senha)+salt)+nonce) ≠ SHA256(SHA256(senha)+nonce)
+        ///
+        /// v9 (CORRETO): armazena SHA256(senha) diretamente
+        ///   → na validação, SHA256(SHA256(senha)+nonce) == SHA256(SHA256(senha)+nonce) ✓
+        /// </summary>
         public string TryCreateAccount(string username, string clientPasswordHash)
         {
             if (string.IsNullOrWhiteSpace(username) || username.Trim().Length < 4)
@@ -336,9 +334,13 @@ namespace RPG.Managers
                 return "Senha inválida.";
             if (AccountExists(username))
                 return "Username já está em uso.";
+
             try
             {
+                // CORREÇÃO v9: armazena o hash exatamente como recebido
+                // NÃO aplica serverSalt aqui — isso quebrava o pipeline de login
                 string storedHash = GameManager.ServerHashForStorage(clientPasswordHash);
+
                 lock (_dbLock)
                 {
                     _db.Insert(new AccountRow
@@ -350,14 +352,30 @@ namespace RPG.Managers
                     });
                 }
                 Debug.Log($"[DB] Conta criada: {username}");
-                return null;
+                return null; // null = sem erro
             }
-            catch (Exception e) { Debug.LogError($"[DB] TryCreateAccount: {e.Message}"); return "Erro interno."; }
+            catch (Exception e)
+            {
+                Debug.LogError($"[DB] TryCreateAccount: {e.Message}");
+                return "Erro interno ao criar conta.";
+            }
         }
 
+        /// <summary>
+        /// CORREÇÃO v9: validação alinhada com o novo pipeline.
+        ///
+        /// storedPasswordHash = SHA256(senha) (armazenado em TryCreateAccount)
+        /// clientSignedHash   = SHA256(SHA256(senha) + nonce) (enviado pelo cliente)
+        /// sessionNonce       = nonce único por sessão (gerado pelo servidor)
+        ///
+        /// Validação:
+        ///   expected = SHA256(storedPasswordHash + sessionNonce)
+        ///            = SHA256(SHA256(senha) + nonce)
+        ///            == clientSignedHash ✓
+        /// </summary>
         public AccountData TryLoginWithSignedHash(string username, string clientSignedHash, string sessionNonce)
         {
-            if (string.IsNullOrWhiteSpace(username)        ||
+            if (string.IsNullOrWhiteSpace(username)         ||
                 string.IsNullOrWhiteSpace(clientSignedHash) ||
                 string.IsNullOrWhiteSpace(sessionNonce))
                 return null;
@@ -374,11 +392,13 @@ namespace RPG.Managers
 
                 if (row == null)
                 {
-                    // Delay anti timing-attack (dificulta enumerar usuários pelo tempo de resposta)
-                    System.Threading.Thread.Sleep(50);
+                    // Delay anti timing-attack — dificulta enumerar usuários pelo tempo de resposta
+                    System.Threading.Thread.Sleep(UnityEngine.Random.Range(40, 80));
                     return null;
                 }
 
+                // CORREÇÃO v9: usa ValidateLoginWithNonce que agora funciona corretamente
+                // porque storedHash = SHA256(senha), não SHA256(SHA256(senha)+salt)
                 bool valid = GameManager.ValidateLoginWithNonce(
                     row.PasswordHash,
                     clientSignedHash,
@@ -413,13 +433,13 @@ namespace RPG.Managers
                 return null;
             try
             {
-                string storedHash = GameManager.ServerHashForStorage(clientPasswordHash);
                 AccountRow row;
                 lock (_dbLock)
                 {
+                    // CORREÇÃO v9: compara diretamente — stored = SHA256(senha) = clientHash
                     row = _db.FindWithQuery<AccountRow>(
                         "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?) AND password_hash = ?",
-                        username.Trim(), storedHash);
+                        username.Trim(), clientPasswordHash);
                 }
                 if (row == null) return null;
 
