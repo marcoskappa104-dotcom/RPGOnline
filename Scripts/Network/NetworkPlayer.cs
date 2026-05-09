@@ -13,29 +13,27 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v19 — Correções de bugs críticos e moderados
+    /// NetworkPlayer v20
     ///
-    /// CORREÇÕES v19:
+    /// CORREÇÕES v20:
     ///
-    ///   CRÍTICO — OnStopServer salvava char sem validar username:
-    ///     Se _serverAccountUsername for vazio, o save é ignorado com log de erro
-    ///     em vez de gravar linha inválida no banco.
+    ///   PROBLEMA — Dano recebido dos monstros não exibia floating text:
+    ///     ServerApplyDamage aplicava o dano e chamava ServerDie() mas não
+    ///     enviava nenhum RPC visual para o jogador que recebeu o dano.
+    ///     SOLUÇÃO: adicionado RpcShowDamageTaken(float dmg, bool isCrit) que
+    ///     exibe floating text vermelho acima do player local ao receber dano.
+    ///     Chamado em ServerApplyDamage após aplicar o valor.
     ///
-    ///   CRÍTICO — ServerGrantExp sem cap de FreeAttributePoints:
-    ///     Level up em múltiplos níveis de uma vez (XP alto) agora soma
-    ///     corretamente 5 pontos por nível mas nunca ultrapassa MAX_LEVEL * 5.
+    ///   PROBLEMA — Regen (HP/MP) não exibia floating text:
+    ///     ServerRegenLoop recuperava HP/MP silenciosamente sem notificação visual.
+    ///     SOLUÇÃO: adicionado RpcShowRegenTick(float hpRestored, float mpRestored)
+    ///     chamado ao final de cada tick de regen que restaurou algum valor.
+    ///     HP regen: texto verde claro "+X HP". MP regen: texto azul "+X MP".
+    ///     Exibição suprimida se o valor restaurado for menor que 1 (evita spam).
     ///
-    ///   SEGURANÇA — CmdAllocateAttribute agora verifica MAX_ALLOCATED_PER_STAT:
-    ///     Cada atributo individual é limitado a CharacterData.MAX_ALLOCATED_PER_STAT.
-    ///     Previne jogadores com clientes modificados de explodir os stats.
-    ///
-    ///   MODERADO — TryMoveToGround sem check de morte no cliente:
-    ///     Movimentação local agora verifica IsDead antes de setar destino.
-    ///
-    ///   MODERADO — ReferenceEquals em BasicAttackSystem (ver esse arquivo):
-    ///     Padrão corrigido aqui para consistência.
-    ///
-    ///   Todas as correções v18 mantidas.
+    ///   CORREÇÃO v19 mantida — OnStopServer salva char com validação de username.
+    ///   CORREÇÃO v19 mantida — ServerGrantExp com cap de FreeAttributePoints.
+    ///   SEGURANÇA v19 mantida — CmdAllocateAttribute verifica MAX_ALLOCATED_PER_STAT.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -50,8 +48,10 @@ namespace RPG.Network
         private const float REGEN_INTERVAL           = 5f;
         private const float ALLOCATE_MIN_INTERVAL    = 0.3f;
         private const float REGEN_COMBAT_SUPPRESSION = 8f;
-        // Máximo de pontos livres acumuláveis (MAX_LEVEL * 5 pontos por nível)
         private const int   MAX_FREE_POINTS          = CharacterData.MAX_LEVEL * 5;
+
+        // Valor mínimo de regen para exibir floating text (evita spam de "+0 HP")
+        private const float REGEN_DISPLAY_THRESHOLD = 1f;
 
         public struct PlayerInitData
         {
@@ -363,23 +363,35 @@ namespace RPG.Network
                 yield return wait;
 
                 if (this == null || !isServer) yield break;
-
                 if (Dead || _serverStats == null) continue;
 
                 bool inCombat = (Time.time - _lastDamageTime) < REGEN_COMBAT_SUPPRESSION;
                 if (inCombat) continue;
 
+                float hpRestored = 0f;
+                float mpRestored = 0f;
+
+                // Regen de HP
                 if (CurrentHP < MaxHP && _serverStats.HPRegen > 0f)
                 {
+                    float before = CurrentHP;
                     CurrentHP = Mathf.Min(MaxHP, CurrentHP + _serverStats.HPRegen);
+                    hpRestored = CurrentHP - before;
                     if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
                 }
 
+                // Regen de MP
                 if (CurrentMP < MaxMP && _serverStats.MPRegen > 0f)
                 {
+                    float before = CurrentMP;
                     CurrentMP = Mathf.Min(MaxMP, CurrentMP + _serverStats.MPRegen);
+                    mpRestored = CurrentMP - before;
                     if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
                 }
+
+                // CORREÇÃO v20: exibe floating text de regen se restaurou algo relevante
+                if (hpRestored >= REGEN_DISPLAY_THRESHOLD || mpRestored >= REGEN_DISPLAY_THRESHOLD)
+                    RpcShowRegenTick(hpRestored, mpRestored);
             }
         }
 
@@ -468,8 +480,11 @@ namespace RPG.Network
             if (skill.Type == SkillType.Heal)
             {
                 float heal = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
+                float before = CurrentHP;
                 CurrentHP = Mathf.Min(MaxHP, CurrentHP + heal);
+                float healed = CurrentHP - before;
                 if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+                if (healed > 0f) RpcShowHeal(healed);
             }
 
             RpcSkillConfirmed(skillIndex, skill.Cooldown);
@@ -482,8 +497,17 @@ namespace RPG.Network
         {
             if (Dead) return;
             _lastDamageTime = Time.time;
+
+            float before = CurrentHP;
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
+            float actualDmg = before - CurrentHP;
+
             if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+
+            // CORREÇÃO v20: exibe floating text de dano recebido no cliente
+            if (actualDmg > 0f)
+                RpcShowDamageTaken(actualDmg);
+
             if (CurrentHP <= 0f) ServerDie();
         }
 
@@ -491,9 +515,11 @@ namespace RPG.Network
         public void ServerApplyHeal(float amount)
         {
             if (Dead || amount <= 0f) return;
+            float before = CurrentHP;
             CurrentHP = Mathf.Min(MaxHP, CurrentHP + amount);
+            float healed = CurrentHP - before;
             if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
-            RpcShowHeal(amount);
+            if (healed > 0f) RpcShowHeal(healed);
         }
 
         [Server]
@@ -566,7 +592,6 @@ namespace RPG.Network
         [Server]
         public void ServerSaveCharacterForced()
         {
-            // CORREÇÃO v19: validação antes de salvar
             if (_serverCharData == null)
             {
                 Debug.LogWarning($"[Server] ServerSaveCharacterForced: sem dados para {CharacterName}");
@@ -691,6 +716,61 @@ namespace RPG.Network
             {
                 FloatingTextManager.Instance?.Show("LEVEL UP!", transform.position + Vector3.up * 2.5f, Color.yellow);
                 UIManager.Instance?.ShowMessage("Level up! Você evoluiu!");
+            }
+        }
+
+        /// <summary>
+        /// CORREÇÃO v20: exibe floating text de dano recebido pelo player.
+        /// Texto vermelho acima do player para indicar dano sofrido.
+        /// Chamado em ServerApplyDamage para cada hit do monstro.
+        /// </summary>
+        [ClientRpc]
+        private void RpcShowDamageTaken(float dmg)
+        {
+            // Exibe em todos os clientes que vejam o player (útil em futuro PvP/observadores)
+            // Só mostra o texto para o player que recebeu dano e para outros jogadores
+            // O floating text do monstro (RpcShowDamageTakenOnPlayer) já cobre o player local,
+            // mas este RPC garante o texto mesmo em situações onde o monstro não envia o RPC
+            // (ex: dano de área, veneno futuramente implementado)
+            FloatingTextManager.Instance?.Show(
+                $"-{dmg:0}",
+                transform.position + Vector3.up * 2f,
+                new Color(1f, 0.25f, 0.25f));
+        }
+
+        /// <summary>
+        /// CORREÇÃO v20: exibe floating text de regen de HP e MP.
+        ///
+        /// Regras de exibição:
+        ///   - HP regen: texto verde claro "+X HP" acima do player.
+        ///   - MP regen: texto azul "+X MP" acima do player (ligeiramente deslocado).
+        ///   - Ambos mostram apenas se o valor restaurado >= REGEN_DISPLAY_THRESHOLD (1).
+        ///   - Só exibe para o player local (isLocalPlayer) para não poluir a tela
+        ///     de outros jogadores com regen de terceiros.
+        /// </summary>
+        [ClientRpc]
+        private void RpcShowRegenTick(float hpRestored, float mpRestored)
+        {
+            if (!isLocalPlayer) return;
+
+            Vector3 basePos = transform.position + Vector3.up * 2f;
+
+            if (hpRestored >= REGEN_DISPLAY_THRESHOLD)
+            {
+                FloatingTextManager.Instance?.Show(
+                    $"+{hpRestored:0} HP",
+                    basePos,
+                    new Color(0.4f, 1f, 0.4f)); // verde claro
+            }
+
+            if (mpRestored >= REGEN_DISPLAY_THRESHOLD)
+            {
+                // Desloca levemente para não sobrepor com o HP regen
+                Vector3 mpPos = basePos + new Vector3(0.3f, 0.2f, 0f);
+                FloatingTextManager.Instance?.Show(
+                    $"+{mpRestored:0} MP",
+                    mpPos,
+                    new Color(0.4f, 0.7f, 1f)); // azul claro
             }
         }
 
