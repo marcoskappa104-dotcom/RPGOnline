@@ -8,22 +8,18 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// ClientAuthHandler v6
+    /// ClientAuthHandler v7
     ///
-    /// CORREÇÃO v6:
-    ///   - Removido campo _handlersRegistered (CS0414: assigned but never used).
-    ///     A proteção contra handlers duplicados já é garantida pelo ReplaceHandler
-    ///     do Mirror, que substitui silenciosamente se o handler já existir.
-    ///     O campo era redundante e gerava warning de compilação.
+    /// CORREÇÕES v7:
+    ///   - Suporte ao sistema de nonce challenge-response (MsgAuthChallenge).
+    ///     Ao conectar, o servidor envia um nonce. O cliente armazena o nonce
+    ///     e usa GameManager.HashPasswordWithNonce() ao fazer login.
+    ///     Isso elimina replay attacks básicos de credenciais capturadas.
     ///
-    /// CORREÇÃO v5 mantida:
-    ///   Usa NetworkClient.ReplaceHandler em OnClientConnected para suportar
-    ///   reconexão sem exceção de handler duplicado.
+    ///   - SendLogin agora exige que o nonce tenha sido recebido antes de enviar.
+    ///     Se o nonce não chegou, aguarda até 5s antes de falhar.
     ///
-    /// CORREÇÃO v4 mantida:
-    ///   Após carregar a GameplayScene, aguarda carregamento completar via
-    ///   SceneManager.sceneLoaded e então envia MsgClientSceneReady ao servidor.
-    ///   O servidor só spawna o player após receber essa confirmação.
+    ///   - Todas as correções v6 mantidas (ReplaceHandler, reconexão, etc).
     /// </summary>
     public class ClientAuthHandler : MonoBehaviour
     {
@@ -36,9 +32,12 @@ namespace RPG.Network
         public event Action<bool, string>                         OnSelectCharacterResult;
         public event Action                                       OnServerDisconnected;
 
-        // CORREÇÃO v6: _handlersRegistered removido — era atribuído mas nunca lido (CS0414).
-        // ReplaceHandler já garante que não haverá handlers duplicados na reconexão.
-        private bool _waitingForSceneToLoad = false;
+        private bool   _waitingForSceneToLoad = false;
+        private string _sessionNonce          = "";
+        private bool   _nonceReceived         = false;
+
+        // Fila de ações aguardando nonce
+        private Action _pendingLoginAction = null;
 
         private void Awake()
         {
@@ -62,22 +61,29 @@ namespace RPG.Network
 
         private void OnClientConnected()
         {
+            _nonceReceived = false;
+            _sessionNonce  = "";
+
             // ReplaceHandler substitui se já existir, evitando exceção na reconexão.
+            NetworkClient.ReplaceHandler<MsgAuthChallenge>          (OnAuthChallenge);
             NetworkClient.ReplaceHandler<MsgLoginResponse>          (OnLoginResponse);
             NetworkClient.ReplaceHandler<MsgCreateAccountResponse>  (OnCreateAccountResponse);
             NetworkClient.ReplaceHandler<MsgCharacterListResponse>  (OnCharacterListResponse);
             NetworkClient.ReplaceHandler<MsgCreateCharacterResponse>(OnCreateCharacterResponse);
             NetworkClient.ReplaceHandler<MsgSelectCharacterResponse>(OnSelectCharacterResponse);
 
-            Debug.Log("[ClientAuthHandler] Handlers registrados após conexão.");
+            Debug.Log("[ClientAuthHandler] Handlers registrados — aguardando challenge do servidor.");
         }
 
         private void OnClientDisconnectedEvent()
         {
             _waitingForSceneToLoad = false;
+            _nonceReceived         = false;
+            _sessionNonce          = "";
+            _pendingLoginAction    = null;
             SceneManager.sceneLoaded -= OnSceneLoaded;
 
-            Debug.Log("[ClientAuthHandler] Desconectado — handlers limpos.");
+            Debug.Log("[ClientAuthHandler] Desconectado — estado limpo.");
         }
 
         public void OnDisconnectedFromServer()
@@ -86,18 +92,76 @@ namespace RPG.Network
             OnServerDisconnected?.Invoke();
         }
 
+        // ── Challenge / Nonce ──────────────────────────────────────────────
+
+        private void OnAuthChallenge(MsgAuthChallenge msg)
+        {
+            _sessionNonce  = msg.Nonce;
+            _nonceReceived = true;
+            Debug.Log("[ClientAuthHandler] Nonce recebido do servidor.");
+
+            // Se havia login pendente esperando o nonce, executa agora
+            if (_pendingLoginAction != null)
+            {
+                var action = _pendingLoginAction;
+                _pendingLoginAction = null;
+                action();
+            }
+        }
+
         // ── Envio ──────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Envia requisição de login. Aguarda o nonce se ainda não chegou.
+        /// </summary>
         public void SendLogin(string username, string password)
         {
             if (!NetworkClient.isConnected)
-            { OnLoginResult?.Invoke(false, "Sem conexão com o servidor."); return; }
-
-            NetworkClient.Send(new MsgLoginRequest
             {
-                Username     = username.Trim(),
-                PasswordHash = Managers.GameManager.HashPassword(password)
-            });
+                OnLoginResult?.Invoke(false, "Sem conexão com o servidor.");
+                return;
+            }
+
+            string baseHash = Managers.GameManager.HashPassword(password);
+
+            void DoSend()
+            {
+                string signedHash = Managers.GameManager.HashPasswordWithNonce(baseHash, _sessionNonce);
+                NetworkClient.Send(new MsgLoginRequest
+                {
+                    Username   = username.Trim(),
+                    SignedHash = signedHash
+                });
+            }
+
+            if (_nonceReceived)
+            {
+                DoSend();
+            }
+            else
+            {
+                // Aguarda nonce com timeout via coroutine
+                _pendingLoginAction = DoSend;
+                StartCoroutine(WaitForNonceThenLogin(username));
+            }
+        }
+
+        private System.Collections.IEnumerator WaitForNonceThenLogin(string username)
+        {
+            float elapsed = 0f;
+            while (!_nonceReceived && elapsed < 5f)
+            {
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+
+            if (!_nonceReceived)
+            {
+                _pendingLoginAction = null;
+                OnLoginResult?.Invoke(false, "Timeout aguardando o servidor. Tente novamente.");
+                Debug.LogWarning("[ClientAuthHandler] Timeout aguardando nonce do servidor.");
+            }
+            // Se nonce chegou, _pendingLoginAction já foi executado em OnAuthChallenge
         }
 
         public void SendCreateAccount(string username, string password)
@@ -159,7 +223,6 @@ namespace RPG.Network
 
             _waitingForSceneToLoad = true;
             SceneManager.sceneLoaded += OnSceneLoaded;
-
             SceneManager.LoadScene(Managers.GameManager.SCENE_GAMEPLAY);
         }
 
