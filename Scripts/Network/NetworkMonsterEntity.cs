@@ -13,24 +13,19 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v18
+    /// NetworkMonsterEntity v19
     ///
-    /// MELHORIAS v18 (vs v17):
+    /// CORREÇÕES v19 (vs v18):
     ///
-    ///   1. VALIDAÇÃO DE DISTÂNCIA SERVER-SIDE em CmdBasicAttack e CmdRequestSkill:
-    ///      Antes, o servidor não verificava se o atacante estava dentro do alcance
-    ///      físico — apenas validava cooldown e HIT roll. Um cliente modificado
-    ///      podia atacar monstros de qualquer distância. Agora o servidor rejeita
-    ///      ataques que excedam attackRange * ATTACK_RANGE_TOLERANCE.
+    ///   1. SINCRONIZAÇÃO DE MOVIMENTO para outros clientes:
+    ///      SyncVar IsMoving adicionada com hook OnIsMovingChanged que seta
+    ///      o parâmetro "IsMoving" no Animator para todos os clientes.
+    ///      Antes, outros jogadores viam o monstro teletransportando sem animação.
+    ///      O servidor atualiza IsMoving baseado na velocidade do NavMeshAgent.
     ///
-    ///   2. PROTEÇÃO ANTI-SPAM em CmdAllocateAttribute foi movida para o servidor
-    ///      (ver NetworkPlayer v15). Aqui, CmdBasicAttack já tinha ServerCheckAndSetCooldown,
-    ///      que serve como rate-limit natural.
+    ///   2. Validação de distância server-side de v18 mantida integralmente.
     ///
-    ///   3. BOBBING do WorldItem movido para usar localPosition (ver WorldItem v3).
-    ///      Não afeta este arquivo mas documentado para rastreabilidade.
-    ///
-    ///   4. REGEN DO PLAYER documentado como ponto de extensão — ver NetworkPlayer v15.
+    ///   3. REGEN do player documentado como implementado em NetworkPlayer v15.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -80,28 +75,24 @@ namespace RPG.Network
 
         [Range(0f, 100f)]
         [SerializeField] private float dropChance = 50f;
-        [SerializeField] private List<RPG.Data.ItemData> dropTable       = new List<RPG.Data.ItemData>();
-        [SerializeField] private List<string>            guaranteedDropIds = new List<string>();
+        [SerializeField] private List<RPG.Data.ItemData> dropTable        = new List<RPG.Data.ItemData>();
+        [SerializeField] private List<string>             guaranteedDropIds = new List<string>();
 
         [Header("Visuals")]
         [SerializeField] private GameObject         selectionIndicator;
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
-        // ── Tolerância de distância server-side (MELHORIA v18) ─────────────
-        /// <summary>
-        /// Multiplicador de tolerância para validação de distância server-side.
-        /// 1.5x cobre latência de rede (o jogador pode estar ligeiramente mais longe
-        /// no servidor do que no cliente devido ao delay de sincronização de posição).
-        /// Valores abaixo de 1.2x causam rejeições legítimas com alta latência.
-        /// Valores acima de 2.0x deixam a proteção ineficaz.
-        /// </summary>
+        // ── Tolerância de distância server-side ────────────────────────────
         private const float ATTACK_RANGE_TOLERANCE = 1.5f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
         [SyncVar]                                     private float _maxHP;
         [SyncVar(hook = nameof(OnDeadChanged))]       private bool  _isDead;
+
+        // CORREÇÃO v19: sincroniza movimento para animar em outros clientes
+        [SyncVar(hook = nameof(OnIsMovingChanged))]   private bool  _isMoving;
 
         // ── ITargetable ────────────────────────────────────────────────────
         public string  DisplayName => monsterDisplayName;
@@ -143,6 +134,10 @@ namespace RPG.Network
         private Vector3 _homePosition;
         private float   _patrolRadiusRuntime;
         private bool    _serverResetDone = false;
+
+        // CORREÇÃO v19: threshold para atualizar SyncVar IsMoving sem spam
+        private float _lastIsMovingUpdateTime;
+        private const float MOVING_UPDATE_INTERVAL = 0.1f;
 
         private Coroutine _aggroScanCoroutine;
         private Coroutine _pathUpdateCoroutine;
@@ -200,6 +195,7 @@ namespace RPG.Network
             _maxHP             = _stats.MaxHP;
             _currentHP         = _maxHP;
             _isDead            = false;
+            _isMoving          = false;
             _deathProcessed    = false;
             _wasAttacked       = false;
             _state             = AIState.Patrol;
@@ -239,6 +235,14 @@ namespace RPG.Network
             if (_isDead) return;
 
             _attackAccumulator += Time.deltaTime;
+
+            // CORREÇÃO v19: atualiza IsMoving periodicamente no servidor
+            if (Time.time - _lastIsMovingUpdateTime >= MOVING_UPDATE_INTERVAL)
+            {
+                _lastIsMovingUpdateTime = Time.time;
+                bool moving = _agent != null && _agent.velocity.sqrMagnitude > 0.05f;
+                if (moving != _isMoving) _isMoving = moving;
+            }
 
             switch (_state)
             {
@@ -456,11 +460,7 @@ namespace RPG.Network
         private void TryAggro()
         {
             int targetableLayer = LayerMask.NameToLayer("Targetable");
-            if (targetableLayer < 0)
-            {
-                Debug.LogWarning("[NetworkMonsterEntity] Layer 'Targetable' não encontrado!");
-                return;
-            }
+            if (targetableLayer < 0) return;
 
             int layerMask = 1 << targetableLayer;
             var cols = Physics.OverlapSphere(transform.position, aggroRange, layerMask);
@@ -548,8 +548,6 @@ namespace RPG.Network
             if (_currentHP <= 0f) ServerDie();
         }
 
-        // ── Helper ─────────────────────────────────────────────────────────
-
         private static NetworkPlayer FindPlayerByNetId(uint netId)
         {
             foreach (var np in NetworkPlayer.All)
@@ -573,12 +571,11 @@ namespace RPG.Network
             var skill = attacker.GetComponent<SkillSystem>()?.GetSkill(skillIndex);
             if (skill == null) { attacker.RpcSkillRejected(skillIndex, "Skill inválida."); return; }
 
-            // MELHORIA v18: validação de distância server-side para skills
-            float distToTarget = Vector3.Distance(attacker.transform.position, transform.position);
+            // Validação de distância server-side
+            float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange = skill.Range * ATTACK_RANGE_TOLERANCE;
             if (distToTarget > maxAllowedRange)
             {
-                // Rejeita silenciosamente — pode ser latência legítima ou exploit
                 Debug.LogWarning($"[Security] {attacker.CharacterName} usou skill fora de range: " +
                                  $"dist={distToTarget:0.1} max={maxAllowedRange:0.1}");
                 return;
@@ -613,12 +610,8 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            // MELHORIA v18: validação de distância server-side para ataque básico.
-            // O attackRange do monstro é a referência mais conservadora — usamos
-            // o maior entre o attackRange do player (2.5m padrão) e do monstro.
-            // Como não temos acesso ao attackRange do BasicAttackSystem aqui,
-            // usamos o attackRange do monstro * tolerance como proxy razoável.
-            float distToTarget = Vector3.Distance(attacker.transform.position, transform.position);
+            // Validação de distância server-side
+            float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange = attackRange * ATTACK_RANGE_TOLERANCE;
             if (distToTarget > maxAllowedRange)
             {
@@ -723,6 +716,7 @@ namespace RPG.Network
         {
             if (_isDead || _deathProcessed) return;
             _isDead         = true;
+            _isMoving       = false;
             _deathProcessed = true;
             _state          = AIState.Dead;
 
@@ -845,6 +839,14 @@ namespace RPG.Network
         private void OnDeadChanged(bool _, bool dead)
         {
             if (dead && _agent != null) _agent.enabled = false;
+        }
+
+        /// <summary>
+        /// CORREÇÃO v19: anima monstro em movimento para outros clientes.
+        /// </summary>
+        private void OnIsMovingChanged(bool _, bool moving)
+        {
+            _animator?.SetBool("IsMoving", moving);
         }
 
 #if UNITY_EDITOR
