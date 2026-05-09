@@ -13,25 +13,27 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v23
+    /// NetworkMonsterEntity v24
     ///
-    /// CORREÇÕES v23:
+    /// CORREÇÕES v24:
     ///
-    ///   BUG-07 — Referências stale de coroutines após StopAllCoroutines():
-    ///     ServerDie() chama StopAllCoroutines() mas não nullava as refs.
-    ///     Após StopAllCoroutines, todos os campos _xyzCoroutine são nullados
-    ///     explicitamente para evitar comportamento indefinido em checks futuros.
+    ///   BUG-09 — FindPlayerByNetId era O(n) sobre todos os players:
+    ///     Substituído por NetworkServer.spawned[netId] que é O(1).
+    ///     Com 100 jogadores e 50 monstros atacando = ganho de ~5000 iterações/seg.
     ///
-    ///   BUG-08 — CmdBasicAttack validava range com attackRange do MONSTRO:
-    ///     O servidor validava a distância do ataque básico usando o campo
-    ///     attackRange do monstro, mas o jogador pode ter um attackRange diferente
-    ///     configurado no BasicAttackSystem. Corrigido: CmdBasicAttack agora recebe
-    ///     o attackRange do atacante como parâmetro. BasicAttackSystem envia esse
-    ///     valor junto com o comando.
-    ///     NOTA DE SEGURANÇA: o servidor clampeia o range recebido do cliente entre
-    ///     0.5f e MAX_PLAYER_ATTACK_RANGE (8f) para evitar exploits.
+    ///   BUG-10 — ATTACK_RANGE_TOLERANCE muito alto (1.35 = 35% de folga):
+    ///     Reduzido para 1.15f (15%). Cobre latência real (~150ms) sem abrir
+    ///     exploits de alcance. Jogadores com ping alto podem precisar de ajuste
+    ///     via inspector por zona/monstro.
     ///
-    ///   Todas as correções v22 mantidas.
+    ///   BUG-11 — ServerDie podia ser chamado após o objeto ser destruído:
+    ///     Adicionado check `if (this == null) return;` no início de coroutines
+    ///     que continuam após StopAllCoroutines (ServerDeathSequence).
+    ///
+    ///   BUG-12 — RegenLoop não verificava se o componente ainda existe:
+    ///     Adicionado guard `if (this == null || !isServer) break;` no loop.
+    ///
+    ///   Todas as correções v23 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -53,9 +55,9 @@ namespace RPG.Network
         [SerializeField] private int baseLUK = 5;
 
         [Header("Ranges de IA")]
-        [SerializeField] private float aggroRange     = 10f;
-        [SerializeField] private float attackRange    = 2.5f;
-        [SerializeField] private float leashRange     = 30f;
+        [SerializeField] private float aggroRange  = 10f;
+        [SerializeField] private float attackRange = 2.5f;
+        [SerializeField] private float leashRange  = 30f;
 
         [Header("Kite")]
         [SerializeField] private float kiteDistanceFraction = 0.50f;
@@ -91,10 +93,9 @@ namespace RPG.Network
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
-        private const float ATTACK_RANGE_TOLERANCE = 1.35f;
+        // BUG-10: reduzido de 1.35f para 1.15f — menos abusável mantendo cobertura de latência real
+        private const float ATTACK_RANGE_TOLERANCE = 1.15f;
         private const float CHASE_DEST_FRACTION    = 0.82f;
-
-        // BUG-08: limite máximo de range aceito do cliente (segurança anti-exploit)
         private const float MAX_PLAYER_ATTACK_RANGE = 8f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
@@ -246,7 +247,6 @@ namespace RPG.Network
 
             StopAllCoroutines();
 
-            // BUG-07: nullar todas as refs após StopAllCoroutines para evitar stale
             _patrolWaitCoroutine = null;
             _regenCoroutine      = null;
             _aggroScanCoroutine  = null;
@@ -292,6 +292,9 @@ namespace RPG.Network
         {
             while (true)
             {
+                // BUG-11: guard para evitar NRE se o objeto foi destruído
+                if (this == null) yield break;
+
                 if (!_isDead &&
                     (_state == AIState.Idle || _state == AIState.Patrol))
                 {
@@ -311,6 +314,9 @@ namespace RPG.Network
             yield return null;
             while (true)
             {
+                // BUG-11: guard
+                if (this == null) yield break;
+
                 if (!_isDead)
                 {
                     switch (_state)
@@ -343,6 +349,10 @@ namespace RPG.Network
             while (_state == AIState.ReturnHome)
             {
                 yield return _regenWait;
+
+                // BUG-12: guard para evitar NRE após destruição do objeto
+                if (this == null || !isServer) break;
+
                 if (_state != AIState.ReturnHome) break;
                 _currentHP = Mathf.Min(_maxHP, _currentHP + _maxHP * REGEN_PERCENT);
             }
@@ -625,10 +635,14 @@ namespace RPG.Network
             if (_currentHP <= 0f) ServerDie();
         }
 
+        /// <summary>
+        /// BUG-09 CORRIGIDO: usa NetworkServer.spawned[netId] em vez de iterar
+        /// todos os players (O(1) vs O(n)).
+        /// </summary>
         private static NetworkPlayer FindPlayerByNetId(uint netId)
         {
-            foreach (var np in NetworkPlayer.All)
-                if (np != null && np.netId == netId) return np;
+            if (NetworkServer.spawned.TryGetValue(netId, out var identity))
+                return identity?.GetComponent<NetworkPlayer>();
             return null;
         }
 
@@ -653,7 +667,7 @@ namespace RPG.Network
             if (distToTarget > maxAllowedRange)
             {
                 Debug.LogWarning($"[Security] {attacker.CharacterName} usou skill fora de range: " +
-                                 $"dist={distToTarget:0.2f} max={maxAllowedRange:0.2f} range={skill.Range:0.1f}");
+                                 $"dist={distToTarget:0.2f} max={maxAllowedRange:0.2f}");
                 return;
             }
 
@@ -673,11 +687,6 @@ namespace RPG.Network
             attacker.RpcSkillConfirmed(skillIndex, skill.Cooldown);
         }
 
-        /// <summary>
-        /// BUG-08 CORRIGIDO: recebe o attackRange do jogador como parâmetro.
-        /// O servidor valida e clampa o valor recebido (anti-exploit).
-        /// BasicAttackSystem.cs deve passar AttackRange nesta chamada.
-        /// </summary>
         [Command(requiresAuthority = false)]
         public void CmdBasicAttack(uint attackerNetId, float playerAttackRange)
         {
@@ -689,7 +698,6 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            // BUG-08: usa o range DO JOGADOR, clampado para evitar exploits
             float safePlayerRange = Mathf.Clamp(playerAttackRange, 0.5f, MAX_PLAYER_ATTACK_RANGE);
             float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange = safePlayerRange * ATTACK_RANGE_TOLERANCE;
@@ -697,7 +705,7 @@ namespace RPG.Network
             if (distToTarget > maxAllowedRange)
             {
                 Debug.LogWarning($"[Security] {attacker.CharacterName} atacou fora de range: " +
-                                 $"dist={distToTarget:0.2f} max={maxAllowedRange:0.2f} playerRange={safePlayerRange:0.1f}");
+                                 $"dist={distToTarget:0.2f} max={maxAllowedRange:0.2f}");
                 return;
             }
 
@@ -799,7 +807,6 @@ namespace RPG.Network
 
             StopAllCoroutines();
 
-            // BUG-07: nullar todas as refs após StopAllCoroutines
             _aggroScanCoroutine  = null;
             _pathUpdateCoroutine = null;
             _patrolWaitCoroutine = null;
@@ -845,18 +852,27 @@ namespace RPG.Network
         [Server]
         private IEnumerator ServerDeathSequence()
         {
+            // BUG-11: guard para evitar NRE se o objeto for destruído durante a sequência
+            if (this == null) yield break;
+
             RpcOnDied(transform.position);
             if (hideDelay > 0f) yield return new WaitForSeconds(hideDelay);
+
+            if (this == null) yield break;
             RpcHideVisuals();
+
             if (respawnDelay <= 0f) yield break;
             yield return new WaitForSeconds(respawnDelay);
-            if (isServer) StartCoroutine(DelayedRespawn());
+
+            if (this == null || !isServer) yield break;
+            StartCoroutine(DelayedRespawn());
         }
 
         [Server]
         private IEnumerator DelayedRespawn()
         {
             yield return null;
+            if (this == null || !isServer) yield break;
             _serverResetDone = false;
             ServerReset();
         }
@@ -897,7 +913,8 @@ namespace RPG.Network
             if (localPlayerGO != null)
             {
                 var playerEntity = localPlayerGO.GetComponent<RPG.Character.PlayerEntity>();
-                if (playerEntity != null && playerEntity.CurrentTarget is NetworkMonsterEntity current && current == this)
+                if (playerEntity != null &&
+                    playerEntity.CurrentTarget is NetworkMonsterEntity current && current == this)
                 {
                     UIManager.Instance?.ClearTargetPanel();
                     playerEntity.ClearTarget();
@@ -934,7 +951,8 @@ namespace RPG.Network
             if (localPlayerGO != null)
             {
                 var pe = localPlayerGO.GetComponent<RPG.Character.PlayerEntity>();
-                if (pe != null && pe.CurrentTarget is NetworkMonsterEntity current && current == this)
+                if (pe != null &&
+                    pe.CurrentTarget is NetworkMonsterEntity current && current == this)
                     UIManager.Instance?.RefreshTargetPanel(this);
             }
         }
