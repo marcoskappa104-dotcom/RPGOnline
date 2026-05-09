@@ -44,9 +44,9 @@ namespace RPG.Data
         public float MDEF;
 
         // Velocidade
-        /// <summary>Ataques por segundo (usado como timer de ataque, NÃO como velocidade do NavMeshAgent).</summary>
+        /// <summary>Ataques por segundo.</summary>
         public float ASPD;
-        /// <summary>Velocidade de deslocamento em m/s para o NavMeshAgent. Separado de ASPD.</summary>
+        /// <summary>Velocidade de deslocamento em m/s para o NavMeshAgent.</summary>
         public float MoveSpeed;
         public float CastSpeed;
 
@@ -56,8 +56,10 @@ namespace RPG.Data
         public float CRIT;
         public float CritDMG;
 
-        // Regen
+        // Regen por tick (usado pelo ServerRegenLoop — intervalo de 5s)
+        /// <summary>HP recuperado por tick de regen (5s). Baseado em VIT e nível.</summary>
         public float HPRegen;
+        /// <summary>MP recuperado por tick de regen (5s). Baseado em INT e nível.</summary>
         public float MPRegen;
 
         // Avançados
@@ -108,7 +110,7 @@ namespace RPG.Data
         }
 
         /// <summary>
-        /// Calcula os stats derivados. NÃO modifica os objetos passados (sem side-effects).
+        /// Calcula os stats derivados. Sem side-effects nos objetos passados.
         /// </summary>
         public static DerivedStats Calculate(
             BaseAttributes   baseAttr,
@@ -155,8 +157,11 @@ namespace RPG.Data
             s.CRIT    = LUK * 0.3f;
             s.CritDMG = 1.5f;
 
-            s.HPRegen  = (VIT * 0.5f) + (level * 0.2f);
-            s.MPRegen  = (INT * 0.5f) + (level * 0.2f);
+            // MELHORIA v2: HPRegen e MPRegen expressos em valor por tick de 5s
+            // (compatível com NetworkPlayer v15 ServerRegenLoop que regenera a cada 5s)
+            s.HPRegen  = (VIT * 0.5f) + (level * 0.2f);  // HP por tick
+            s.MPRegen  = (INT * 0.5f) + (level * 0.2f);  // MP por tick
+
             s.CastSpeed = (DEX * 0.5f) + (INT * 0.3f);
 
             s.Penetration     = STR * 0.2f;
