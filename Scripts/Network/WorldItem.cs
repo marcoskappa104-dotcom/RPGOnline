@@ -7,21 +7,24 @@ using System.Collections;
 namespace RPG.Network
 {
     /// <summary>
-    /// WorldItem v3
+    /// WorldItem v4
     ///
-    /// CORREÇÃO v3:
-    ///   1. BOBBING: o Update() anterior modificava transform.position completo
-    ///      criando um new Vector3 por frame por item. Com 20 itens = 20 alocações/frame.
-    ///      Agora usa transform.localPosition com apenas o Y variando, zerando X e Z
-    ///      do offset — elimina alocações desnecessárias e não interfere no X/Z world.
+    /// CORREÇÕES v4:
     ///
-    ///      Na prática: guardamos a posição world no OnStartClient e usamos um
-    ///      TransformPoint local para mover apenas Y, mantendo X/Z intocados.
-    ///      Técnica alternativa limpa: modificar apenas transform.localPosition.y
-    ///      não funciona em C# (propriedade). Usamos a abordagem de reutilizar
-    ///      um Vector3 pré-alocado e atualizar apenas o Y.
+    ///   BUG-08 — Bobbing causava jitter em multiplayer:
+    ///     O Update() modificava transform.position no transform raiz, que o
+    ///     Mirror NetworkTransform sincronizava com o servidor — causando jitter.
+    ///     SOLUÇÃO: o bobbing agora é aplicado em _visualRoot (filho), deixando
+    ///     o transform raiz intocado para o NetworkTransform.
+    ///     Se não houver filho visual configurado, cria um automaticamente.
     ///
-    ///   2. RACE CONDITION, DISTÂNCIA e AUTODESPAWN: mantidos do v2.
+    ///   BUG-23 — CmdPickUp iterava NetworkPlayer.All (pode modificar durante iteração):
+    ///     Substituído por NetworkServer.spawned[playerNetId] que é O(1) e thread-safe.
+    ///
+    ///   BUG-17 — FloatingTextManager crashava em servidor dedicado:
+    ///     Guards de Application.isBatchMode adicionados onde relevante.
+    ///
+    ///   Todas as correções v3 mantidas (auto-despawn, distância de pickup).
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class WorldItem : NetworkBehaviour
@@ -30,6 +33,10 @@ namespace RPG.Network
         [SerializeField] private SpriteRenderer spriteRenderer;
         [SerializeField] private TMPro.TMP_Text  nameLabel;
         [SerializeField] private GameObject      glowEffect;
+
+        [Header("Visual Root — filho que recebe o bobbing (não o transform raiz)")]
+        [Tooltip("Arraste aqui o filho visual. Se null, será criado automaticamente.")]
+        [SerializeField] private Transform _visualRoot;
 
         [Header("Configuração")]
         [SerializeField] private float despawnTime  = 60f;
@@ -42,10 +49,8 @@ namespace RPG.Network
 
         public string ItemId => _itemId;
 
-        // CORREÇÃO v3: reutiliza Vector3 pré-alocado, guarda só Y base
-        private float   _startY;
-        private Vector3 _bobPosition; // reutilizado a cada frame — sem alocação
-        private bool    _picked = false;
+        private bool  _picked  = false;
+        private float _startLocalY;
 
         // ── Server Init ────────────────────────────────────────────────────
 
@@ -71,10 +76,49 @@ namespace RPG.Network
 
         public override void OnStartClient()
         {
-            // Guarda posição inicial e inicializa o Vector3 de bobbing
-            _startY      = transform.position.y;
-            _bobPosition = transform.position;
+            EnsureVisualRoot();
+            // Guarda posição local Y do visual root para o bobbing
+            _startLocalY = _visualRoot != null ? _visualRoot.localPosition.y : 0f;
             RefreshVisual(_itemId);
+        }
+
+        private void Awake()
+        {
+            EnsureVisualRoot();
+        }
+
+        /// <summary>
+        /// Garante que existe um transform filho para o bobbing.
+        /// Se o designer não configurou _visualRoot, cria um GameObject filho
+        /// e move os filhos visuais existentes para dentro dele.
+        /// </summary>
+        private void EnsureVisualRoot()
+        {
+            if (_visualRoot != null) return;
+
+            // Procura por um filho chamado "VisualRoot"
+            var existing = transform.Find("VisualRoot");
+            if (existing != null)
+            {
+                _visualRoot = existing;
+                return;
+            }
+
+            // Cria o VisualRoot como filho do transform raiz
+            var go = new GameObject("VisualRoot");
+            go.transform.SetParent(transform, false);
+            go.transform.localPosition = Vector3.zero;
+            go.transform.localRotation = Quaternion.identity;
+            go.transform.localScale    = Vector3.one;
+            _visualRoot = go.transform;
+
+            // Move componentes visuais para o VisualRoot
+            if (spriteRenderer != null && spriteRenderer.transform == transform)
+                spriteRenderer.transform.SetParent(_visualRoot, true);
+            if (nameLabel != null && nameLabel.transform == transform)
+                nameLabel.transform.SetParent(_visualRoot, true);
+            if (glowEffect != null && glowEffect.transform == transform)
+                glowEffect.transform.SetParent(_visualRoot, true);
         }
 
         private void OnItemIdChanged(string oldId, string newId) => RefreshVisual(newId);
@@ -98,32 +142,37 @@ namespace RPG.Network
                 glowEffect.SetActive(item.Rarity >= ItemRarity.Rare);
         }
 
-        // CORREÇÃO v3: reutiliza _bobPosition sem new Vector3 por frame
+        /// <summary>
+        /// BUG-08 CORRIGIDO: bobbing aplicado em _visualRoot (filho),
+        /// não no transform raiz que o NetworkTransform controla.
+        /// Elimina jitter em multiplayer.
+        /// </summary>
         private void Update()
         {
-            if (!isClient) return;
+            if (!isClient || _visualRoot == null) return;
 
-            float newY = _startY + Mathf.Sin(Time.time * bobFrequency * Mathf.PI * 2f) * bobAmplitude;
-
-            // Reutiliza o Vector3 existente — sem alocação GC
-            _bobPosition.x = transform.position.x;
-            _bobPosition.y = newY;
-            _bobPosition.z = transform.position.z;
-            transform.position = _bobPosition;
+            float newLocalY = _startLocalY + Mathf.Sin(Time.time * bobFrequency * Mathf.PI * 2f) * bobAmplitude;
+            var localPos = _visualRoot.localPosition;
+            localPos.y = newLocalY;
+            _visualRoot.localPosition = localPos;
         }
 
         // ── Pickup ─────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// BUG-23 CORRIGIDO: usa NetworkServer.spawned[playerNetId] (O(1))
+        /// em vez de iterar NetworkPlayer.All (O(n), race condition).
+        /// </summary>
         [Command(requiresAuthority = false)]
         public void CmdPickUp(uint playerNetId)
         {
             if (_picked) return;
 
+            // O(1) em vez de O(n) — sem risco de modificação durante iteração
             NetworkPlayer player = null;
-            foreach (var np in NetworkPlayer.All)
-            {
-                if (np != null && np.netId == playerNetId) { player = np; break; }
-            }
+            if (NetworkServer.spawned.TryGetValue(playerNetId, out var identity))
+                player = identity?.GetComponent<NetworkPlayer>();
+
             if (player == null || player.Dead) return;
 
             float dist = Vector3.Distance(transform.position, player.transform.position);
@@ -153,6 +202,8 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcPickupFeedback(uint playerNetId, string itemName, Color rarityColor)
         {
+            // Guard para servidor dedicado (sem UI)
+            if (Application.isBatchMode) return;
             if (NetworkClient.localPlayer == null) return;
             if (NetworkClient.localPlayer.netId != playerNetId) return;
 
