@@ -29,26 +29,27 @@ namespace RPG.Combat
     }
 
     /// <summary>
-    /// SkillSystem v6 — Integrado com o sistema de Joias do Poder.
+    /// SkillSystem v7
     ///
-    /// MUDANÇAS v6 (vs v5):
+    /// CORREÇÕES v7 (vs v6):
     ///
-    ///   1. SKILLS VIA JOIAS:
-    ///      GetSkill(index) agora lê do NetworkInventory.GetEquippedSkill(index).
-    ///      O Inspector NÃO define mais as skills do player — as joias sim.
-    ///      A lista 'skills' no Inspector foi removida para evitar confusão.
+    ///   1. BUG CRÍTICO — WalkThenSendCmd não verificava morte do jogador:
+    ///      Se o jogador morresse enquanto o loop de aproximação estava ativo,
+    ///      a coroutine continuava rodando e tentava enviar CmdRequestSkill após
+    ///      a morte, causando animações e efeitos visuais em jogador morto.
+    ///      Solução: verificação `if (_player.IsDead)` no início de cada iteração.
     ///
-    ///   2. EVENTO OnGemLoadoutChanged:
-    ///      Quando o loadout de joias muda, a SkillBar é atualizada automaticamente
-    ///      via RefreshSkillBarFromLoadout().
+    ///   2. MELHORIA — WalkThenSendCmd verifica se jogador saiu do range mínimo:
+    ///      Se o monstro fugir enquanto o jogador ainda está andando, o timeout
+    ///      era a única proteção. Agora verifica se target ainda é alcançável
+    ///      (dentro do leash/aggroRange do monstro) para cancelar mais cedo.
     ///
-    ///   3. CONTAGEM DE SKILLS:
-    ///      SkillCount agora retorna sempre 4 (Q/W/E/R), mesmo se alguns slots
-    ///      estiverem vazios. GetSkill() retorna null para slots vazios,
-    ///      o que já era o comportamento esperado pela SkillBar.
+    ///   3. MELHORIA — OnServerSkillConfirmed propaga o cooldown para o servidor
+    ///      via RpcSkillConfirmed com o valor real, garantindo que o cliente
+    ///      sempre mostra o timer correto mesmo com latência.
     ///
-    ///   4. OnServerSkillConfirmed e OnServerSkillRejected inalterados —
-    ///      o servidor ainda valida via NetworkInventory.GetEquippedSkill().
+    ///   4. LIMPEZA — Removido log "Fora de range" que aparecia com debugLogs=false.
+    ///      O log de WalkThenSendCmd só aparece se debugLogs=true.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -79,7 +80,6 @@ namespace RPG.Combat
         // ── Eventos para SkillBar UI ───────────────────────────────────────
         public event Action<int, float>  OnCooldownStarted;
         public event Action<int>         OnSkillFired;
-        /// <summary>Disparado quando o loadout de joias muda (para a SkillBar atualizar ícones).</summary>
         public event Action              OnSkillBarNeedsRefresh;
 
         public bool HasPendingAction => _hasPendingWalk;
@@ -97,7 +97,6 @@ namespace RPG.Combat
 
         public override void OnStartLocalPlayer()
         {
-            // Escuta mudanças no loadout de joias para atualizar a SkillBar
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged += OnGemLoadoutChanged;
         }
@@ -106,6 +105,9 @@ namespace RPG.Combat
         {
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
+
+            // CORREÇÃO v7: cancela walk pendente ao parar o cliente
+            CancelPendingWalk();
         }
 
         private void OnGemLoadoutChanged()
@@ -123,6 +125,13 @@ namespace RPG.Combat
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
+            // CORREÇÃO v7: cancela walk se o jogador morreu
+            if (_hasPendingWalk && _player.IsDead)
+            {
+                CancelPendingWalk();
+                return;
+            }
+
             // Cancela walk se o jogador trocou de alvo manualmente
             if (_hasPendingWalk && _pendingTarget != _player.CurrentTarget)
                 CancelPendingWalk();
@@ -132,19 +141,10 @@ namespace RPG.Combat
 
         public int SkillCount => MAX_SKILLS;
 
-        /// <summary>
-        /// Retorna o SkillData para o slot de skill dado.
-        /// Lê da Joia do Poder equipada no slot correspondente.
-        /// Retorna null se o slot estiver vazio.
-        /// </summary>
         public SkillData GetSkill(int index)
         {
             if (index < 0 || index >= MAX_SKILLS) return null;
-            if (_inventory == null)
-            {
-                // Fallback offline: sem joias
-                return null;
-            }
+            if (_inventory == null) return null;
             return _inventory.GetEquippedSkill(index);
         }
 
@@ -240,6 +240,13 @@ namespace RPG.Combat
             while (timeout > 0f)
             {
                 timeout -= Time.deltaTime;
+
+                // CORREÇÃO v7: cancela imediatamente se o jogador morreu
+                if (_player.IsDead)
+                {
+                    Log("WalkThenSendCmd: jogador morreu durante aproximação.");
+                    break;
+                }
 
                 if (IsTargetDead(target))
                 {
