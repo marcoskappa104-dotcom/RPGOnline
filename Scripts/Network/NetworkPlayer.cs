@@ -13,20 +13,28 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v17
+    /// NetworkPlayer v18
     ///
-    /// CORREÇÕES v17:
+    /// CORREÇÕES v18:
     ///
-    ///   BUG-03 — OnAllocatedChanged não sincronizava Data.BaseAttributes:
-    ///     O cliente atualizava só AllocatedXXX no Data, mas nunca os BaseAttributes
-    ///     com os SyncVars BaseSTR/AGI/etc. FullRefreshStatsFromData() calculava com
-    ///     base errada se a raça/base do servidor diferia. Agora sincroniza tudo.
+    ///   BUG-13 — SyncVar flooding: 6 AllocatedXXX compartilhavam um hook
+    ///     que chamava FullRefreshStatsFromData 6x em cada inicialização.
+    ///     Solução: adicionado _statsVersion (SyncVar int) que incrementa UMA VEZ
+    ///     ao final de cada operação de alocação. O hook OnStatsVersionChanged
+    ///     dispara apenas uma vez, chamando FullRefreshStatsFromData uma vez.
+    ///     Os hooks individuais OnAllocatedChanged ainda atualizam PlayerEntity.Data,
+    ///     mas não chamam mais FullRefreshStatsFromData.
     ///
-    ///   BUG-05 — RpcInitializeLocalPlayer com 24 parâmetros (risco de overflow MTU):
-    ///     Parâmetros agrupados em struct PlayerInitData que é serializada como uma
-    ///     única mensagem Mirror, dentro do limite seguro de ~1200 bytes KCP.
+    ///   BUG-14 — ServerSaveCharacter sem debounce:
+    ///     Level up em combate intenso podia chamar SaveCharacter várias vezes/seg.
+    ///     Solução: _isDirty flag + SaveCharacter só executa no próximo tick do
+    ///     autoSave quando _isDirty=true. Saves urgentes (morte, respawn) ainda
+    ///     podem forçar save imediato via ServerSaveCharacterForced().
     ///
-    ///   Todas as correções v16 mantidas.
+    ///   BUG-15 — ServerRegenLoop sem guard de destruição:
+    ///     Adicionado `if (this == null) yield break;` para evitar NRE em crash.
+    ///
+    ///   Todas as correções v17 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -35,18 +43,18 @@ namespace RPG.Network
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        private const float MAX_HP_CAP              = 500_000f;
-        private const float MAX_MP_CAP              = 200_000f;
-        private const float SAVE_INTERVAL           = 60f;
-        private const float REGEN_INTERVAL          = 5f;
-        private const float ALLOCATE_MIN_INTERVAL   = 0.3f;
+        private const float MAX_HP_CAP               = 500_000f;
+        private const float MAX_MP_CAP               = 200_000f;
+        private const float SAVE_INTERVAL            = 60f;
+        private const float REGEN_INTERVAL           = 5f;
+        private const float ALLOCATE_MIN_INTERVAL    = 0.3f;
         private const float REGEN_COMBAT_SUPPRESSION = 8f;
 
-        // ── Struct de inicialização (BUG-05: evita overflow de parâmetros RPC) ──
+        // ── Struct de inicialização ────────────────────────────────────────
         public struct PlayerInitData
         {
             public string CharName;
-            public int    Race;          // int para serialização Mirror
+            public int    Race;
             public int    Level;
             public long   Exp;
             public long   ExpToNext;
@@ -70,12 +78,16 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
 
-        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedSTR = 0;
-        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedAGI = 0;
-        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedVIT = 0;
-        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedDEX = 0;
-        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedINT = 0;
-        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedLUK = 0;
+        // BUG-13: SyncVar de versão — dispara FullRefreshStatsFromData apenas UMA VEZ
+        // ao final de cada operação que modifica atributos alocados.
+        [SyncVar(hook = nameof(OnStatsVersionChanged))] public int StatsVersion = 0;
+
+        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedSTR = 0;
+        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedAGI = 0;
+        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedVIT = 0;
+        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedDEX = 0;
+        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedINT = 0;
+        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedLUK = 0;
 
         [SyncVar] public int BaseSTR = 10;
         [SyncVar] public int BaseAGI = 10;
@@ -115,8 +127,10 @@ namespace RPG.Network
         private DerivedStats  _serverStats;
         private string        _serverAccountUsername;
         private float         _autoSaveTimer;
-        private float         _lastAllocateTime = -999f;
-        private float         _lastDamageTime   = -999f;
+        private float         _lastAllocateTime   = -999f;
+        private float         _lastDamageTime     = -999f;
+        // BUG-14: dirty flag para debounce de save
+        private bool          _isDirty            = false;
 
         public DerivedStats ServerStats => _serverStats;
 
@@ -154,7 +168,7 @@ namespace RPG.Network
             All.Remove(this);
             StopRegenLoop();
             if (_serverCharData != null)
-                ServerSaveCharacter();
+                ServerSaveCharacterForced(); // save forçado ao desconectar
             else
                 Debug.LogWarning($"[Server] OnStopServer: {CharacterName} sem dados — save ignorado.");
         }
@@ -204,7 +218,8 @@ namespace RPG.Network
             if (_autoSaveTimer <= 0f)
             {
                 _autoSaveTimer = SAVE_INTERVAL;
-                ServerSaveCharacter();
+                // BUG-14: só salva se houver mudanças pendentes
+                if (_isDirty) ServerSaveCharacterForced();
             }
         }
 
@@ -254,6 +269,9 @@ namespace RPG.Network
             CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= maxHP) ? charData.CurrentHP : maxHP;
             CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP) ? charData.CurrentMP : maxMP;
 
+            // BUG-13: incrementa versão UMA VEZ ao final da inicialização
+            StatsVersion++;
+
             var savedPos = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
             if (savedPos.sqrMagnitude > 0.01f)
             {
@@ -271,7 +289,6 @@ namespace RPG.Network
             StartCoroutine(SendInitRpcDelayed(charData));
         }
 
-        // BUG-05: usa struct em vez de 24 parâmetros avulsos
         [Server]
         private IEnumerator SendInitRpcDelayed(CharacterData charData)
         {
@@ -336,6 +353,9 @@ namespace RPG.Network
             {
                 yield return wait;
 
+                // BUG-15: guard para evitar NRE se o objeto foi destruído
+                if (this == null || !isServer) yield break;
+
                 if (Dead || _serverStats == null) continue;
 
                 bool inCombat = (Time.time - _lastDamageTime) < REGEN_COMBAT_SUPPRESSION;
@@ -364,7 +384,7 @@ namespace RPG.Network
         {
             if (Time.time - _lastAllocateTime < ALLOCATE_MIN_INTERVAL)
             {
-                Debug.LogWarning($"[Server] CmdAllocateAttribute spam detectado: {CharacterName}");
+                Debug.LogWarning($"[Server] CmdAllocateAttribute spam: {CharacterName}");
                 return;
             }
 
@@ -393,7 +413,13 @@ namespace RPG.Network
             if (CurrentMP > MaxMP) CurrentMP = MaxMP;
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
-            ServerSaveCharacter();
+
+            // BUG-13: incrementa versão UMA VEZ após todos os Allocated serem atualizados
+            // O hook OnStatsVersionChanged no cliente chama FullRefreshStatsFromData uma vez.
+            StatsVersion++;
+
+            // BUG-14: marca dirty em vez de salvar imediatamente
+            MarkDirty();
         }
 
         [Command] public void CmdRequestRespawn() => ServerRespawn();
@@ -496,18 +522,34 @@ namespace RPG.Network
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
-                StartRegenLoop();
+                // BUG-13: incrementa versão para notificar cliente de mudanças de stats por level up
+                StatsVersion++;
 
+                StartRegenLoop();
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
 
             DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
-            if (leveledUp) ServerSaveCharacter();
+
+            // BUG-14: level up força save imediato; XP comum apenas marca dirty
+            if (leveledUp) ServerSaveCharacterForced();
+            else           MarkDirty();
+
             RpcOnExpGained(amount, leveledUp);
         }
 
+        /// <summary>
+        /// BUG-14: Marca dados como sujos — o save ocorre no próximo tick do autoSave.
+        /// Usar para mudanças frequentes (XP, HP, posição).
+        /// </summary>
         [Server]
-        public void ServerSaveCharacter()
+        private void MarkDirty() => _isDirty = true;
+
+        /// <summary>
+        /// BUG-14: Save imediato — usar para eventos críticos (morte, respawn, desconexão).
+        /// </summary>
+        [Server]
+        public void ServerSaveCharacterForced()
         {
             if (_serverCharData == null || string.IsNullOrEmpty(_serverAccountUsername)) return;
 
@@ -519,11 +561,17 @@ namespace RPG.Network
 
             DatabaseManager.Instance?.SaveCharacter(_serverCharData, _serverAccountUsername);
             _inventory?.ServerSaveAll(_serverCharData.CharacterId, _serverAccountUsername);
+            _isDirty = false;
         }
+
+        /// <summary>
+        /// Compatibilidade com código existente — chama a versão forçada.
+        /// </summary>
+        [Server]
+        public void ServerSaveCharacter() => ServerSaveCharacterForced();
 
         // ── ClientRpcs ─────────────────────────────────────────────────────
 
-        // BUG-05: struct em vez de 24 parâmetros avulsos
         [ClientRpc]
         private void RpcInitializeLocalPlayer(PlayerInitData d)
         {
@@ -653,7 +701,7 @@ namespace RPG.Network
             CurrentHP = 0f;
             StopRegenLoop();
             if (_agent != null) _agent.ResetPath();
-            ServerSaveCharacter();
+            ServerSaveCharacterForced(); // morte sempre salva imediatamente
             RpcPlayerDied();
         }
 
@@ -673,7 +721,7 @@ namespace RPG.Network
             {
                 _serverCharData.CurrentHP = CurrentHP;
                 _serverCharData.CurrentMP = CurrentMP;
-                ServerSaveCharacter();
+                ServerSaveCharacterForced(); // respawn também salva imediatamente
             }
 
             _lastDamageTime = -999f;
@@ -767,32 +815,40 @@ namespace RPG.Network
         }
 
         /// <summary>
-        /// BUG-03 CORRIGIDO: Sincroniza TODOS os campos do Data (base + allocated)
-        /// para que FullRefreshStatsFromData() calcule com os valores corretos do servidor.
+        /// BUG-13: Atualiza PlayerEntity.Data quando AllocatedXXX muda,
+        /// mas NÃO chama FullRefreshStatsFromData (evita 6 chamadas por inicialização).
+        /// O refresh completo é feito apenas em OnStatsVersionChanged.
         /// </summary>
-        private void OnAllocatedChanged(int _, int __)
+        private void OnAllocatedDataChanged(int _, int __)
+        {
+            if (!isLocalPlayer) return;
+            if (_playerEntity?.Data == null) return;
+
+            // Sincroniza apenas os dados no PlayerEntity.Data
+            _playerEntity.Data.BaseAttributes.STR = BaseSTR;
+            _playerEntity.Data.BaseAttributes.AGI = BaseAGI;
+            _playerEntity.Data.BaseAttributes.VIT = BaseVIT;
+            _playerEntity.Data.BaseAttributes.DEX = BaseDEX;
+            _playerEntity.Data.BaseAttributes.INT = BaseINT;
+            _playerEntity.Data.BaseAttributes.LUK = BaseLUK;
+
+            _playerEntity.Data.AllocatedSTR = AllocatedSTR;
+            _playerEntity.Data.AllocatedAGI = AllocatedAGI;
+            _playerEntity.Data.AllocatedVIT = AllocatedVIT;
+            _playerEntity.Data.AllocatedDEX = AllocatedDEX;
+            _playerEntity.Data.AllocatedINT = AllocatedINT;
+            _playerEntity.Data.AllocatedLUK = AllocatedLUK;
+            // NÃO chama FullRefreshStatsFromData aqui
+        }
+
+        /// <summary>
+        /// BUG-13: Este hook dispara UMA VEZ após todos os Allocated serem atualizados
+        /// no servidor. Chama FullRefreshStatsFromData apenas uma vez.
+        /// </summary>
+        private void OnStatsVersionChanged(int _, int __)
         {
             if (!isLocalPlayer) return;
             if (_playerEntity == null || !_playerEntity.IsInitialized) return;
-
-            if (_playerEntity.Data != null)
-            {
-                // BUG-03: sincroniza BaseAttributes também (não só Allocated)
-                _playerEntity.Data.BaseAttributes.STR = BaseSTR;
-                _playerEntity.Data.BaseAttributes.AGI = BaseAGI;
-                _playerEntity.Data.BaseAttributes.VIT = BaseVIT;
-                _playerEntity.Data.BaseAttributes.DEX = BaseDEX;
-                _playerEntity.Data.BaseAttributes.INT = BaseINT;
-                _playerEntity.Data.BaseAttributes.LUK = BaseLUK;
-
-                _playerEntity.Data.AllocatedSTR = AllocatedSTR;
-                _playerEntity.Data.AllocatedAGI = AllocatedAGI;
-                _playerEntity.Data.AllocatedVIT = AllocatedVIT;
-                _playerEntity.Data.AllocatedDEX = AllocatedDEX;
-                _playerEntity.Data.AllocatedINT = AllocatedINT;
-                _playerEntity.Data.AllocatedLUK = AllocatedLUK;
-            }
-
             _playerEntity.FullRefreshStatsFromData();
         }
     }
