@@ -9,29 +9,22 @@ using RPG.Data;
 namespace RPG.Combat
 {
     /// <summary>
-    /// BasicAttackSystem v2
+    /// BasicAttackSystem v3
     ///
-    /// CORREÇÕES v2 — Mesma família de bugs do SkillSystem v8.
+    /// CORREÇÃO v3 — Mesma família de bugs corrigida no SkillSystem v9.
     ///
-    ///   BUG CORRIGIDO: Player sobrepunha o monstro durante o auto-ataque.
+    ///   BUG: Player podia sobrepor o monstro ou parar longe demais durante auto-ataque.
     ///
-    ///   CAUSA: ChaseTarget() chamava `_agent.SetDestination(_attackTarget.Position)`,
-    ///   onde o destino ERA a posição exata do monstro. O stoppingDistance de
-    ///   (attackRange * 0.85f) funciona como margem de PARADA, não de DESTINO.
-    ///   O NavMesh move o agente até o destino e só para quando está a
-    ///   stoppingDistance do destino — mas se o destino muda todo frame (monstro
-    ///   se move), o stoppingDistance pode não ter efeito correto.
+    ///   CAUSA: DEST_FRACTION (0.80) e stoppingDistance (0.5f antes, mas era
+    ///   potencialmente maior em certas condições) se somavam ou o destino calculado
+    ///   ficava muito próximo do monstro.
     ///
-    ///   SOLUÇÃO: Igual ao SkillSystem — calculamos um ponto intermediário
-    ///   que fica dentro do range, na direção player→monstro. O NavMesh
-    ///   leva o player exatamente até esse ponto e para naturalmente.
-    ///
-    ///   stoppingDistance é mantido como fallback de segurança em 0.5f
-    ///   (o comportamento natural do agente) já que o destino calculado
-    ///   já garante a posição correta.
-    ///
-    ///   MELHORIA: Adicionado método público GetAttackRange() para que
-    ///   o NetworkMonsterEntity possa usar o mesmo range ao validar ataques.
+    ///   SOLUÇÃO (alinhada com SkillSystem v9):
+    ///     • DEST_FRACTION = 0.80f → player vai para 80% do attackRange (conservador)
+    ///     • stoppingDistance = 0.2f durante perseguição (fixo e pequeno)
+    ///     • RANGE_CHECK_MARGIN = 1.05f → absorve micro-jitter do NavMesh
+    ///     • Quando entra no range: ResetPath + velocity=zero antes de atacar
+    ///     • velocity zerrada ao parar para evitar deslizamento residual
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -51,14 +44,17 @@ namespace RPG.Combat
         [SerializeField] private float doubleClickTime = 0.35f;
 
         [Tooltip("Frequência máxima de envio do CmdMoveTo durante perseguição (s).")]
-        [SerializeField] private float moveCommandInterval = 0.2f;
+        [SerializeField] private float moveCommandInterval = 0.15f;
 
         [Header("Debug")]
         [SerializeField] private bool debugLogs = false;
 
-        // Fração do attackRange para calcular o ponto de destino intermediário.
-        // Player vai até (attackRange * DEST_FRACTION) do monstro e para.
-        private const float DEST_FRACTION = 0.80f;
+        // CORREÇÃO v3: destino a 80% do range → player para dentro do range de ataque
+        private const float DEST_FRACTION        = 0.80f;
+        // Margem de tolerância no check de range
+        private const float RANGE_CHECK_MARGIN   = 1.05f;
+        // stoppingDistance fixo durante perseguição (não mais múltiplo do range)
+        private const float CHASE_STOP_DIST      = 0.2f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
@@ -100,10 +96,6 @@ namespace RPG.Combat
 
         // ── API pública ────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo NetworkPlayerController ao clicar em um monstro.
-        /// Detecta duplo clique para iniciar auto-ataque.
-        /// </summary>
         public bool TryRegisterClick(NetworkMonsterEntity monster)
         {
             if (IsUnityNull(monster) || monster.IsDead) return false;
@@ -124,7 +116,6 @@ namespace RPG.Combat
             return false;
         }
 
-        /// <summary>Cancela o auto-ataque.</summary>
         public void CancelAutoAttack()
         {
             if (!_autoAttacking) return;
@@ -136,6 +127,7 @@ namespace RPG.Combat
             {
                 _agent.stoppingDistance = 0.5f;
                 _agent.ResetPath();
+                _agent.velocity = Vector3.zero;
             }
 
             Log("Auto-ataque cancelado.");
@@ -150,7 +142,7 @@ namespace RPG.Combat
 
             _attackTarget  = monster;
             _autoAttacking = true;
-            _attackTimer   = GetAttackInterval(); // aguarda um ciclo antes do 1º ataque
+            _attackTimer   = GetAttackInterval();
 
             _player.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
@@ -178,19 +170,24 @@ namespace RPG.Combat
                 return;
             }
 
-            float dist = Vector3.Distance(transform.position, _attackTarget.Position);
+            float dist              = Vector3.Distance(transform.position, _attackTarget.Position);
+            float effectiveRange    = attackRange * RANGE_CHECK_MARGIN;
 
-            if (dist > attackRange)
+            if (dist > effectiveRange)
             {
                 ChaseTarget();
             }
             else
             {
-                // CORREÇÃO v2: para o agente completamente quando está no range
-                if (_agent != null && _agent.isOnNavMesh && _agent.hasPath)
+                // CORREÇÃO v3: para o agente com velocity zerrada
+                if (_agent != null && _agent.isOnNavMesh)
                 {
-                    _agent.ResetPath();
-                    _agent.stoppingDistance = 0.5f;
+                    if (_agent.hasPath)
+                    {
+                        _agent.ResetPath();
+                        _agent.velocity         = Vector3.zero;
+                        _agent.stoppingDistance = 0.5f;
+                    }
                 }
 
                 _attackTimer += Time.deltaTime;
@@ -212,19 +209,18 @@ namespace RPG.Combat
         }
 
         /// <summary>
-        /// CORREÇÃO v2 — Perseguição usa destino intermediário, não posição do monstro.
+        /// CORREÇÃO v3 — Perseguição usa destino intermediário + stoppingDistance fixo.
         ///
-        /// Calculamos um ponto que fica a (attackRange * DEST_FRACTION) do monstro
-        /// na direção player→monstro. O NavMesh para naturalmente nesse ponto.
-        /// O stoppingDistance volta para 0.5f padrão (destino intermediário = parada natural).
+        /// Destino = posição a (attackRange * DEST_FRACTION) do monstro.
+        /// stoppingDistance = CHASE_STOP_DIST (0.2f fixo) — não um múltiplo do range.
+        /// O player para naturalmente quando chega ao destino, que já está dentro do range.
         /// </summary>
         private void ChaseTarget()
         {
             if (_agent != null && _agent.isOnNavMesh)
             {
-                // CORREÇÃO: destino é o ponto no range, não o monstro
                 Vector3 destination = CalculateChaseDestination(_attackTarget.Position);
-                _agent.stoppingDistance = 0.5f; // parada natural no ponto calculado
+                _agent.stoppingDistance = CHASE_STOP_DIST;
                 _agent.SetDestination(destination);
             }
 
@@ -232,30 +228,28 @@ namespace RPG.Combat
             if (Time.time - _lastMoveCmd >= moveCommandInterval)
             {
                 _lastMoveCmd = Time.time;
-                // Envia destino intermediário ao servidor também
                 Vector3 serverDest = CalculateChaseDestination(_attackTarget.Position);
                 _controller?.CmdMoveTo(serverDest);
             }
         }
 
         /// <summary>
-        /// Calcula ponto de destino dentro do range do ataque, evitando sobrepor o monstro.
+        /// Calcula o destino de perseguição dentro do range de ataque.
+        /// O player para a (attackRange * DEST_FRACTION) do monstro.
         /// </summary>
         private Vector3 CalculateChaseDestination(Vector3 targetPos)
         {
             Vector3 toTarget = targetPos - transform.position;
             float dist = toTarget.magnitude;
 
-            // Já está no range ou muito perto — não precisa mover
-            if (dist <= attackRange * DEST_FRACTION)
+            float safeStopDist = attackRange * DEST_FRACTION;
+
+            if (dist <= safeStopDist * 0.95f)
                 return transform.position;
 
-            // Ponto a (attackRange * DEST_FRACTION) do monstro, na direção do player
-            float   stopDist    = attackRange * DEST_FRACTION;
             Vector3 direction   = toTarget.normalized;
-            Vector3 destination = targetPos - direction * stopDist;
+            Vector3 destination = targetPos - direction * safeStopDist;
 
-            // Snap ao NavMesh
             if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
                 return hit.position;
 
@@ -302,7 +296,6 @@ namespace RPG.Combat
             Gizmos.color = new Color(1f, 0.5f, 0f, 0.4f);
             Gizmos.DrawWireSphere(transform.position, attackRange);
 
-            // Mostra o raio efetivo de destino (onde o player vai parar)
             Gizmos.color = new Color(0f, 1f, 0.5f, 0.25f);
             Gizmos.DrawWireSphere(transform.position, attackRange * DEST_FRACTION);
         }
