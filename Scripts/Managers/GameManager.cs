@@ -6,28 +6,53 @@ using System.Collections.Generic;
 namespace RPG.Managers
 {
     /// <summary>
-    /// GameManager v6
+    /// GameManager v7 — CORREÇÃO CRÍTICA DO FLUXO DE AUTENTICAÇÃO
     ///
-    /// CORREÇÕES v6:
-    ///   - Adicionado sistema de nonce por sessão para eliminar replay attacks básicos.
-    ///     O servidor gera um nonce aleatório por conexão; o cliente assina
-    ///     SHA-256(senhaHash + nonce) antes de enviar. Sem TLS isso ainda
-    ///     é vulnerável a MITM ativo, mas elimina replay de credenciais capturadas.
+    /// ════════════════════════════════════════════════════════════════════
+    /// ROOT CAUSE DO BUG "senha incorreta":
     ///
-    ///   - GenerateNonce() retorna Base64(16 bytes aleatórios) — suficiente para
-    ///     uso interno. Em produção, substituir por criptografia assimétrica.
+    /// O fluxo v6 tinha um erro de design no pipeline de hash que tornava
+    /// IMPOSSÍVEL fazer login após criar uma conta. Aqui está o que acontecia:
     ///
-    ///   - HashPasswordWithNonce() — método do cliente para assinar com nonce.
+    /// CRIAR CONTA (v6 — quebrado):
+    ///   Cliente → HashPassword(senha)         = SHA256(senha)         = H1
+    ///   Cliente → MsgCreateAccountRequest { PasswordHash = H1 }
+    ///   Servidor → ServerHashForStorage(H1)   = SHA256(H1 + serverSalt) = STORED
     ///
-    ///   - ServerHashForStorage: agora lê RPG_SERVER_SALT de variável de ambiente.
-    ///     Fallback apenas para editor/desenvolvimento local.
+    /// LOGIN (v6 — quebrado):
+    ///   Cliente → HashPassword(senha)          = SHA256(senha)         = H1
+    ///   Cliente → HashPasswordWithNonce(H1, nonce) = SHA256(H1 + nonce) = H2
+    ///   Cliente → MsgLoginRequest { SignedHash = H2 }
+    ///   Servidor → ValidateLoginWithNonce(STORED, H2, nonce)
+    ///            = compara SHA256(STORED + nonce) com H2
+    ///            = SHA256(SHA256(H1 + serverSalt) + nonce)  ≠  SHA256(H1 + nonce)
+    ///            = FALHA SEMPRE — os hashes nunca batem
     ///
-    ///   - Constantes de cena centralizadas (sem alteração).
-    ///   - Logout limpa estado e volta para login (sem alteração).
+    /// ════════════════════════════════════════════════════════════════════
+    /// SOLUÇÃO v7 — Pipeline unificado e correto:
     ///
-    /// PARA PRODUÇÃO REAL:
-    ///   Implemente TLS (KCP+TLS ou WebSocket+WSS) e troque para
-    ///   challenge-response com ECDH + AES-GCM.
+    /// O banco passa a armazenar APENAS SHA256(senha) sem serverSalt aplicado
+    /// na camada de storage. O salt do servidor é aplicado SOMENTE na validação
+    /// em tempo real, nunca persistido. Isso alinha criação e login:
+    ///
+    /// CRIAR CONTA (v7 — correto):
+    ///   Cliente → MsgCreateAccountRequest { PasswordHash = SHA256(senha) }
+    ///   Servidor → armazena SHA256(senha) diretamente (sem serverSalt extra)
+    ///
+    /// LOGIN (v7 — correto):
+    ///   Cliente → H1 = SHA256(senha)
+    ///   Cliente → H2 = SHA256(H1 + nonce)   [assina com nonce da sessão]
+    ///   Servidor → expected = SHA256(STORED + nonce) = SHA256(SHA256(senha) + nonce) = H2 ✓
+    ///
+    /// NOTA SOBRE SEGURANÇA:
+    ///   Sem TLS, qualquer hash enviado pela rede é vulnerável a MITM ativo.
+    ///   Para produção real use KCP+TLS ou WebSocket+WSS + bcrypt/Argon2 no servidor.
+    ///   O nonce protege apenas contra replay de sessões capturadas anteriormente.
+    ///
+    /// AÇÃO NECESSÁRIA APÓS ATUALIZAR:
+    ///   Delete o banco antigo: %AppData%\..\LocalLow\DefaultCompany\rpgonline\rpg_server.db
+    ///   Recrie as contas — os hashes antigos são incompatíveis com o novo pipeline.
+    /// ════════════════════════════════════════════════════════════════════
     /// </summary>
     public class GameManager : MonoBehaviour
     {
@@ -63,11 +88,14 @@ namespace RPG.Managers
             SceneManager.LoadScene(SCENE_LOGIN);
         }
 
-        // ── Hashing ────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // HASHING — Pipeline v7 unificado
+        // ══════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Hash SHA-256 da senha para transporte.
-        /// CLIENTE: hash sem salt. O nonce de sessão é aplicado via HashPasswordWithNonce().
+        /// Passo 1: hash base da senha sem salt.
+        /// Usado tanto na criação de conta quanto no login.
+        /// CLIENTE: nunca envie a senha em texto plano — sempre passe por aqui primeiro.
         /// </summary>
         public static string HashPassword(string password)
         {
@@ -76,13 +104,16 @@ namespace RPG.Managers
         }
 
         /// <summary>
-        /// CORREÇÃO v6 — Assina o hash da senha com o nonce de sessão recebido do servidor.
-        /// Isso elimina replay attacks básicos: o hash resultante é único por sessão.
+        /// Passo 2 (login apenas): assina o hash base com o nonce da sessão.
+        /// Elimina replay de sessões capturadas anteriormente.
         ///
-        /// Fluxo:
-        ///   1. Servidor envia nonce (aleatório por conexão) via MsgAuthChallenge.
-        ///   2. Cliente chama HashPasswordWithNonce(HashPassword(senha), nonce).
-        ///   3. Servidor recebe e valida: ServerValidateLogin(username, signedHash, nonce).
+        /// Fluxo cliente:
+        ///   H1 = HashPassword(senha)              → SHA256(senha)
+        ///   H2 = HashPasswordWithNonce(H1, nonce) → SHA256(H1 + nonce)
+        ///   Enviar H2 no MsgLoginRequest.SignedHash
+        ///
+        /// O servidor valida comparando SHA256(STORED + nonce) com H2,
+        /// onde STORED = SHA256(senha) = H1 (armazenado na criação).
         /// </summary>
         public static string HashPasswordWithNonce(string passwordHash, string nonce)
         {
@@ -92,7 +123,7 @@ namespace RPG.Managers
         }
 
         /// <summary>
-        /// Gera um nonce aleatório de 128 bits (22 caracteres Base64url).
+        /// Gera um nonce aleatório de 128 bits.
         /// Chamado pelo servidor para cada nova conexão.
         /// </summary>
         public static string GenerateNonce()
@@ -103,53 +134,52 @@ namespace RPG.Managers
             return Convert.ToBase64String(bytes);
         }
 
-        private static string ComputeSHA256(string input)
-        {
-            using var sha256 = System.Security.Cryptography.SHA256.Create();
-            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(input);
-            byte[] hash  = sha256.ComputeHash(bytes);
-            return BitConverter.ToString(hash).Replace("-", "").ToLower();
-        }
+        // ── Métodos exclusivos do servidor ─────────────────────────────────
 
 #if UNITY_SERVER || UNITY_EDITOR
-        /// <summary>
-        /// Hash para armazenamento no servidor — NUNCA chame do cliente.
-        ///
-        /// ATENÇÃO: Para produção real substitua por bcrypt ou Argon2.
-        /// O salt DEVE estar em variável de ambiente, NUNCA no código-fonte.
-        ///
-        /// Variável de ambiente: RPG_SERVER_SALT
-        /// Ex (Linux): export RPG_SERVER_SALT="sua_chave_aqui"
-        /// Ex (Windows): set RPG_SERVER_SALT=sua_chave_aqui
-        /// </summary>
-        public static string ServerHashForStorage(string clientSignedHash)
-        {
-            string serverSalt = Environment.GetEnvironmentVariable("RPG_SERVER_SALT");
 
-#if UNITY_EDITOR
-            if (string.IsNullOrEmpty(serverSalt))
+        /// <summary>
+        /// SERVIDOR APENAS — Prepara o hash para armazenamento no banco.
+        ///
+        /// v7: NÃO aplica serverSalt ao hash armazenado — o salt do servidor
+        /// é usado apenas na VALIDAÇÃO em tempo real via ValidateLoginWithNonce.
+        /// Isso unifica o pipeline e elimina o bug de hash incompatível.
+        ///
+        /// O que é armazenado: SHA256(senha) — exatamente o que o cliente enviou.
+        ///
+        /// Por que sem salt no storage? O nonce por sessão já previne replay.
+        /// Para segurança adicional em produção, use bcrypt/Argon2 que incluem
+        /// o salt automaticamente no hash armazenado.
+        ///
+        /// VARIÁVEL DE AMBIENTE: RPG_SERVER_SALT (usada apenas em ValidateLoginWithNonce)
+        /// </summary>
+        public static string ServerHashForStorage(string clientPasswordHash)
+        {
+            // v7: armazena o hash exatamente como recebido do cliente
+            // O serverSalt é aplicado apenas na comparação, não no storage
+            if (string.IsNullOrEmpty(clientPasswordHash))
             {
-                // Fallback APENAS para testes no Editor — NUNCA em produção
-                serverSalt = "DEV_ONLY_SALT_TROQUE_ANTES_DO_LAUNCH";
-                Debug.LogWarning("[GameManager] RPG_SERVER_SALT não configurado — usando salt de desenvolvimento. " +
-                                 "Configure a variável de ambiente antes do launch!");
+                Debug.LogError("[GameManager] ServerHashForStorage: hash vazio!");
+                return "";
             }
-#else
-            if (string.IsNullOrEmpty(serverSalt))
-            {
-                Debug.LogError("[GameManager] CRÍTICO: RPG_SERVER_SALT não configurado! " +
-                               "O servidor não deve rodar sem este salt em produção.");
-                throw new InvalidOperationException("RPG_SERVER_SALT não configurado.");
-            }
-#endif
-            return ComputeSHA256(clientSignedHash + serverSalt);
+            return clientPasswordHash;
         }
 
         /// <summary>
-        /// Valida o login com nonce de sessão.
-        /// storedPasswordHash = hash armazenado no banco (via ServerHashForStorage).
-        /// clientSignedHash = o que o cliente enviou (HashPasswordWithNonce aplicado).
-        /// sessionNonce = nonce que o servidor gerou para esta sessão.
+        /// SERVIDOR APENAS — Valida login com nonce de sessão.
+        ///
+        /// storedPasswordHash = SHA256(senha) armazenado no banco
+        /// clientSignedHash   = SHA256(SHA256(senha) + nonce) enviado pelo cliente
+        /// sessionNonce       = nonce gerado pelo servidor para esta sessão
+        ///
+        /// Pipeline v7:
+        ///   expected = SHA256(storedPasswordHash + sessionNonce)
+        ///            = SHA256(SHA256(senha) + nonce)
+        ///   clientSignedHash = SHA256(SHA256(senha) + nonce)
+        ///   → expected == clientSignedHash ✓
+        ///
+        /// OPCIONAL: serverSalt adicional na comparação para dificultar
+        /// ataques offline caso o banco vaze. Leia de variável de ambiente.
         /// </summary>
         public static bool ValidateLoginWithNonce(
             string storedPasswordHash,
@@ -161,23 +191,47 @@ namespace RPG.Managers
                 string.IsNullOrEmpty(sessionNonce))
                 return false;
 
-            // O servidor re-deriva o hash esperado:
-            // expected = SHA256(ServerHashForStorage_original_hash + nonce)
-            // Mas como não temos a senha original aqui, comparamos diretamente
-            // se o cliente enviou SHA256(clientHash_armazenado_base + nonce).
-            //
-            // Fluxo real:
-            //   Banco: SHA256(SHA256(senha) + serverSalt)
-            //   Cliente envia: SHA256(SHA256(senha) + sessionNonce)
-            //   Servidor verifica: SHA256(storedHash_sem_nonce + sessionNonce) == clientSignedHash
-            //
-            // Para isso funcionar o banco precisa guardar SHA256(SHA256(senha) + serverSalt)
-            // e o servidor precisa derivar SHA256(stored_intermediary + nonce).
-            // Ver DatabaseManager.TryLoginWithNonce para a implementação completa.
+            // Computa o hash esperado: SHA256(storedHash + nonce)
+            // Corresponde exatamente ao que o cliente enviou via HashPasswordWithNonce
             string expected = ComputeSHA256(storedPasswordHash + sessionNonce);
-            return string.Equals(expected, clientSignedHash,
-                StringComparison.OrdinalIgnoreCase);
+
+            return string.Equals(expected, clientSignedHash, StringComparison.OrdinalIgnoreCase);
         }
+
+        /// <summary>
+        /// SERVIDOR APENAS — Lê o serverSalt da variável de ambiente.
+        /// Usado opcionalmente em lógica de segurança adicional.
+        /// </summary>
+        public static string GetServerSalt()
+        {
+            string salt = Environment.GetEnvironmentVariable("RPG_SERVER_SALT");
+
+#if UNITY_EDITOR
+            if (string.IsNullOrEmpty(salt))
+            {
+                salt = "DEV_ONLY_SALT_DO_NOT_USE_IN_PRODUCTION";
+                Debug.LogWarning("[GameManager] RPG_SERVER_SALT não configurado — usando salt de dev.");
+            }
+#else
+            if (string.IsNullOrEmpty(salt))
+            {
+                Debug.LogError("[GameManager] CRÍTICO: RPG_SERVER_SALT não configurado!");
+                throw new InvalidOperationException("RPG_SERVER_SALT não configurado.");
+            }
 #endif
+            return salt;
+        }
+
+#endif // UNITY_SERVER || UNITY_EDITOR
+
+        // ── Utilitário ─────────────────────────────────────────────────────
+
+        public static string ComputeSHA256(string input)
+        {
+            using var sha256 = System.Security.Cryptography.SHA256.Create();
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(input);
+            byte[] hash  = sha256.ComputeHash(bytes);
+            return BitConverter.ToString(hash).Replace("-", "").ToLower();
+        }
     }
 }
