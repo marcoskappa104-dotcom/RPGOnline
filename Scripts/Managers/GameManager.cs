@@ -124,7 +124,7 @@ namespace RPG.Managers
         /// </summary>
         public static string ServerHashForStorage(string clientSignedHash)
         {
-            string serverSalt = Environment.GetEnvironmentVariable("RPGOnline_S3cr3t_2024_xK9!");
+            string serverSalt = Environment.GetEnvironmentVariable("RPG_SERVER_SALT");
 
 #if UNITY_EDITOR
             if (string.IsNullOrEmpty(serverSalt))
