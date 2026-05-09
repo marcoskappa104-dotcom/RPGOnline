@@ -6,17 +6,21 @@ using TMPro;
 namespace RPG.UI
 {
     /// <summary>
-    /// FloatingTextManager v3
+    /// FloatingTextManager v4
     ///
-    /// CORREÇÃO v3:
-    ///   Camera.main era chamada TODO frame dentro da coroutine ShowCoroutine,
-    ///   para CADA texto flutuante ativo ao mesmo tempo. Com 10 textos simultâneos
-    ///   e 60fps = 600 buscas por segundo.
+    /// CORREÇÕES v4:
     ///
-    ///   Solução: câmera buscada UMA VEZ em Show() e passada para a coroutine.
-    ///   Cache global atualizado apenas quando a câmera for null (troca de cena).
+    ///   BUG-17 — Crashava em servidor dedicado (Application.isBatchMode):
+    ///     O servidor dedicado não tem câmera nem UI. Se o FloatingTextManager
+    ///     fosse instanciado no servidor, Show() tentava Camera.main = null
+    ///     e crashava silenciosamente.
+    ///     SOLUÇÃO: Guard no Awake() — em batch mode (servidor dedicado),
+    ///     o componente é desativado imediatamente. Show() também tem guard.
     ///
-    ///   Adicionado: proteção contra pool vazio quando poolSize = 0.
+    ///   Todas as correções v3 mantidas:
+    ///     - Câmera cacheada globalmente (não busca todo frame).
+    ///     - Pool com tamanho mínimo de 1.
+    ///     - Câmera passada como parâmetro para ShowCoroutine (sem GC por frame).
     /// </summary>
     public class FloatingTextManager : MonoBehaviour
     {
@@ -28,21 +32,29 @@ namespace RPG.UI
         [SerializeField] private float      lifetime  = 1.2f;
 
         private Queue<GameObject> _pool = new Queue<GameObject>();
-
-        // CORREÇÃO: câmera cacheada globalmente no manager
-        private Camera _cachedCamera;
+        private Camera            _cachedCamera;
+        private bool              _isServerOnly = false;
 
         private void Awake()
         {
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
             Instance = this;
             DontDestroyOnLoad(gameObject);
+
+            // BUG-17: servidor dedicado não tem UI — desativa tudo
+            if (Application.isBatchMode)
+            {
+                _isServerOnly = true;
+                Debug.Log("[FloatingTextManager] Servidor dedicado detectado — UI desabilitada.");
+                return;
+            }
+
             PrewarmPool();
         }
 
         private void Start()
         {
-            // Cache inicial — evita busca na primeira chamada de Show()
+            if (_isServerOnly) return;
             _cachedCamera = Camera.main;
         }
 
@@ -54,7 +66,8 @@ namespace RPG.UI
                 return;
             }
 
-            for (int i = 0; i < Mathf.Max(poolSize, 1); i++)
+            int size = Mathf.Max(poolSize, 1);
+            for (int i = 0; i < size; i++)
             {
                 var obj = Instantiate(floatingTextPrefab, transform);
                 obj.SetActive(false);
@@ -64,9 +77,10 @@ namespace RPG.UI
 
         public void Show(string text, Vector3 worldPos, Color color)
         {
+            // BUG-17: guard duplo — servidor dedicado e prefab não configurado
+            if (_isServerOnly || Application.isBatchMode) return;
             if (floatingTextPrefab == null) return;
 
-            // CORREÇÃO: câmera buscada aqui (uma vez por Show), não dentro da coroutine
             if (_cachedCamera == null) _cachedCamera = Camera.main;
 
             StartCoroutine(ShowCoroutine(text, worldPos, color, _cachedCamera));
@@ -90,10 +104,6 @@ namespace RPG.UI
                 tmp.text  = text;
                 tmp.color = color;
             }
-            else
-            {
-                Debug.LogWarning("[FloatingTextManager] Prefab não tem TextMeshPro (3D)!");
-            }
 
             float   elapsed  = 0f;
             Vector3 startPos = obj.transform.position;
@@ -112,7 +122,6 @@ namespace RPG.UI
                     tmp.color = c;
                 }
 
-                // CORREÇÃO: usa 'cam' (parâmetro da coroutine), não Camera.main
                 if (cam != null)
                 {
                     Vector3 dir = obj.transform.position - cam.transform.position;
