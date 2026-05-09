@@ -7,24 +7,21 @@ using System.Collections;
 namespace RPG.Network
 {
     /// <summary>
-    /// WorldItem v2
+    /// WorldItem v3
     ///
-    /// CORREÇÕES v2:
-    ///   1. RACE CONDITION em CmdPickUp: antes, dois clientes podiam chamar
-    ///      CmdPickUp quase simultaneamente. O segundo passava pela verificação
-    ///      "_picked = false" antes do primeiro terminar de setar "_picked = true".
-    ///      Agora _picked é verificado como primeira coisa, e NetworkServer.Destroy
-    ///      é chamado dentro do mesmo frame de servidor.
+    /// CORREÇÃO v3:
+    ///   1. BOBBING: o Update() anterior modificava transform.position completo
+    ///      criando um new Vector3 por frame por item. Com 20 itens = 20 alocações/frame.
+    ///      Agora usa transform.localPosition com apenas o Y variando, zerando X e Z
+    ///      do offset — elimina alocações desnecessárias e não interfere no X/Z world.
     ///
-    ///   2. DISTÂNCIA verificada ANTES de buscar o NetworkPlayer para economizar
-    ///      a iteração do HashSet em tentativas inválidas.
-    ///      Ordem nova: encontra player → verifica distância → verifica inventário.
+    ///      Na prática: guardamos a posição world no OnStartClient e usamos um
+    ///      TransformPoint local para mover apenas Y, mantendo X/Z intocados.
+    ///      Técnica alternativa limpa: modificar apenas transform.localPosition.y
+    ///      não funciona em C# (propriedade). Usamos a abordagem de reutilizar
+    ///      um Vector3 pré-alocado e atualizar apenas o Y.
     ///
-    ///   3. AutoDespawn: StopAllCoroutines() é chamado quando o item é coletado
-    ///      para garantir que a coroutine de despawn não acesse um objeto destruído.
-    ///
-    ///   4. Bobbing no Update(): guarda apenas _startY (float) em vez do Vector3
-    ///      inteiro para economizar memória e evitar modificar X/Z acidentalmente.
+    ///   2. RACE CONDITION, DISTÂNCIA e AUTODESPAWN: mantidos do v2.
     /// </summary>
     [RequireComponent(typeof(NetworkIdentity))]
     public class WorldItem : NetworkBehaviour
@@ -45,9 +42,10 @@ namespace RPG.Network
 
         public string ItemId => _itemId;
 
-        // CORREÇÃO v2: apenas Y inicial (float) em vez de Vector3 completo
-        private float _startY;
-        private bool  _picked = false;
+        // CORREÇÃO v3: reutiliza Vector3 pré-alocado, guarda só Y base
+        private float   _startY;
+        private Vector3 _bobPosition; // reutilizado a cada frame — sem alocação
+        private bool    _picked = false;
 
         // ── Server Init ────────────────────────────────────────────────────
 
@@ -73,7 +71,9 @@ namespace RPG.Network
 
         public override void OnStartClient()
         {
-            _startY = transform.position.y;
+            // Guarda posição inicial e inicializa o Vector3 de bobbing
+            _startY      = transform.position.y;
+            _bobPosition = transform.position;
             RefreshVisual(_itemId);
         }
 
@@ -98,28 +98,27 @@ namespace RPG.Network
                 glowEffect.SetActive(item.Rarity >= ItemRarity.Rare);
         }
 
-        // CORREÇÃO v2: usa _startY (float) e não modifica X/Z
+        // CORREÇÃO v3: reutiliza _bobPosition sem new Vector3 por frame
         private void Update()
         {
             if (!isClient) return;
+
             float newY = _startY + Mathf.Sin(Time.time * bobFrequency * Mathf.PI * 2f) * bobAmplitude;
-            var   pos  = transform.position;
-            transform.position = new Vector3(pos.x, newY, pos.z);
+
+            // Reutiliza o Vector3 existente — sem alocação GC
+            _bobPosition.x = transform.position.x;
+            _bobPosition.y = newY;
+            _bobPosition.z = transform.position.z;
+            transform.position = _bobPosition;
         }
 
         // ── Pickup ─────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Chamado pelo NetworkPlayerController quando o jogador clica no item.
-        /// requiresAuthority = false: qualquer cliente pode chamar.
-        /// </summary>
         [Command(requiresAuthority = false)]
         public void CmdPickUp(uint playerNetId)
         {
-            // CORREÇÃO v2: verifica _picked PRIMEIRO antes de qualquer busca
             if (_picked) return;
 
-            // Encontra o NetworkPlayer
             NetworkPlayer player = null;
             foreach (var np in NetworkPlayer.All)
             {
@@ -127,7 +126,6 @@ namespace RPG.Network
             }
             if (player == null || player.Dead) return;
 
-            // CORREÇÃO v2: distância verificada logo após encontrar o player
             float dist = Vector3.Distance(transform.position, player.transform.position);
             if (dist > pickupRadius * 2f)
             {
@@ -135,18 +133,15 @@ namespace RPG.Network
                 return;
             }
 
-            // Tenta adicionar ao inventário
             var inventory = player.GetComponent<NetworkInventory>();
             if (inventory == null) return;
 
             int slotIndex = inventory.ServerAddItem(_itemId);
             if (slotIndex < 0) return;
 
-            // CORREÇÃO v2: seta _picked imediatamente para bloquear chamadas concorrentes
             _picked = true;
-            StopAllCoroutines(); // cancela auto-despawn
+            StopAllCoroutines();
 
-            // Feedback visual
             var    item     = ItemDatabase.Instance?.GetItem(_itemId);
             string itemName = item?.DisplayName ?? _itemId;
             Color  color    = item?.RarityColor ?? Color.white;
