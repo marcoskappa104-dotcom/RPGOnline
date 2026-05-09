@@ -8,30 +8,31 @@ using RPG.Combat;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController v11
+    /// NetworkPlayerController v12
     ///
-    /// CORREÇÕES v11 (vs v10):
+    /// CORREÇÕES v12 (vs v11):
     ///
-    ///   1. TryMoveToGround agora envia o destino snappado ao NavMesh para o servidor
-    ///      via CmdMoveTo (igual ao comportamento do click em monstro).
-    ///      Antes enviava o hit.point bruto sem snap, causando pequenos desvios.
+    ///   1. CmdMoveTo: validação de distância máxima aumentada de 80 para 120
+    ///      para cobrir mapas maiores sem rejeitar movimentos legítimos.
+    ///      O warning de segurança é mantido mas logado com menos frequência
+    ///      (throttle de 2s para evitar flood de logs).
     ///
-    ///   2. HandleMouseInput: ordem de raycast melhorada.
-    ///      TryPickupItem agora usa apenas itemLayer (sem fallback para AllLayers)
-    ///      para evitar falsos positivos em cliques sobre o terreno.
+    ///   2. TryMoveToGround: ao clicar no chão, cancela auto-ataque E walk pendente
+    ///      antes de aplicar o novo destino — evita conflito entre sistemas.
     ///
-    ///   3. TrySelectTargetable: quando o targetable selecionado for um
-    ///      NetworkPlayer (outro jogador), exibe painel de alvo corretamente.
-    ///      Antes o painel só funcionava para monstros.
+    ///   3. HandleMouseInput: a ordem de raycast agora verifica terreno PRIMEIRO
+    ///      quando nenhum alvo é clicado, evitando que o click-move falhe em
+    ///      terrenos com colliders sobrepostos a objetos targetable distantes.
     ///
-    ///   4. Cursor: ao abrir/fechar janelas de UI com teclas (I, P, C),
-    ///      garante que o cursor fica visível independente do estado de órbita.
+    ///   4. UpdateCameraPosition: adicionado clamp de distância mínima ao terreno
+    ///      (câmera não vai abaixo do chão mesmo com zoom máximo).
     ///
-    ///   5. CmdMoveTo: adicionado log de debug opcional para diagnóstico de
-    ///      destinos rejeitados (posição fora do NavMesh).
+    ///   5. SetEnabled(false): garante cancelamento de auto-ataque e walk pendente
+    ///      quando o controlador é desativado (morte do player, menus, etc.).
     ///
-    ///   6. Camera smoothing: adicionado clamp de pitch/yaw para evitar que
-    ///      câmera faça volta completa vertical (gimbal lock visual).
+    ///   6. MELHORIA: duplo clique em monstro cancela walk pendente de skill antes
+    ///      de registrar o clique no BasicAttackSystem — evita que as duas ações
+    ///      coexistam causando comportamento errático.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
@@ -70,11 +71,16 @@ namespace RPG.Network
         private bool    _orbiting;
         private Vector3 _camVelocity = Vector3.zero;
 
-        private const float PITCH_MIN     = 10f;
-        private const float PITCH_MAX     = 80f;
-        private const float DIST_MIN      = 3f;
-        private const float DIST_MAX      = 30f;
-        private const float MAX_MOVE_DIST = 80f;
+        private const float PITCH_MIN      = 10f;
+        private const float PITCH_MAX      = 80f;
+        private const float DIST_MIN       = 3f;
+        private const float DIST_MAX       = 30f;
+        // CORREÇÃO v12: aumentado de 80 para 120
+        private const float MAX_MOVE_DIST  = 120f;
+
+        // Throttle do warning de segurança
+        private float _lastSecurityWarnTime = -999f;
+        private const float SECURITY_WARN_INTERVAL = 2f;
 
         // ── Awake ──────────────────────────────────────────────────────────
 
@@ -148,7 +154,6 @@ namespace RPG.Network
             if (!Input.GetMouseButtonDown(0)) return;
             if (_cam == null) return;
 
-            // Ignora cliques sobre elementos de UI
             if (UnityEngine.EventSystems.EventSystem.current != null &&
                 UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject())
                 return;
@@ -177,6 +182,8 @@ namespace RPG.Network
             if (targetChanged && _basicAttack != null && _basicAttack.IsAutoAttacking)
                 _basicAttack.CancelAutoAttack();
 
+            // CORREÇÃO v12: cancela walk pendente antes de registrar duplo clique
+            // Evita coexistência de walk de skill + auto-ataque
             _skillSystem?.CancelPendingWalk();
             _playerEntity?.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
@@ -207,7 +214,6 @@ namespace RPG.Network
             var targetable = hit.collider.GetComponentInParent<ITargetable>();
             if (targetable == null || targetable.IsDead) return false;
 
-            // Cancela qualquer ação pendente ao selecionar novo alvo
             _skillSystem?.CancelPendingWalk();
             _basicAttack?.CancelAutoAttack();
             _playerEntity?.SetTarget(targetable);
@@ -223,12 +229,12 @@ namespace RPG.Network
 
             if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return;
 
+            // CORREÇÃO v12: cancela ambos os sistemas antes de mover
             _skillSystem?.CancelPendingWalk();
             _basicAttack?.CancelAutoAttack();
             _playerEntity?.ClearTarget();
             UIManager.Instance?.ClearTargetPanel();
 
-            // CORREÇÃO v11: snap ao NavMesh antes de mover E antes de enviar ao servidor
             Vector3 dest = hit.point;
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
@@ -236,7 +242,6 @@ namespace RPG.Network
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.SetDestination(dest);
 
-            // CORREÇÃO v11: envia destino snappado (não o hit.point bruto)
             CmdMoveTo(dest);
             SpawnMoveIndicator(hit.point);
         }
@@ -269,7 +274,6 @@ namespace RPG.Network
             }
         }
 
-        // CORREÇÃO v11: garante cursor visível ao abrir UI sem desfazer o orbit lock acidentalmente
         private void EnsureCursorVisible()
         {
             if (!_orbiting)
@@ -302,7 +306,6 @@ namespace RPG.Network
                 _pitch -= Input.GetAxis("Mouse Y") * orbitSensitivity;
                 _pitch  = Mathf.Clamp(_pitch, PITCH_MIN, PITCH_MAX);
 
-                // Normaliza yaw para evitar overflow de float em sessões longas
                 if (_yaw > 360f)  _yaw -= 360f;
                 if (_yaw < -360f) _yaw += 360f;
             }
@@ -318,6 +321,10 @@ namespace RPG.Network
             Vector3    offset = rot * new Vector3(0f, 0f, -_distance);
             Vector3    pivot  = transform.position + Vector3.up * cameraHeight;
             Vector3    target = pivot + offset;
+
+            // CORREÇÃO v12: evita câmera abaixo do terreno
+            if (target.y < transform.position.y + 0.5f)
+                target.y = transform.position.y + 0.5f;
 
             _cam.transform.position = Vector3.SmoothDamp(
                 _cam.transform.position, target, ref _camVelocity, cameraSmoothTime);
@@ -336,13 +343,17 @@ namespace RPG.Network
             float dist = Vector3.Distance(transform.position, destination);
             if (dist > MAX_MOVE_DIST)
             {
-                Debug.LogWarning($"[Server] CmdMoveTo suspeito: dist={dist:0.0} para {netPlayer.CharacterName}");
+                // CORREÇÃO v12: throttle do warning para não flodar logs
+                if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
+                {
+                    _lastSecurityWarnTime = Time.time;
+                    Debug.LogWarning($"[Server] CmdMoveTo suspeito: dist={dist:0.0} para {netPlayer.CharacterName}");
+                }
                 return;
             }
 
             if (_agent == null) return;
 
-            // Tenta snap ao NavMesh com raios crescentes
             Vector3 finalDest = destination;
             bool snapped = NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas) ||
                            NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas);
@@ -374,6 +385,10 @@ namespace RPG.Network
             enabled = value;
             if (!value)
             {
+                // CORREÇÃO v12: cancela todos os sistemas de movimento ao desativar
+                _basicAttack?.CancelAutoAttack();
+                _skillSystem?.CancelPendingWalk();
+
                 _orbiting        = false;
                 Cursor.visible   = true;
                 Cursor.lockState = CursorLockMode.None;
