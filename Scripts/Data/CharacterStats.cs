@@ -30,6 +30,13 @@ namespace RPG.Data
         public int STR, AGI, VIT, DEX, INT, LUK;
     }
 
+    /// <summary>
+    /// DerivedStats v2
+    /// CORREÇÃO: classe → struct-like imutável via cópia.
+    /// Mantida como classe por compatibilidade Mirror/SyncVar,
+    /// mas métodos de mutação direta (Stats.MaxHP = x) foram substituídos
+    /// por SetMaxHP/SetMaxMP no PlayerEntity para controle centralizado.
+    /// </summary>
     [Serializable]
     public class DerivedStats
     {
@@ -56,21 +63,22 @@ namespace RPG.Data
         public float CRIT;
         public float CritDMG;
 
-        // Regen por tick (usado pelo ServerRegenLoop — intervalo de 5s)
-        /// <summary>HP recuperado por tick de regen (5s). Baseado em VIT e nível.</summary>
+        // Regen por tick (ServerRegenLoop — intervalo de 5s)
         public float HPRegen;
-        /// <summary>MP recuperado por tick de regen (5s). Baseado em INT e nível.</summary>
         public float MPRegen;
 
         // Avançados
         public float Penetration;
         public float DamageReduction;
 
-        // Resistências (0-100%)
+        // Resistências (0–100%) — agora populadas pelo StatsCalculator
         public float ResistFire;
         public float ResistIce;
         public float ResistPoison;
         public float ResistLightning;
+
+        /// <summary>Cria uma cópia rasa — evita mutações acidentais do objeto original.</summary>
+        public DerivedStats Clone() => (DerivedStats)MemberwiseClone();
     }
 
     [Serializable]
@@ -79,6 +87,8 @@ namespace RPG.Data
         public int   STR, AGI, VIT, DEX, INT, LUK;
         public float ATK, DEF, MATK, MDEF;
         public float HPBonus, MPBonus;
+        // Resistências via equipamento
+        public float ResistFire, ResistIce, ResistPoison, ResistLightning;
     }
 
     [Serializable]
@@ -91,10 +101,10 @@ namespace RPG.Data
 
     public static class StatsCalculator
     {
-        public static readonly int   BASE_HP        = 100;
-        public static readonly int   BASE_MP        = 50;
-        public static readonly float BASE_ASPD      = 0.5f;
-        public static readonly float BASE_MOVESPEED = 4.0f;
+        public const int   BASE_HP        = 100;
+        public const int   BASE_MP        = 50;
+        public const float BASE_ASPD      = 0.5f;
+        public const float BASE_MOVESPEED = 4.0f;
 
         public static RaceBonus GetRaceBonus(CharacterRace race)
         {
@@ -111,6 +121,7 @@ namespace RPG.Data
 
         /// <summary>
         /// Calcula os stats derivados. Sem side-effects nos objetos passados.
+        /// THREAD-SAFE: não usa UnityEngine.Random (apenas aritmética pura).
         /// </summary>
         public static DerivedStats Calculate(
             BaseAttributes   baseAttr,
@@ -130,6 +141,14 @@ namespace RPG.Data
 
             var raceBonus = GetRaceBonus(race);
 
+            // Garante que atributos alocados não sejam negativos
+            allocSTR = Math.Max(0, allocSTR);
+            allocAGI = Math.Max(0, allocAGI);
+            allocVIT = Math.Max(0, allocVIT);
+            allocDEX = Math.Max(0, allocDEX);
+            allocINT = Math.Max(0, allocINT);
+            allocLUK = Math.Max(0, allocLUK);
+
             float STR = baseAttr.STR + raceBonus.STR + allocSTR + equip.STR + buff.STR;
             float AGI = baseAttr.AGI + raceBonus.AGI + allocAGI + equip.AGI + buff.AGI;
             float VIT = baseAttr.VIT + raceBonus.VIT + allocVIT + equip.VIT + buff.VIT;
@@ -137,10 +156,22 @@ namespace RPG.Data
             float INT = baseAttr.INT + raceBonus.INT + allocINT + equip.INT + buff.INT;
             float LUK = baseAttr.LUK + raceBonus.LUK + allocLUK + equip.LUK + buff.LUK;
 
+            // Garante mínimo de 1 em cada atributo
+            STR = Math.Max(1f, STR);
+            AGI = Math.Max(1f, AGI);
+            VIT = Math.Max(1f, VIT);
+            DEX = Math.Max(1f, DEX);
+            INT = Math.Max(1f, INT);
+            LUK = Math.Max(1f, LUK);
+
             var s = new DerivedStats();
 
             s.MaxHP = BASE_HP + (VIT * 20f) + (STR * 5f) + (level * 10f) + equip.HPBonus;
             s.MaxMP = BASE_MP + (INT * 15f) + (DEX * 3f) + (level * 5f)  + equip.MPBonus;
+
+            // Garante mínimo de 1 em HP/MP
+            s.MaxHP = Math.Max(1f, s.MaxHP);
+            s.MaxMP = Math.Max(1f, s.MaxMP);
 
             s.ATK  = ((STR * 1.5f) + (DEX * 0.5f) + level + equip.ATK)  * buff.ATKMultiplier;
             s.MATK = ((INT * 2.0f) + (DEX * 0.5f) + level + equip.MATK) * buff.ATKMultiplier;
@@ -157,46 +188,67 @@ namespace RPG.Data
             s.CRIT    = LUK * 0.3f;
             s.CritDMG = 1.5f;
 
-            // MELHORIA v2: HPRegen e MPRegen expressos em valor por tick de 5s
-            // (compatível com NetworkPlayer v15 ServerRegenLoop que regenera a cada 5s)
-            s.HPRegen  = (VIT * 0.5f) + (level * 0.2f);  // HP por tick
-            s.MPRegen  = (INT * 0.5f) + (level * 0.2f);  // MP por tick
+            // HP/MP regen por tick de 5s
+            s.HPRegen  = (VIT * 0.5f) + (level * 0.2f);
+            s.MPRegen  = (INT * 0.5f) + (level * 0.2f);
 
             s.CastSpeed = (DEX * 0.5f) + (INT * 0.3f);
 
             s.Penetration     = STR * 0.2f;
             s.DamageReduction = VIT * 0.1f;
 
+            // Resistências via equipamento (clampadas 0–75% para evitar imunidade total)
+            s.ResistFire      = Mathf.Clamp(equip.ResistFire,      0f, 75f);
+            s.ResistIce       = Mathf.Clamp(equip.ResistIce,       0f, 75f);
+            s.ResistPoison    = Mathf.Clamp(equip.ResistPoison,    0f, 75f);
+            s.ResistLightning = Mathf.Clamp(equip.ResistLightning, 0f, 75f);
+
             return s;
         }
 
         // ── Fórmulas de dano ──────────────────────────────────────────────
 
-        public static float CalculatePhysicalDamage(float atk, float def, bool isCrit, float critDmgMult = 1.5f)
+        public static float CalculatePhysicalDamage(
+            float atk, float def, bool isCrit, float critDmgMult = 1.5f)
         {
             float reduction = def / (def + 100f);
             float raw       = atk * (1f - reduction);
-            raw             = Mathf.Max(1f, raw);
+            raw             = Math.Max(1f, raw);
             if (isCrit) raw *= critDmgMult;
             return Mathf.Floor(raw);
         }
 
-        public static float CalculateMagicDamage(float matk, float mdef, bool isCrit, float critDmgMult = 1.5f)
+        public static float CalculateMagicDamage(
+            float matk, float mdef, bool isCrit, float critDmgMult = 1.5f)
         {
             float reduction = mdef / (mdef + 100f);
             float raw       = matk * (1f - reduction);
-            raw             = Mathf.Max(1f, raw);
+            raw             = Math.Max(1f, raw);
             if (isCrit) raw *= critDmgMult;
             return Mathf.Floor(raw);
         }
 
-        public static bool RollCrit(float critChance)
-            => UnityEngine.Random.Range(0f, 100f) < critChance;
+        /// <summary>
+        /// THREAD-SAFE: aceita um System.Random passado pelo chamador.
+        /// Para uso no servidor: passe um System.Random instanciado lá.
+        /// Para uso no cliente (Unity main thread): passe null para usar UnityEngine.Random.
+        /// </summary>
+        public static bool RollCrit(float critChance, System.Random rng = null)
+        {
+            float roll = rng != null
+                ? (float)(rng.NextDouble() * 100.0)
+                : UnityEngine.Random.Range(0f, 100f);
+            return roll < critChance;
+        }
 
-        public static bool RollHit(float hit, float flee)
+        /// <summary>THREAD-SAFE: mesma lógica de RollCrit.</summary>
+        public static bool RollHit(float hit, float flee, System.Random rng = null)
         {
             float hitChance = Mathf.Clamp(hit / (hit + flee) * 100f, 5f, 95f);
-            return UnityEngine.Random.Range(0f, 100f) < hitChance;
+            float roll = rng != null
+                ? (float)(rng.NextDouble() * 100.0)
+                : UnityEngine.Random.Range(0f, 100f);
+            return roll < hitChance;
         }
     }
 }
