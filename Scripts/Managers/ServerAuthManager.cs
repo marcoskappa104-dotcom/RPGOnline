@@ -8,22 +8,23 @@ using System.Collections;
 namespace RPG.Network
 {
     /// <summary>
-    /// ServerAuthManager v6
+    /// ServerAuthManager v7
     ///
-    /// CORREÇÕES v6:
-    ///   - RATE LIMITING: máximo de LOGIN_MAX_ATTEMPTS tentativas de login por conexão.
-    ///     Após atingir o limite, a conexão é encerrada pelo servidor.
+    /// CORREÇÕES v7:
     ///
-    ///   - NONCE CHALLENGE: ao se conectar, o servidor envia MsgAuthChallenge com
-    ///     um nonce único. O cliente usa o nonce para assinar a senha antes de enviar.
-    ///     Isso elimina replay attacks básicos sem exigir TLS.
+    ///   ALINHAMENTO COM PIPELINE v9:
+    ///     TryLoginWithSignedHash agora funciona porque o banco armazena SHA256(senha)
+    ///     e ValidateLoginWithNonce calcula SHA256(SHA256(senha)+nonce) corretamente.
+    ///     Nenhuma mudança de lógica necessária aqui — o bug estava em GameManager/DatabaseManager.
     ///
-    ///   - SESSION TTL: sessões inativas por SESSION_TTL_SECONDS são limpas
-    ///     automaticamente por uma coroutine no servidor para evitar memory leak.
+    ///   MELHORIA — logs de debug detalhados no fluxo de login:
+    ///     Agora é possível rastrear exatamente onde o login falha sem modificar o código.
+    ///     Ative DEBUG_AUTH no Inspector ou via define para ver os detalhes.
     ///
-    ///   - Validação de login via GameManager.ValidateLoginWithNonce.
+    ///   MELHORIA — OnCreateAccountRequest agora retorna erro apropriado quando
+    ///     username ou hash são vazios, em vez de passar null para TryCreateAccount.
     ///
-    ///   - Todas as correções v5 mantidas (SQLite, ownership check, etc).
+    ///   Todas as correções v6 mantidas (rate limiting, nonce, session TTL, cleanup).
     /// </summary>
     public class ServerAuthManager : MonoBehaviour
     {
@@ -32,6 +33,10 @@ namespace RPG.Network
         // ── Configuração de segurança ──────────────────────────────────────
         private const int   LOGIN_MAX_ATTEMPTS  = 5;
         private const float SESSION_TTL_SECONDS = 300f; // 5 minutos sem atividade
+
+        [Header("Debug")]
+        [Tooltip("Ativa logs detalhados do fluxo de autenticação. DESATIVE em produção.")]
+        [SerializeField] private bool debugAuth = false;
 
         private enum ConnState { Unauthenticated, Authenticated, InGame }
 
@@ -77,11 +82,11 @@ namespace RPG.Network
         public void OnServerConnect(NetworkConnectionToClient conn)
         {
             var session = new ConnData();
-            // CORREÇÃO v6: gera nonce e envia challenge imediatamente
             session.SessionNonce = GameManager.GenerateNonce();
             _sessions[conn.connectionId] = session;
 
             conn.Send(new MsgAuthChallenge { Nonce = session.SessionNonce });
+            LogAuth($"Nova conexão: {conn.connectionId} | Nonce: {session.SessionNonce}");
             Debug.Log($"[ServerAuth] Nova conexão: {conn.connectionId} | Nonce enviado.");
         }
 
@@ -108,23 +113,39 @@ namespace RPG.Network
                 return;
             }
 
-            // CORREÇÃO v6: rate limiting por conexão
+            // Rate limiting por conexão
             session.LoginAttempts++;
             if (session.LoginAttempts > LOGIN_MAX_ATTEMPTS)
             {
-                Debug.LogWarning($"[ServerAuth] SECURITY: {conn.connectionId} excedeu tentativas de login ({LOGIN_MAX_ATTEMPTS}). Desconectando.");
-                conn.Send(new MsgLoginResponse { Success = false, Error = "Muitas tentativas. Tente novamente mais tarde." });
+                Debug.LogWarning($"[ServerAuth] SECURITY: conn:{conn.connectionId} excedeu tentativas ({LOGIN_MAX_ATTEMPTS}). Desconectando.");
+                conn.Send(new MsgLoginResponse { Success = false, Error = "Muitas tentativas. Tente mais tarde." });
                 conn.Disconnect();
                 return;
             }
 
-            // CORREÇÃO v6: valida com nonce da sessão
+            // Validação de entrada
+            if (string.IsNullOrWhiteSpace(msg.Username) || string.IsNullOrWhiteSpace(msg.SignedHash))
+            {
+                conn.Send(new MsgLoginResponse { Success = false, Error = "Dados de login inválidos." });
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(session.SessionNonce))
+            {
+                Debug.LogError($"[ServerAuth] SessionNonce vazio para conn:{conn.connectionId}! Isso não deveria acontecer.");
+                conn.Send(new MsgLoginResponse { Success = false, Error = "Erro de sessão. Reconecte." });
+                return;
+            }
+
+            LogAuth($"Login attempt: user='{msg.Username}' nonce='{session.SessionNonce}' signedHash='{msg.SignedHash}'");
+
             var account = DatabaseManager.Instance?.TryLoginWithSignedHash(
                 msg.Username, msg.SignedHash, session.SessionNonce);
 
             if (account == null)
             {
                 string attempts = $"({session.LoginAttempts}/{LOGIN_MAX_ATTEMPTS})";
+                LogAuth($"Login falhou para '{msg.Username}' {attempts}");
                 conn.Send(new MsgLoginResponse { Success = false, Error = $"Usuário ou senha incorretos. {attempts}" });
                 return;
             }
@@ -132,7 +153,7 @@ namespace RPG.Network
             session.State            = ConnState.Authenticated;
             session.Username         = account.Username;
             session.CachedAccount    = account;
-            session.LoginAttempts    = 0; // reseta tentativas após sucesso
+            session.LoginAttempts    = 0;
             session.LastActivityTime = Time.time;
 
             Debug.Log($"[ServerAuth] Login OK: {account.Username}");
@@ -144,6 +165,18 @@ namespace RPG.Network
 
         private void OnCreateAccountRequest(NetworkConnectionToClient conn, MsgCreateAccountRequest msg)
         {
+            // Validação de entrada antes de passar para o banco
+            if (string.IsNullOrWhiteSpace(msg.Username))
+            {
+                conn.Send(new MsgCreateAccountResponse { Success = false, Error = "Username inválido." });
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(msg.PasswordHash))
+            {
+                conn.Send(new MsgCreateAccountResponse { Success = false, Error = "Senha inválida." });
+                return;
+            }
+
             var error = DatabaseManager.Instance?.TryCreateAccount(msg.Username, msg.PasswordHash);
             if (error != null)
             {
@@ -227,7 +260,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Carrega personagem verificando ownership em uma única query
             var charData = DatabaseManager.Instance?.LoadCharacterForAccount(
                 msg.CharacterId, session.Username);
 
@@ -267,6 +299,11 @@ namespace RPG.Network
         private static void UpdateActivity(ConnData session)
             => session.LastActivityTime = Time.time;
 
+        private void LogAuth(string msg)
+        {
+            if (debugAuth) Debug.Log($"[ServerAuth-DEBUG] {msg}");
+        }
+
         // ── Limpeza de sessões expiradas ───────────────────────────────────
 
         private IEnumerator CleanupExpiredSessions()
@@ -279,7 +316,6 @@ namespace RPG.Network
                 var expired = new List<int>();
                 foreach (var kv in _sessions)
                 {
-                    // Só limpa sessões não autenticadas antigas (evitar limpar jogadores em jogo)
                     if (kv.Value.State == ConnState.Unauthenticated &&
                         Time.time - kv.Value.LastActivityTime > SESSION_TTL_SECONDS)
                     {
