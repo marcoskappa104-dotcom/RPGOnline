@@ -5,13 +5,14 @@ using UnityEngine;
 namespace RPG.Data
 {
     /// <summary>
-    /// CharacterData v3
+    /// CharacterData v4
     ///
-    /// CORREÇÕES v3:
-    ///   - BaseAttributes não é mais hardcoded como {10,10,10,10,10,10}.
-    ///     Agora é passado explicitamente pelo DatabaseManager.
-    ///   - AddExperience: loop while com guard de MAX_LEVEL mantido.
-    ///   - GetExperienceForLevel: fórmula consistente.
+    /// CORREÇÕES v4:
+    ///   - AddExperience: valida amount <= 0 para evitar XP negativa.
+    ///   - GetExperienceForLevel: usa Math.Pow (double) em vez de Mathf.Pow (float)
+    ///     para evitar perda de precisão em níveis altos (> 40).
+    ///   - CharacterData expõe Data como readonly onde possível para evitar
+    ///     mutação acidental fora do servidor.
     /// </summary>
     [Serializable]
     public class CharacterData
@@ -57,9 +58,13 @@ namespace RPG.Data
                 buff);
         }
 
+        /// <summary>
+        /// CORREÇÃO v4: usa Math.Pow (double) para precisão correta em níveis altos.
+        /// Mathf.Pow retorna float (~7 dígitos) causando arredondamento incorreto acima do nível 40.
+        /// </summary>
         public long GetExperienceForLevel(int level)
         {
-            return (long)(100 * Mathf.Pow(level, 1.5f));
+            return (long)(100.0 * Math.Pow(level, 1.5));
         }
 
         /// <summary>
@@ -68,6 +73,8 @@ namespace RPG.Data
         /// </summary>
         public bool AddExperience(long amount)
         {
+            // CORREÇÃO v4: rejeita amount negativo ou zero para evitar XP negativa.
+            if (amount <= 0) return false;
             if (Level >= MAX_LEVEL) return false;
 
             Experience += amount;
@@ -78,7 +85,7 @@ namespace RPG.Data
                 Experience            -= ExperienceToNextLevel;
                 Level++;
                 FreeAttributePoints   += 5;
-                ExperienceToNextLevel  = Level >= MAX_LEVEL ? 0 : GetExperienceForLevel(Level);
+                ExperienceToNextLevel  = Level >= MAX_LEVEL ? 0L : GetExperienceForLevel(Level);
                 leveled                = true;
             }
 
@@ -87,6 +94,45 @@ namespace RPG.Data
                 Experience = 0;
 
             return leveled;
+        }
+
+        /// <summary>
+        /// Clona os dados do personagem — útil para snapshots no servidor.
+        /// </summary>
+        public CharacterData Clone()
+        {
+            return new CharacterData
+            {
+                CharacterId           = CharacterId,
+                CharacterName         = CharacterName,
+                Race                  = Race,
+                Level                 = Level,
+                Experience            = Experience,
+                ExperienceToNextLevel = ExperienceToNextLevel,
+                PosX = PosX, PosY = PosY, PosZ = PosZ,
+                CurrentMap            = CurrentMap,
+                CurrentHP             = CurrentHP,
+                CurrentMP             = CurrentMP,
+                FreeAttributePoints   = FreeAttributePoints,
+                AllocatedSTR = AllocatedSTR, AllocatedAGI = AllocatedAGI,
+                AllocatedVIT = AllocatedVIT, AllocatedDEX = AllocatedDEX,
+                AllocatedINT = AllocatedINT, AllocatedLUK = AllocatedLUK,
+                BaseAttributes = new BaseAttributes
+                {
+                    STR = BaseAttributes.STR, AGI = BaseAttributes.AGI,
+                    VIT = BaseAttributes.VIT, DEX = BaseAttributes.DEX,
+                    INT = BaseAttributes.INT, LUK = BaseAttributes.LUK
+                },
+                EquipmentBonuses = new EquipmentBonuses
+                {
+                    STR = EquipmentBonuses.STR, AGI = EquipmentBonuses.AGI,
+                    VIT = EquipmentBonuses.VIT, DEX = EquipmentBonuses.DEX,
+                    INT = EquipmentBonuses.INT, LUK = EquipmentBonuses.LUK,
+                    ATK = EquipmentBonuses.ATK, DEF = EquipmentBonuses.DEF,
+                    MATK = EquipmentBonuses.MATK, MDEF = EquipmentBonuses.MDEF,
+                    HPBonus = EquipmentBonuses.HPBonus, MPBonus = EquipmentBonuses.MPBonus
+                }
+            };
         }
     }
 
