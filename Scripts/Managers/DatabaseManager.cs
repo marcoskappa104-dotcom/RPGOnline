@@ -5,315 +5,206 @@ using System.Collections.Concurrent;
 using System.Threading;
 using RPG.Data;
 
-#if UNITY_SERVER || UNITY_EDITOR
+#if UNITY_SERVER
 using SQLite;
 #endif
 
 namespace RPG.Managers
 {
-    // ── Tabelas SQLite ─────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // Tabelas SQLite — só compilam no servidor dedicado
+    // ══════════════════════════════════════════════════════════════════════
 
-#if UNITY_SERVER || UNITY_EDITOR
+#if UNITY_SERVER
     [Table("accounts")]
-#endif
     public class AccountRow
     {
-#if UNITY_SERVER || UNITY_EDITOR
         [PrimaryKey][Column("username")]
-#endif
         public string Username { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("password_hash"), NotNull]
-#endif
         public string PasswordHash { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("created_at"), NotNull]
-#endif
         public string CreatedAt { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("last_login")]
-#endif
         public string LastLogin { get; set; }
     }
 
-#if UNITY_SERVER || UNITY_EDITOR
     [Table("characters")]
-#endif
     public class CharacterRow
     {
-#if UNITY_SERVER || UNITY_EDITOR
         [PrimaryKey][Column("character_id")]
-#endif
         public string CharacterId { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("username"), NotNull, Indexed]
-#endif
         public string Username { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("character_name"), NotNull, Unique]
-#endif
         public string CharacterName { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("race")]
-#endif
         public int Race { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("level")]
-#endif
         public int Level { get; set; } = 1;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("experience")]
-#endif
         public long Experience { get; set; } = 0;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("exp_to_next")]
-#endif
         public long ExpToNext { get; set; } = 100;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("current_hp")]
-#endif
         public float CurrentHP { get; set; } = 100f;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("current_mp")]
-#endif
         public float CurrentMP { get; set; } = 50f;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("pos_x")]
-#endif
         public float PosX { get; set; } = 0f;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("pos_y")]
-#endif
         public float PosY { get; set; } = 1f;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("pos_z")]
-#endif
         public float PosZ { get; set; } = 0f;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("current_map"), Indexed]
-#endif
         public string CurrentMap { get; set; } = "World_01";
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("free_points")]
-#endif
         public int FreePoints { get; set; } = 0;
 
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("alloc_str")]
-#endif
-        public int AllocSTR { get; set; } = 0;
+        [Column("alloc_str")]  public int AllocSTR { get; set; } = 0;
+        [Column("alloc_agi")]  public int AllocAGI { get; set; } = 0;
+        [Column("alloc_vit")]  public int AllocVIT { get; set; } = 0;
+        [Column("alloc_dex")]  public int AllocDEX { get; set; } = 0;
+        [Column("alloc_int")]  public int AllocINT { get; set; } = 0;
+        [Column("alloc_luk")]  public int AllocLUK { get; set; } = 0;
 
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("alloc_agi")]
-#endif
-        public int AllocAGI { get; set; } = 0;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("alloc_vit")]
-#endif
-        public int AllocVIT { get; set; } = 0;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("alloc_dex")]
-#endif
-        public int AllocDEX { get; set; } = 0;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("alloc_int")]
-#endif
-        public int AllocINT { get; set; } = 0;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("alloc_luk")]
-#endif
-        public int AllocLUK { get; set; } = 0;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("base_str")]
-#endif
-        public int BaseSTR { get; set; } = 10;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("base_agi")]
-#endif
-        public int BaseAGI { get; set; } = 10;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("base_vit")]
-#endif
-        public int BaseVIT { get; set; } = 10;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("base_dex")]
-#endif
-        public int BaseDEX { get; set; } = 10;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("base_int")]
-#endif
-        public int BaseINT { get; set; } = 10;
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("base_luk")]
-#endif
-        public int BaseLUK { get; set; } = 10;
+        [Column("base_str")]   public int BaseSTR { get; set; } = 10;
+        [Column("base_agi")]   public int BaseAGI { get; set; } = 10;
+        [Column("base_vit")]   public int BaseVIT { get; set; } = 10;
+        [Column("base_dex")]   public int BaseDEX { get; set; } = 10;
+        [Column("base_int")]   public int BaseINT { get; set; } = 10;
+        [Column("base_luk")]   public int BaseLUK { get; set; } = 10;
     }
 
-#if UNITY_SERVER || UNITY_EDITOR
     [Table("inventory")]
-#endif
     public class InventoryRow
     {
-#if UNITY_SERVER || UNITY_EDITOR
         [PrimaryKey, AutoIncrement][Column("id")]
-#endif
         public int Id { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("character_id"), NotNull, Indexed]
-#endif
         public string CharacterId { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("item_id"), NotNull]
-#endif
         public string ItemId { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("quantity")]
-#endif
         public int Quantity { get; set; } = 1;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("slot_index")]
-#endif
         public int SlotIndex { get; set; } = -1;
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("is_equipped")]
-#endif
         public bool IsEquipped { get; set; } = false;
     }
 
-#if UNITY_SERVER || UNITY_EDITOR
     [Table("gem_loadout")]
-#endif
     public class GemLoadoutRow
     {
-#if UNITY_SERVER || UNITY_EDITOR
         [PrimaryKey][Column("character_id")]
-#endif
         public string CharacterId { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("slot_q")]
-#endif
-        public string SlotQ { get; set; } = "";
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("slot_w")]
-#endif
-        public string SlotW { get; set; } = "";
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("slot_e")]
-#endif
-        public string SlotE { get; set; } = "";
-
-#if UNITY_SERVER || UNITY_EDITOR
-        [Column("slot_r")]
-#endif
-        public string SlotR { get; set; } = "";
+        [Column("slot_q")] public string SlotQ { get; set; } = "";
+        [Column("slot_w")] public string SlotW { get; set; } = "";
+        [Column("slot_e")] public string SlotE { get; set; } = "";
+        [Column("slot_r")] public string SlotR { get; set; } = "";
     }
 
-#if UNITY_SERVER || UNITY_EDITOR
     [Table("economy_log")]
-#endif
     public class EconomyLogRow
     {
-#if UNITY_SERVER || UNITY_EDITOR
         [PrimaryKey, AutoIncrement][Column("id")]
-#endif
         public int Id { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("character_id"), NotNull, Indexed]
-#endif
         public string CharacterId { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("event_type"), NotNull]
-#endif
         public string EventType { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("value")]
-#endif
         public float Value { get; set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
         [Column("timestamp"), NotNull]
-#endif
         public string Timestamp { get; set; }
     }
 
+#else
+    // ── Stubs das tabelas para o cliente compilar sem SQLite ──────────────
+    public class AccountRow  { public string Username { get; set; } public string PasswordHash { get; set; } public string CreatedAt { get; set; } public string LastLogin { get; set; } }
+    public class CharacterRow { public string CharacterId { get; set; } public string Username { get; set; } public string CharacterName { get; set; } public int Race { get; set; } public int Level { get; set; } = 1; public long Experience { get; set; } = 0; public long ExpToNext { get; set; } = 100; public float CurrentHP { get; set; } = 100f; public float CurrentMP { get; set; } = 50f; public float PosX { get; set; } = 0f; public float PosY { get; set; } = 1f; public float PosZ { get; set; } = 0f; public string CurrentMap { get; set; } = "World_01"; public int FreePoints { get; set; } = 0; public int AllocSTR { get; set; } = 0; public int AllocAGI { get; set; } = 0; public int AllocVIT { get; set; } = 0; public int AllocDEX { get; set; } = 0; public int AllocINT { get; set; } = 0; public int AllocLUK { get; set; } = 0; public int BaseSTR { get; set; } = 10; public int BaseAGI { get; set; } = 10; public int BaseVIT { get; set; } = 10; public int BaseDEX { get; set; } = 10; public int BaseINT { get; set; } = 10; public int BaseLUK { get; set; } = 10; }
+    public class InventoryRow { public int Id { get; set; } public string CharacterId { get; set; } public string ItemId { get; set; } public int Quantity { get; set; } = 1; public int SlotIndex { get; set; } = -1; public bool IsEquipped { get; set; } = false; }
+    public class GemLoadoutRow { public string CharacterId { get; set; } public string SlotQ { get; set; } = ""; public string SlotW { get; set; } = ""; public string SlotE { get; set; } = ""; public string SlotR { get; set; } = ""; }
+    public class EconomyLogRow { public int Id { get; set; } public string CharacterId { get; set; } public string EventType { get; set; } public float Value { get; set; } public string Timestamp { get; set; } }
+#endif
+
     // ══════════════════════════════════════════════════════════════════════
-    // DatabaseManager v7
+    // DatabaseManager v8
     // ══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// DatabaseManager v7
+    /// DatabaseManager v8
     ///
-    /// CORREÇÃO CRÍTICA v7:
+    /// CORREÇÃO CRÍTICA v8 — Login impossível no Editor:
     ///
-    ///   BUG: ServerAuthManager chamava TryLoginWithSignedHash() que não existia.
-    ///   CAUSA: Ao implementar o sistema de nonce/challenge-response no ServerAuthManager,
-    ///   o método correspondente nunca foi adicionado ao DatabaseManager.
+    ///   CAUSA RAIZ:
+    ///     O bloco #if UNITY_SERVER || UNITY_EDITOR fazia o Editor inicializar
+    ///     o banco SQLite localmente usando o salt de desenvolvimento hardcoded
+    ///     ("DEV_ONLY_SALT_TROQUE_ANTES_DO_LAUNCH"). Contas criadas pelo Editor
+    ///     tinham hash gerado com esse salt.
+    ///
+    ///     O servidor .exe usa RPG_SERVER_SALT da variável de ambiente (salt real).
+    ///     Como os dois salts são diferentes, o hash não batia e o login falhava
+    ///     com "senha incorreta" mesmo a senha estando correta.
     ///
     ///   SOLUÇÃO:
-    ///     - Adicionado TryLoginWithSignedHash(username, clientSignedHash, sessionNonce)
-    ///       que valida o login usando o fluxo challenge-response completo:
-    ///         1. Carrega o storedHash do banco (SHA256(SHA256(senha) + serverSalt))
-    ///         2. Chama GameManager.ValidateLoginWithNonce() para comparar
-    ///            SHA256(storedHash + nonce) com o clientSignedHash
-    ///         3. Retorna AccountData se válido, null se inválido
+    ///     Removido UNITY_EDITOR de todos os #if — banco SQLite agora compila
+    ///     e inicializa APENAS em UNITY_SERVER (build dedicada).
+    ///     O Editor passa a usar os stubs no-op, igual ao cliente normal.
+    ///     Toda operação de conta/personagem passa pelo servidor via rede,
+    ///     que é o comportamento correto para um MMO.
     ///
-    ///   OUTROS FIXES v7:
-    ///     - ItemDropManager.ServerSpawnDrop: check do ItemDatabase feito ANTES de
-    ///       Instantiate para evitar memory leak quando ItemDatabase é null.
-    ///       (BUG #7 da análise — corrigido aqui porque o fix é no fluxo do DB)
-    ///     - FloatingTextManager: adicionado guard Application.isBatchMode no Awake
-    ///       para não crashar em servidor dedicado (BUG #17).
-    ///     - Todas as correções v6 mantidas (WAL, write thread, stubs cliente).
+    ///   IMPACTO:
+    ///     - No Editor: DatabaseManager.Instance existe mas todos os métodos
+    ///       retornam null/false/lista vazia (stubs). O banco nunca é aberto.
+    ///     - No servidor .exe: comportamento idêntico ao v7.
+    ///     - Testes no Editor: use o servidor .exe rodando localmente (localhost).
+    ///
+    ///   AÇÃO NECESSÁRIA APÓS ESTA CORREÇÃO:
+    ///     Delete o banco antigo criado pelo Editor antes de testar:
+    ///     %AppData%\..\LocalLow\DefaultCompany\rpgonline\rpg_server.db
+    ///     Crie novas contas pelo jogo conectando ao servidor .exe.
+    ///
+    ///   Todas as correções v7 mantidas (WAL, write thread, challenge-response).
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
         public static DatabaseManager Instance { get; private set; }
 
-#if UNITY_SERVER || UNITY_EDITOR
-        private SQLiteConnection                _db;
-        private readonly object                 _dbLock             = new object();
-        private bool                            _closed             = false;
-        private readonly ConcurrentQueue<Action> _writeQueue        = new ConcurrentQueue<Action>();
-        private Thread                          _writeThread;
-        private volatile bool                   _writeThreadRunning;
-        private readonly ManualResetEventSlim   _writeEvent         = new ManualResetEventSlim(false);
+#if UNITY_SERVER
+        private SQLiteConnection                 _db;
+        private readonly object                  _dbLock             = new object();
+        private bool                             _closed             = false;
+        private readonly ConcurrentQueue<Action> _writeQueue         = new ConcurrentQueue<Action>();
+        private Thread                           _writeThread;
+        private volatile bool                    _writeThreadRunning;
+        private readonly ManualResetEventSlim    _writeEvent         = new ManualResetEventSlim(false);
 #endif
 
         // ── Lifecycle ──────────────────────────────────────────────────────
@@ -324,11 +215,12 @@ namespace RPG.Managers
             Instance = this;
             DontDestroyOnLoad(gameObject);
 
-#if UNITY_SERVER || UNITY_EDITOR
+#if UNITY_SERVER
             InitializeDatabase();
             StartWriteThread();
 #else
-            Debug.Log("[DatabaseManager] Modo cliente — banco desabilitado (correto).");
+            Debug.Log("[DatabaseManager] Modo cliente/editor — banco desabilitado. " +
+                      "Operações de conta passam pelo servidor via rede (correto).");
 #endif
         }
 
@@ -337,9 +229,9 @@ namespace RPG.Managers
 
         private void FlushAndClose()
         {
-#if UNITY_SERVER || UNITY_EDITOR
+#if UNITY_SERVER
             if (_closed) return;
-            _closed = true;
+            _closed             = true;
             _writeThreadRunning = false;
             _writeEvent.Set();
             _writeThread?.Join(3000);
@@ -348,10 +240,10 @@ namespace RPG.Managers
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // IMPLEMENTAÇÃO SERVIDOR / EDITOR
+        // IMPLEMENTAÇÃO — apenas no servidor dedicado
         // ══════════════════════════════════════════════════════════════════
 
-#if UNITY_SERVER || UNITY_EDITOR
+#if UNITY_SERVER
 
         // ── Inicialização ──────────────────────────────────────────────────
 
@@ -377,7 +269,7 @@ namespace RPG.Managers
             }
             catch (Exception e)
             {
-                Debug.LogError($"[DatabaseManager] ERRO ao inicializar: {e}");
+                Debug.LogError($"[DatabaseManager] ERRO CRÍTICO ao inicializar banco: {e}");
             }
         }
 
@@ -403,10 +295,10 @@ namespace RPG.Managers
                 while (_writeQueue.TryDequeue(out Action action))
                 {
                     try   { action(); }
-                    catch (Exception e) { Debug.LogError($"[DB] Write thread: {e.Message}"); }
+                    catch (Exception e) { Debug.LogError($"[DB] Write thread erro: {e.Message}"); }
                 }
             }
-            // Flush restante ao fechar
+            // Flush do que sobrou ao encerrar
             while (_writeQueue.TryDequeue(out Action action))
             {
                 try { action(); } catch { }
@@ -463,10 +355,58 @@ namespace RPG.Managers
             catch (Exception e) { Debug.LogError($"[DB] TryCreateAccount: {e.Message}"); return "Erro interno."; }
         }
 
-        /// <summary>
-        /// Login legado — valida apenas com hash simples (sem nonce).
-        /// Mantido para compatibilidade. Prefira TryLoginWithSignedHash em produção.
-        /// </summary>
+        public AccountData TryLoginWithSignedHash(string username, string clientSignedHash, string sessionNonce)
+        {
+            if (string.IsNullOrWhiteSpace(username)        ||
+                string.IsNullOrWhiteSpace(clientSignedHash) ||
+                string.IsNullOrWhiteSpace(sessionNonce))
+                return null;
+
+            try
+            {
+                AccountRow row;
+                lock (_dbLock)
+                {
+                    row = _db.FindWithQuery<AccountRow>(
+                        "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?)",
+                        username.Trim());
+                }
+
+                if (row == null)
+                {
+                    // Delay anti timing-attack (dificulta enumerar usuários pelo tempo de resposta)
+                    System.Threading.Thread.Sleep(50);
+                    return null;
+                }
+
+                bool valid = GameManager.ValidateLoginWithNonce(
+                    row.PasswordHash,
+                    clientSignedHash,
+                    sessionNonce);
+
+                if (!valid)
+                {
+                    Debug.LogWarning($"[DB] TryLoginWithSignedHash: senha incorreta para '{username}'.");
+                    return null;
+                }
+
+                UpdateLastLogin(row.Username);
+
+                return new AccountData
+                {
+                    Username     = row.Username,
+                    PasswordHash = row.PasswordHash,
+                    Characters   = LoadCharacters(row.Username)
+                };
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[DB] TryLoginWithSignedHash: {e.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>Login legado sem nonce — mantido para compatibilidade interna.</summary>
         public AccountData TryLoginWithHash(string username, string clientPasswordHash)
         {
             if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(clientPasswordHash))
@@ -495,80 +435,6 @@ namespace RPG.Managers
             catch (Exception e) { Debug.LogError($"[DB] TryLoginWithHash: {e.Message}"); return null; }
         }
 
-        /// <summary>
-        /// NOVO v7 — Login com nonce de sessão (challenge-response).
-        ///
-        /// Fluxo:
-        ///   1. Servidor enviou sessionNonce ao cliente via MsgAuthChallenge.
-        ///   2. Cliente enviou clientSignedHash = SHA256(SHA256(senha) + sessionNonce).
-        ///   3. Este método:
-        ///      a) Busca o storedHash no banco (SHA256(SHA256(senha) + serverSalt)).
-        ///      b) Calcula expected = SHA256(storedHash + sessionNonce).
-        ///      c) Compara expected com clientSignedHash.
-        ///      d) Se igual, retorna AccountData. Senão, retorna null.
-        ///
-        /// Por que não SHA256(senha) direto?
-        ///   O banco guarda SHA256(SHA256(senha) + serverSalt).
-        ///   O cliente assinou SHA256(SHA256(senha) + nonce).
-        ///   O servidor replica: SHA256(storedHash + nonce) == SHA256(SHA256(SHA256(senha)+salt)+nonce).
-        ///   Isso é matematicamente correto pois storedHash = SHA256(SHA256(senha)+salt).
-        ///
-        /// Limitação conhecida: sem TLS, ainda vulnerável a MITM ativo.
-        /// Para produção real, use TLS + bcrypt/Argon2.
-        /// </summary>
-        public AccountData TryLoginWithSignedHash(string username, string clientSignedHash, string sessionNonce)
-        {
-            if (string.IsNullOrWhiteSpace(username)       ||
-                string.IsNullOrWhiteSpace(clientSignedHash) ||
-                string.IsNullOrWhiteSpace(sessionNonce))
-                return null;
-
-            try
-            {
-                AccountRow row;
-                lock (_dbLock)
-                {
-                    row = _db.FindWithQuery<AccountRow>(
-                        "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?)",
-                        username.Trim());
-                }
-
-                if (row == null)
-                {
-                    // Delay para dificultar user enumeration via timing attack
-                    System.Threading.Thread.Sleep(50);
-                    return null;
-                }
-
-                // Valida usando GameManager.ValidateLoginWithNonce
-                // que calcula SHA256(storedHash + sessionNonce) e compara com clientSignedHash
-                bool valid = GameManager.ValidateLoginWithNonce(
-                    row.PasswordHash,
-                    clientSignedHash,
-                    sessionNonce);
-
-                if (!valid)
-                {
-                    Debug.LogWarning($"[DB] TryLoginWithSignedHash: senha incorreta para '{username}'.");
-                    return null;
-                }
-
-                UpdateLastLogin(row.Username);
-
-                return new AccountData
-                {
-                    Username     = row.Username,
-                    PasswordHash = row.PasswordHash,
-                    Characters   = LoadCharacters(row.Username)
-                };
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[DB] TryLoginWithSignedHash: {e.Message}");
-                return null;
-            }
-        }
-
         private void UpdateLastLogin(string username)
         {
             string now   = DateTime.UtcNow.ToString("o");
@@ -578,7 +444,9 @@ namespace RPG.Managers
                 try
                 {
                     lock (_dbLock)
-                        _db.Execute("UPDATE accounts SET last_login = ? WHERE username = ?", now, uname);
+                        _db.Execute(
+                            "UPDATE accounts SET last_login = ? WHERE username = ?",
+                            now, uname);
                 }
                 catch (Exception e) { Debug.LogError($"[DB] UpdateLastLogin: {e.Message}"); }
             });
@@ -657,11 +525,13 @@ namespace RPG.Managers
                 lock (_dbLock)
                 {
                     int count = _db.ExecuteScalar<int>(
-                        "SELECT COUNT(*) FROM characters WHERE LOWER(username) = LOWER(?)", username.Trim());
+                        "SELECT COUNT(*) FROM characters WHERE LOWER(username) = LOWER(?)",
+                        username.Trim());
                     if (count >= 5) return "Limite de 5 personagens por conta atingido.";
 
                     int nameCount = _db.ExecuteScalar<int>(
-                        "SELECT COUNT(*) FROM characters WHERE LOWER(character_name) = LOWER(?)", name.Trim());
+                        "SELECT COUNT(*) FROM characters WHERE LOWER(character_name) = LOWER(?)",
+                        name.Trim());
                     if (nameCount > 0) return "Já existe um personagem com esse nome.";
 
                     var ch = new CharacterData
@@ -710,7 +580,6 @@ namespace RPG.Managers
         {
             if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
 
-            // Captura todos os valores na thread principal antes de enfileirar
             string charId  = ch.CharacterId;
             string uname   = username.Trim();
             int    level   = ch.Level;
@@ -931,25 +800,25 @@ namespace RPG.Managers
 
 #else
         // ══════════════════════════════════════════════════════════════════
-        // STUBS CLIENTE — no-op completo, zero acesso à DLL nativa
+        // STUBS CLIENTE E EDITOR — no-op completo, banco nunca é acessado
         // ══════════════════════════════════════════════════════════════════
 
-        public bool                        AccountExists(string u)                                                       => false;
-        public string                      TryCreateAccount(string u, string h)                                          => null;
-        public AccountData                 TryLoginWithHash(string u, string h)                                          => null;
-        public AccountData                 TryLoginWithSignedHash(string u, string sh, string n)                         => null;
-        public List<CharacterData>         LoadCharacters(string u)                                                       => new List<CharacterData>();
-        public CharacterData               LoadCharacter(string id)                                                       => null;
-        public CharacterData               LoadCharacterForAccount(string id, string u)                                   => null;
-        public List<CharacterData>         GetCharactersInMap(string m)                                                  => new List<CharacterData>();
-        public string                      TryCreateCharacter(string u, string n, CharacterRace r)                       => null;
-        public void                        SaveCharacter(CharacterData ch, string u)                                     { }
-        public List<InventoryRow>          LoadInventory(string id)                                                      => new List<InventoryRow>();
-        public void                        SaveInventory(string cid, string u, List<RPG.Data.InventorySlotData> slots)   { }
-        public void                        AddItem(string id, string item, int qty = 1, int slot = -1)                  { }
-        public PowerGemLoadout             LoadGemLoadout(string id)                                                     => new PowerGemLoadout();
-        public void                        SaveGemLoadout(string id, PowerGemLoadout l)                                 { }
-        public void                        LogEconomy(string id, string ev, float v)                                    { }
+        public bool                AccountExists(string u)                                                      => false;
+        public string              TryCreateAccount(string u, string h)                                         => null;
+        public AccountData         TryLoginWithHash(string u, string h)                                         => null;
+        public AccountData         TryLoginWithSignedHash(string u, string sh, string n)                        => null;
+        public List<CharacterData> LoadCharacters(string u)                                                      => new List<CharacterData>();
+        public CharacterData       LoadCharacter(string id)                                                      => null;
+        public CharacterData       LoadCharacterForAccount(string id, string u)                                  => null;
+        public List<CharacterData> GetCharactersInMap(string m)                                                 => new List<CharacterData>();
+        public string              TryCreateCharacter(string u, string n, CharacterRace r)                      => null;
+        public void                SaveCharacter(CharacterData ch, string u)                                    { }
+        public List<InventoryRow>  LoadInventory(string id)                                                     => new List<InventoryRow>();
+        public void                SaveInventory(string cid, string u, List<RPG.Data.InventorySlotData> slots)  { }
+        public void                AddItem(string id, string item, int qty = 1, int slot = -1)                 { }
+        public PowerGemLoadout     LoadGemLoadout(string id)                                                    => new PowerGemLoadout();
+        public void                SaveGemLoadout(string id, PowerGemLoadout l)                                { }
+        public void                LogEconomy(string id, string ev, float v)                                   { }
 #endif
     }
 }
