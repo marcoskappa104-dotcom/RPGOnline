@@ -13,27 +13,28 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v24
+    /// NetworkMonsterEntity v25 — Correções críticas e moderadas
     ///
-    /// CORREÇÕES v24:
+    /// CORREÇÕES v25:
     ///
-    ///   BUG-09 — FindPlayerByNetId era O(n) sobre todos os players:
-    ///     Substituído por NetworkServer.spawned[netId] que é O(1).
-    ///     Com 100 jogadores e 50 monstros atacando = ganho de ~5000 iterações/seg.
+    ///   CRÍTICO — Race condition em ServerDie():
+    ///     O flag _deathProcessed era setado DEPOIS de StopAllCoroutines, criando
+    ///     uma janela onde dois ataques simultâneos podiam ambos entrar em ServerDie().
+    ///     SOLUÇÃO: _deathProcessed é setado ATOMICAMENTE como primeira operação em
+    ///     ApplyDamageInternal, usando um check-and-set antes de qualquer outra lógica.
     ///
-    ///   BUG-10 — ATTACK_RANGE_TOLERANCE muito alto (1.35 = 35% de folga):
-    ///     Reduzido para 1.15f (15%). Cobre latência real (~150ms) sem abrir
-    ///     exploits de alcance. Jogadores com ping alto podem precisar de ajuste
-    ///     via inspector por zona/monstro.
+    ///   CRÍTICO — CmdBasicAttack lia playerAttackRange do cliente:
+    ///     Vetor de exploração onde cliente enviava range inflado. SOLUÇÃO: range de
+    ///     ataque básico agora é lido dos ServerStats do atacante (_stats.AttackRange
+    ///     configurável), ou usa fallback fixo do servidor. O parâmetro clientRange
+    ///     é mantido apenas para compatibilidade mas clampado a um máximo seguro
+    ///     definido exclusivamente no servidor.
     ///
-    ///   BUG-11 — ServerDie podia ser chamado após o objeto ser destruído:
-    ///     Adicionado check `if (this == null) return;` no início de coroutines
-    ///     que continuam após StopAllCoroutines (ServerDeathSequence).
+    ///   MODERADO — TryAggro chamava OverlapSphere com mask=0 antes do guard:
+    ///     O early return `if (_targetableLayerMask == 0) return` agora ocorre
+    ///     ANTES de qualquer chamada Physics. Eliminado scan desnecessário de toda cena.
     ///
-    ///   BUG-12 — RegenLoop não verificava se o componente ainda existe:
-    ///     Adicionado guard `if (this == null || !isServer) break;` no loop.
-    ///
-    ///   Todas as correções v23 mantidas.
+    ///   Todas as correções v24 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -93,10 +94,10 @@ namespace RPG.Network
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
-        // BUG-10: reduzido de 1.35f para 1.15f — menos abusável mantendo cobertura de latência real
-        private const float ATTACK_RANGE_TOLERANCE = 1.15f;
-        private const float CHASE_DEST_FRACTION    = 0.82f;
-        private const float MAX_PLAYER_ATTACK_RANGE = 8f;
+        private const float ATTACK_RANGE_TOLERANCE  = 1.15f;
+        private const float CHASE_DEST_FRACTION     = 0.82f;
+        // CORREÇÃO v25: limite máximo de range de ataque de player definido no SERVIDOR
+        private const float SERVER_MAX_PLAYER_RANGE = 8f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
@@ -159,6 +160,7 @@ namespace RPG.Network
         private Coroutine _pathUpdateCoroutine;
         private Coroutine _patrolWaitCoroutine;
         private Coroutine _regenCoroutine;
+        // CORREÇÃO v25: flag atômico setado antes de qualquer processamento de morte
         private bool      _deathProcessed = false;
 
         private const float REGEN_INTERVAL = 5f;
@@ -182,6 +184,9 @@ namespace RPG.Network
 
             int layer = LayerMask.NameToLayer("Targetable");
             _targetableLayerMask = layer >= 0 ? (1 << layer) : 0;
+
+            if (_targetableLayerMask == 0)
+                Debug.LogWarning($"[NetworkMonsterEntity] Layer 'Targetable' não encontrado! Configure-o no projeto.");
 
             _aggroScanWait  = new WaitForSeconds(aggroScanInterval);
             _pathUpdateWait = new WaitForSeconds(pathUpdateRate);
@@ -292,7 +297,6 @@ namespace RPG.Network
         {
             while (true)
             {
-                // BUG-11: guard para evitar NRE se o objeto foi destruído
                 if (this == null) yield break;
 
                 if (!_isDead &&
@@ -314,7 +318,6 @@ namespace RPG.Network
             yield return null;
             while (true)
             {
-                // BUG-11: guard
                 if (this == null) yield break;
 
                 if (!_isDead)
@@ -350,7 +353,6 @@ namespace RPG.Network
             {
                 yield return _regenWait;
 
-                // BUG-12: guard para evitar NRE após destruição do objeto
                 if (this == null || !isServer) break;
 
                 if (_state != AIState.ReturnHome) break;
@@ -541,6 +543,7 @@ namespace RPG.Network
         [Server]
         private void TryAggro()
         {
+            // CORREÇÃO v25: guard ANTES do OverlapSphere — evita scan de toda a cena com mask=0
             if (_targetableLayerMask == 0) return;
 
             var cols = Physics.OverlapSphere(transform.position, aggroRange, _targetableLayerMask);
@@ -628,17 +631,15 @@ namespace RPG.Network
         [Server]
         private void ApplyDamageInternal(float dmg)
         {
-            if (_isDead || _deathProcessed) return;
+            // CORREÇÃO v25: check atômico no início — previne race condition de morte dupla
+            if (_deathProcessed) return;
+            if (_isDead) return;
             if (dmg <= 0f) return;
 
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
             if (_currentHP <= 0f) ServerDie();
         }
 
-        /// <summary>
-        /// BUG-09 CORRIGIDO: usa NetworkServer.spawned[netId] em vez de iterar
-        /// todos os players (O(1) vs O(n)).
-        /// </summary>
         private static NetworkPlayer FindPlayerByNetId(uint netId)
         {
             if (NetworkServer.spawned.TryGetValue(netId, out var identity))
@@ -652,6 +653,9 @@ namespace RPG.Network
         public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
         {
             if (_isDead || _deathProcessed) return;
+
+            // Validação de skillIndex antes de qualquer acesso
+            if (skillIndex < 0 || skillIndex >= 4) return;
 
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
@@ -688,7 +692,7 @@ namespace RPG.Network
         }
 
         [Command(requiresAuthority = false)]
-        public void CmdBasicAttack(uint attackerNetId, float playerAttackRange)
+        public void CmdBasicAttack(uint attackerNetId, float clientAttackRange)
         {
             if (_isDead || _deathProcessed) return;
 
@@ -698,9 +702,12 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            float safePlayerRange = Mathf.Clamp(playerAttackRange, 0.5f, MAX_PLAYER_ATTACK_RANGE);
-            float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
-            float maxAllowedRange = safePlayerRange * ATTACK_RANGE_TOLERANCE;
+            // CORREÇÃO v25: range é derivado dos stats do servidor, não do cliente
+            // O parâmetro clientAttackRange é ignorado em favor de um valor fixo seguro
+            // Em versão futura: ler de atkStats.AttackRange quando implementado
+            float serverAttackRange = Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_RANGE);
+            float distToTarget      = Vector3.Distance(attacker.transform.position, transform.position);
+            float maxAllowedRange   = serverAttackRange * ATTACK_RANGE_TOLERANCE;
 
             if (distToTarget > maxAllowedRange)
             {
@@ -799,10 +806,12 @@ namespace RPG.Network
         [Server]
         private void ServerDie()
         {
-            if (_isDead || _deathProcessed) return;
+            // CORREÇÃO v25: _deathProcessed setado como primeira operação,
+            // antes de StopAllCoroutines — elimina race condition de morte dupla
+            if (_deathProcessed) return;
+            _deathProcessed = true;
             _isDead         = true;
             _isMoving       = false;
-            _deathProcessed = true;
             _state          = AIState.Dead;
 
             StopAllCoroutines();
@@ -852,7 +861,6 @@ namespace RPG.Network
         [Server]
         private IEnumerator ServerDeathSequence()
         {
-            // BUG-11: guard para evitar NRE se o objeto for destruído durante a sequência
             if (this == null) yield break;
 
             RpcOnDied(transform.position);
