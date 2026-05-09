@@ -1,0 +1,799 @@
+using UnityEngine;
+using UnityEngine.AI;
+using Mirror;
+using RPG.Data;
+using RPG.UI;
+using RPG.Managers;
+using RPG.Character;
+using RPG.Combat;
+using System.Collections;
+using System.Collections.Generic;
+using System;
+
+namespace RPG.Network
+{
+    /// <summary>
+    /// NetworkPlayer v17
+    ///
+    /// CORREÇÕES v17:
+    ///
+    ///   BUG-03 — OnAllocatedChanged não sincronizava Data.BaseAttributes:
+    ///     O cliente atualizava só AllocatedXXX no Data, mas nunca os BaseAttributes
+    ///     com os SyncVars BaseSTR/AGI/etc. FullRefreshStatsFromData() calculava com
+    ///     base errada se a raça/base do servidor diferia. Agora sincroniza tudo.
+    ///
+    ///   BUG-05 — RpcInitializeLocalPlayer com 24 parâmetros (risco de overflow MTU):
+    ///     Parâmetros agrupados em struct PlayerInitData que é serializada como uma
+    ///     única mensagem Mirror, dentro do limite seguro de ~1200 bytes KCP.
+    ///
+    ///   Todas as correções v16 mantidas.
+    /// </summary>
+    [RequireComponent(typeof(NavMeshAgent))]
+    [RequireComponent(typeof(NetworkIdentity))]
+    [RequireComponent(typeof(NetworkInventory))]
+    public class NetworkPlayer : NetworkBehaviour, ITargetable
+    {
+        public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
+
+        private const float MAX_HP_CAP              = 500_000f;
+        private const float MAX_MP_CAP              = 200_000f;
+        private const float SAVE_INTERVAL           = 60f;
+        private const float REGEN_INTERVAL          = 5f;
+        private const float ALLOCATE_MIN_INTERVAL   = 0.3f;
+        private const float REGEN_COMBAT_SUPPRESSION = 8f;
+
+        // ── Struct de inicialização (BUG-05: evita overflow de parâmetros RPC) ──
+        public struct PlayerInitData
+        {
+            public string CharName;
+            public int    Race;          // int para serialização Mirror
+            public int    Level;
+            public long   Exp;
+            public long   ExpToNext;
+            public int    FreePoints;
+            public int    AllocSTR, AllocAGI, AllocVIT, AllocDEX, AllocINT, AllocLUK;
+            public int    BaseSTR,  BaseAGI,  BaseVIT,  BaseDEX,  BaseINT,  BaseLUK;
+            public float  CurHP, CurMP;
+            public float  EquipATK, EquipDEF, EquipMATK, EquipMDEF;
+        }
+
+        // ── SyncVars ───────────────────────────────────────────────────────
+        [SyncVar(hook = nameof(OnNetNameChanged))]       public string CharacterName         = "...";
+        [SyncVar]                                         public string RaceStr               = "Human";
+        [SyncVar(hook = nameof(OnNetLevelChanged))]      public int    Level                 = 1;
+        [SyncVar(hook = nameof(OnNetHPChanged))]         public float  CurrentHP             = 0f;
+        [SyncVar(hook = nameof(OnNetMaxHPChanged))]      public float  MaxHP                 = 1f;
+        [SyncVar(hook = nameof(OnNetMPChanged))]         public float  CurrentMP             = 0f;
+        [SyncVar(hook = nameof(OnNetMaxMPChanged))]      public float  MaxMP                 = 1f;
+        [SyncVar(hook = nameof(OnNetMovingChanged))]     public bool   IsMoving              = false;
+        [SyncVar(hook = nameof(OnNetExpChanged))]        public long   Experience            = 0;
+        [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
+        [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
+
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedSTR = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedAGI = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedVIT = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedDEX = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedINT = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedLUK = 0;
+
+        [SyncVar] public int BaseSTR = 10;
+        [SyncVar] public int BaseAGI = 10;
+        [SyncVar] public int BaseVIT = 10;
+        [SyncVar] public int BaseDEX = 10;
+        [SyncVar] public int BaseINT = 10;
+        [SyncVar] public int BaseLUK = 10;
+
+        // ── ITargetable ────────────────────────────────────────────────────
+        string  ITargetable.DisplayName => CharacterName;
+        float   ITargetable.CurrentHP   => CurrentHP;
+        float   ITargetable.MaxHP       => MaxHP;
+        bool    ITargetable.IsDead      => Dead;
+        Vector3 ITargetable.Position    => transform.position;
+
+        public void OnSelected()   { if (_selectionIndicator) _selectionIndicator.SetActive(true);  }
+        public void OnDeselected() { if (_selectionIndicator) _selectionIndicator.SetActive(false); }
+        public void TakeDamage(float rawAtk, float rawMatk, bool isPhysical)
+            => Debug.Log("[NetworkPlayer] PvP não implementado.");
+
+        [Header("Visuals")]
+        [SerializeField] private GameObject            _selectionIndicator;
+        [SerializeField] private TMPro.TMP_Text        _nameTagText;
+        [SerializeField] private UnityEngine.UI.Slider _hpBarSlider;
+
+        [Header("Respawn Points")]
+        [SerializeField] private Transform[] _respawnPoints;
+
+        // ── Componentes ────────────────────────────────────────────────────
+        private NavMeshAgent     _agent;
+        private Animator         _animator;
+        private PlayerEntity     _playerEntity;
+        private NetworkInventory _inventory;
+
+        // ── Estado do servidor ─────────────────────────────────────────────
+        private CharacterData _serverCharData;
+        private DerivedStats  _serverStats;
+        private string        _serverAccountUsername;
+        private float         _autoSaveTimer;
+        private float         _lastAllocateTime = -999f;
+        private float         _lastDamageTime   = -999f;
+
+        public DerivedStats ServerStats => _serverStats;
+
+        private readonly Dictionary<int, float> _serverSkillCooldowns = new();
+        private Coroutine _regenCoroutine;
+
+        // ── Estado do cliente ──────────────────────────────────────────────
+        private bool          _clientInitialized = false;
+        private bool          _pendingClientInit = false;
+        private CharacterData _pendingInitData   = null;
+
+        private float       _lastMovingCmdTime;
+        private const float MOVING_CMD_INTERVAL = 0.1f;
+
+        public bool Dead => CurrentHP <= 0f;
+
+        // ── Lifecycle ──────────────────────────────────────────────────────
+
+        private void Awake()
+        {
+            _agent        = GetComponent<NavMeshAgent>();
+            _animator     = GetComponentInChildren<Animator>();
+            _playerEntity = GetComponent<PlayerEntity>();
+            _inventory    = GetComponent<NetworkInventory>();
+        }
+
+        public override void OnStartServer()
+        {
+            All.Add(this);
+            _autoSaveTimer = SAVE_INTERVAL;
+        }
+
+        public override void OnStopServer()
+        {
+            All.Remove(this);
+            StopRegenLoop();
+            if (_serverCharData != null)
+                ServerSaveCharacter();
+            else
+                Debug.LogWarning($"[Server] OnStopServer: {CharacterName} sem dados — save ignorado.");
+        }
+
+        public override void OnStartClient()
+        {
+            if (_nameTagText        != null) _nameTagText.text = CharacterName;
+            if (_selectionIndicator != null) _selectionIndicator.SetActive(false);
+            if (!isLocalPlayer && _agent != null) _agent.enabled = false;
+        }
+
+        public override void OnStopClient()
+        {
+            _clientInitialized = false;
+            _pendingClientInit = false;
+            _pendingInitData   = null;
+        }
+
+        public override void OnStartLocalPlayer()
+        {
+            _playerEntity = GetComponent<PlayerEntity>();
+            _agent        = GetComponent<NavMeshAgent>();
+            if (_agent != null) _agent.enabled = true;
+
+            Debug.Log("[NetworkPlayer] Local player ativo — aguardando RpcInitializeLocalPlayer.");
+
+            if (_pendingClientInit && _pendingInitData != null)
+            {
+                var data = _pendingInitData;
+                _pendingClientInit = false;
+                _pendingInitData   = null;
+                StartCoroutine(DelayedClientInit(data));
+            }
+        }
+
+        private void Update()
+        {
+            if (isServer) ServerUpdate();
+            if (!isLocalPlayer || Dead) return;
+            ClientMovingUpdate();
+        }
+
+        [Server]
+        private void ServerUpdate()
+        {
+            _autoSaveTimer -= Time.deltaTime;
+            if (_autoSaveTimer <= 0f)
+            {
+                _autoSaveTimer = SAVE_INTERVAL;
+                ServerSaveCharacter();
+            }
+        }
+
+        private void ClientMovingUpdate()
+        {
+            if (_agent == null || !_agent.enabled) return;
+            bool moving = _agent.velocity.sqrMagnitude > 0.05f;
+            if (moving != IsMoving && Time.time - _lastMovingCmdTime >= MOVING_CMD_INTERVAL)
+            {
+                _lastMovingCmdTime = Time.time;
+                CmdSetMoving(moving);
+            }
+        }
+
+        // ── Inicialização pelo servidor ────────────────────────────────────
+
+        [Server]
+        public void ServerInitialize(CharacterData charData, string accountUsername)
+        {
+            _serverAccountUsername = accountUsername;
+            _serverCharData        = charData;
+            _serverStats           = charData.GetDerivedStats();
+
+            float maxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
+            float maxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+
+            CharacterName         = charData.CharacterName;
+            RaceStr               = charData.Race.ToString();
+            Level                 = charData.Level;
+            Experience            = charData.Experience;
+            ExperienceToNextLevel = charData.ExperienceToNextLevel;
+            FreeAttributePoints   = charData.FreeAttributePoints;
+            AllocatedSTR          = charData.AllocatedSTR;
+            AllocatedAGI          = charData.AllocatedAGI;
+            AllocatedVIT          = charData.AllocatedVIT;
+            AllocatedDEX          = charData.AllocatedDEX;
+            AllocatedINT          = charData.AllocatedINT;
+            AllocatedLUK          = charData.AllocatedLUK;
+            BaseSTR = charData.BaseAttributes.STR;
+            BaseAGI = charData.BaseAttributes.AGI;
+            BaseVIT = charData.BaseAttributes.VIT;
+            BaseDEX = charData.BaseAttributes.DEX;
+            BaseINT = charData.BaseAttributes.INT;
+            BaseLUK = charData.BaseAttributes.LUK;
+            MaxHP     = maxHP;
+            MaxMP     = maxMP;
+            CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= maxHP) ? charData.CurrentHP : maxHP;
+            CurrentMP = (charData.CurrentMP > 0f && charData.CurrentMP <= maxMP) ? charData.CurrentMP : maxMP;
+
+            var savedPos = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
+            if (savedPos.sqrMagnitude > 0.01f)
+            {
+                transform.position = savedPos;
+                if (_agent != null && _agent.isOnNavMesh) _agent.Warp(savedPos);
+            }
+            if (_agent != null) _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+
+            _inventory?.ServerLoadFromDatabase(charData.CharacterId);
+            _inventory?.ServerLoadGemLoadout(charData.CharacterId);
+
+            StartRegenLoop();
+
+            Debug.Log($"[Server] {charData.CharacterName} Lv{Level} HP:{CurrentHP:0}/{MaxHP:0} inicializado.");
+            StartCoroutine(SendInitRpcDelayed(charData));
+        }
+
+        // BUG-05: usa struct em vez de 24 parâmetros avulsos
+        [Server]
+        private IEnumerator SendInitRpcDelayed(CharacterData charData)
+        {
+            yield return null;
+            yield return null;
+
+            var initData = new PlayerInitData
+            {
+                CharName  = charData.CharacterName,
+                Race      = (int)charData.Race,
+                Level     = charData.Level,
+                Exp       = charData.Experience,
+                ExpToNext = charData.ExperienceToNextLevel,
+                FreePoints = charData.FreeAttributePoints,
+                AllocSTR  = charData.AllocatedSTR,
+                AllocAGI  = charData.AllocatedAGI,
+                AllocVIT  = charData.AllocatedVIT,
+                AllocDEX  = charData.AllocatedDEX,
+                AllocINT  = charData.AllocatedINT,
+                AllocLUK  = charData.AllocatedLUK,
+                BaseSTR   = charData.BaseAttributes.STR,
+                BaseAGI   = charData.BaseAttributes.AGI,
+                BaseVIT   = charData.BaseAttributes.VIT,
+                BaseDEX   = charData.BaseAttributes.DEX,
+                BaseINT   = charData.BaseAttributes.INT,
+                BaseLUK   = charData.BaseAttributes.LUK,
+                CurHP     = CurrentHP,
+                CurMP     = CurrentMP,
+                EquipATK  = charData.EquipmentBonuses?.ATK  ?? 0f,
+                EquipDEF  = charData.EquipmentBonuses?.DEF  ?? 0f,
+                EquipMATK = charData.EquipmentBonuses?.MATK ?? 0f,
+                EquipMDEF = charData.EquipmentBonuses?.MDEF ?? 0f
+            };
+
+            RpcInitializeLocalPlayer(initData);
+        }
+
+        // ── Regen Loop ─────────────────────────────────────────────────────
+
+        [Server]
+        private void StartRegenLoop()
+        {
+            StopRegenLoop();
+            _regenCoroutine = StartCoroutine(ServerRegenLoop());
+        }
+
+        [Server]
+        private void StopRegenLoop()
+        {
+            if (_regenCoroutine != null)
+            {
+                StopCoroutine(_regenCoroutine);
+                _regenCoroutine = null;
+            }
+        }
+
+        [Server]
+        private IEnumerator ServerRegenLoop()
+        {
+            var wait = new WaitForSeconds(REGEN_INTERVAL);
+            while (true)
+            {
+                yield return wait;
+
+                if (Dead || _serverStats == null) continue;
+
+                bool inCombat = (Time.time - _lastDamageTime) < REGEN_COMBAT_SUPPRESSION;
+                if (inCombat) continue;
+
+                if (CurrentHP < MaxHP && _serverStats.HPRegen > 0f)
+                {
+                    CurrentHP = Mathf.Min(MaxHP, CurrentHP + _serverStats.HPRegen);
+                    if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+                }
+
+                if (CurrentMP < MaxMP && _serverStats.MPRegen > 0f)
+                {
+                    CurrentMP = Mathf.Min(MaxMP, CurrentMP + _serverStats.MPRegen);
+                    if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
+                }
+            }
+        }
+
+        // ── Commands ──────────────────────────────────────────────────────
+
+        [Command] public void CmdSetMoving(bool moving) => IsMoving = moving;
+
+        [Command]
+        public void CmdAllocateAttribute(int attributeIndex)
+        {
+            if (Time.time - _lastAllocateTime < ALLOCATE_MIN_INTERVAL)
+            {
+                Debug.LogWarning($"[Server] CmdAllocateAttribute spam detectado: {CharacterName}");
+                return;
+            }
+
+            if (FreeAttributePoints <= 0 || _serverCharData == null) return;
+            if (attributeIndex < 0 || attributeIndex > 5) return;
+
+            _lastAllocateTime = Time.time;
+
+            FreeAttributePoints--;
+            _serverCharData.FreeAttributePoints--;
+
+            switch (attributeIndex)
+            {
+                case 0: AllocatedSTR++; _serverCharData.AllocatedSTR++; break;
+                case 1: AllocatedAGI++; _serverCharData.AllocatedAGI++; break;
+                case 2: AllocatedVIT++; _serverCharData.AllocatedVIT++; break;
+                case 3: AllocatedDEX++; _serverCharData.AllocatedDEX++; break;
+                case 4: AllocatedINT++; _serverCharData.AllocatedINT++; break;
+                case 5: AllocatedLUK++; _serverCharData.AllocatedLUK++; break;
+            }
+
+            _serverStats = _serverCharData.GetDerivedStats();
+            MaxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
+            MaxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+            if (CurrentHP > MaxHP) CurrentHP = MaxHP;
+            if (CurrentMP > MaxMP) CurrentMP = MaxMP;
+            if (_agent != null && _agent.isOnNavMesh)
+                _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+            ServerSaveCharacter();
+        }
+
+        [Command] public void CmdRequestRespawn() => ServerRespawn();
+
+        [Command]
+        public void CmdRequestSelfSkill(int skillIndex)
+        {
+            if (Dead || _serverStats == null) return;
+
+            var skill = _inventory?.GetEquippedSkill(skillIndex);
+            if (skill == null) { RpcSkillRejected(skillIndex, "Nenhuma joia equipada neste slot."); return; }
+
+            if (!ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
+            {
+                if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime))
+                    RpcSkillRejected(skillIndex, $"{skill.Name}: aguarde {endTime - Time.time:0.0}s");
+                return;
+            }
+
+            if (CurrentMP < skill.ManaCost) { RpcSkillRejected(skillIndex, "MP insuficiente!"); return; }
+
+            ServerConsumeMP(skill.ManaCost);
+
+            if (skill.Type == SkillType.Heal)
+            {
+                float heal = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
+                CurrentHP = Mathf.Min(MaxHP, CurrentHP + heal);
+                if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+            }
+
+            RpcSkillConfirmed(skillIndex, skill.Cooldown);
+        }
+
+        // ── Métodos de servidor ────────────────────────────────────────────
+
+        [Server]
+        public void ServerApplyDamage(float dmg)
+        {
+            if (Dead) return;
+            _lastDamageTime = Time.time;
+            CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
+            if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+            if (CurrentHP <= 0f) ServerDie();
+        }
+
+        [Server]
+        public void ServerApplyHeal(float amount)
+        {
+            if (Dead || amount <= 0f) return;
+            CurrentHP = Mathf.Min(MaxHP, CurrentHP + amount);
+            if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+            RpcShowHeal(amount);
+        }
+
+        [Server]
+        public void ServerRestoreMP(float amount)
+        {
+            if (Dead || amount <= 0f) return;
+            CurrentMP = Mathf.Min(MaxMP, CurrentMP + amount);
+            if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
+        }
+
+        [Server]
+        public void ServerConsumeMP(float amount)
+        {
+            CurrentMP = Mathf.Max(0f, CurrentMP - amount);
+            if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
+        }
+
+        [Server]
+        public bool ServerCheckAndSetCooldown(int skillIndex, float cooldownDuration)
+        {
+            if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime) && Time.time < endTime)
+                return false;
+            _serverSkillCooldowns[skillIndex] = Time.time + cooldownDuration;
+            return true;
+        }
+
+        [Server]
+        public void ServerGrantExp(long amount)
+        {
+            if (_serverCharData == null || amount <= 0) return;
+
+            bool leveledUp = _serverCharData.AddExperience(amount);
+
+            Experience            = _serverCharData.Experience;
+            ExperienceToNextLevel = _serverCharData.ExperienceToNextLevel;
+            Level                 = _serverCharData.Level;
+            FreeAttributePoints   = _serverCharData.FreeAttributePoints;
+
+            if (leveledUp)
+            {
+                _serverStats = _serverCharData.GetDerivedStats();
+                MaxHP        = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
+                MaxMP        = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+                CurrentHP    = MaxHP;
+                CurrentMP    = MaxMP;
+                _serverCharData.CurrentHP = MaxHP;
+                _serverCharData.CurrentMP = MaxMP;
+                if (_agent != null && _agent.isOnNavMesh)
+                    _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
+
+                StartRegenLoop();
+
+                Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
+            }
+
+            DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
+            if (leveledUp) ServerSaveCharacter();
+            RpcOnExpGained(amount, leveledUp);
+        }
+
+        [Server]
+        public void ServerSaveCharacter()
+        {
+            if (_serverCharData == null || string.IsNullOrEmpty(_serverAccountUsername)) return;
+
+            _serverCharData.CurrentHP = CurrentHP;
+            _serverCharData.CurrentMP = CurrentMP;
+            _serverCharData.PosX      = transform.position.x;
+            _serverCharData.PosY      = transform.position.y;
+            _serverCharData.PosZ      = transform.position.z;
+
+            DatabaseManager.Instance?.SaveCharacter(_serverCharData, _serverAccountUsername);
+            _inventory?.ServerSaveAll(_serverCharData.CharacterId, _serverAccountUsername);
+        }
+
+        // ── ClientRpcs ─────────────────────────────────────────────────────
+
+        // BUG-05: struct em vez de 24 parâmetros avulsos
+        [ClientRpc]
+        private void RpcInitializeLocalPlayer(PlayerInitData d)
+        {
+            if (!isLocalPlayer) return;
+
+            var data = new CharacterData
+            {
+                CharacterName         = d.CharName,
+                Race                  = (CharacterRace)d.Race,
+                Level                 = d.Level,
+                Experience            = d.Exp,
+                ExperienceToNextLevel = d.ExpToNext,
+                FreeAttributePoints   = d.FreePoints,
+                AllocatedSTR          = d.AllocSTR,
+                AllocatedAGI          = d.AllocAGI,
+                AllocatedVIT          = d.AllocVIT,
+                AllocatedDEX          = d.AllocDEX,
+                AllocatedINT          = d.AllocINT,
+                AllocatedLUK          = d.AllocLUK,
+                CurrentHP             = d.CurHP,
+                CurrentMP             = d.CurMP,
+                BaseAttributes = new BaseAttributes
+                {
+                    STR = d.BaseSTR, AGI = d.BaseAGI, VIT = d.BaseVIT,
+                    DEX = d.BaseDEX, INT = d.BaseINT, LUK = d.BaseLUK
+                },
+                EquipmentBonuses = new EquipmentBonuses
+                {
+                    ATK = d.EquipATK, DEF = d.EquipDEF,
+                    MATK = d.EquipMATK, MDEF = d.EquipMDEF
+                }
+            };
+
+            if (_playerEntity == null)
+            {
+                _pendingClientInit = true;
+                _pendingInitData   = data;
+                return;
+            }
+
+            if (_clientInitialized) return;
+            _clientInitialized = true;
+            StartCoroutine(DelayedClientInit(data));
+        }
+
+        private IEnumerator DelayedClientInit(CharacterData data)
+        {
+            yield return null;
+
+            if (_playerEntity == null)
+            {
+                _playerEntity = GetComponent<PlayerEntity>();
+                if (_playerEntity == null)
+                {
+                    Debug.LogError("[NetworkPlayer] PlayerEntity não encontrado!");
+                    yield break;
+                }
+            }
+
+            _playerEntity.InitializeFromServer(data);
+            UIManager.Instance?.BindLocalPlayer(_playerEntity);
+            AttributeWindowUI.Instance?.BindPlayer(_playerEntity);
+
+            Debug.Log($"[Client] Inicializado: {data.CharacterName} Lv{data.Level}");
+        }
+
+        [ClientRpc]
+        private void RpcPlayerDied()
+        {
+            if (!isLocalPlayer) return;
+            if (_agent != null) { _agent.ResetPath(); _agent.isStopped = true; }
+            GetComponent<NetworkPlayerController>()?.SetEnabled(false);
+            _playerEntity?.OnServerDeath();
+            DeathScreenUI.Show(this);
+        }
+
+        [ClientRpc]
+        private void RpcOnRespawned(Vector3 position, float hp, float maxHp, float mp, float maxMp)
+        {
+            if (!isLocalPlayer) return;
+            if (_agent != null) { _agent.isStopped = false; _agent.Warp(position); }
+            GetComponent<NetworkPlayerController>()?.SetEnabled(true);
+            _playerEntity?.OnServerRespawn(position, hp, maxHp, mp, maxMp);
+            DeathScreenUI.Hide();
+        }
+
+        [ClientRpc] public void RpcPlayAnimation(string trigger) => _animator?.SetTrigger(trigger);
+
+        [ClientRpc]
+        private void RpcOnExpGained(long amount, bool leveledUp)
+        {
+            if (!isLocalPlayer) return;
+            FloatingTextManager.Instance?.Show($"+{amount} XP", transform.position + Vector3.up * 2f, Color.cyan);
+            if (leveledUp)
+            {
+                FloatingTextManager.Instance?.Show("LEVEL UP!", transform.position + Vector3.up * 2.5f, Color.yellow);
+                UIManager.Instance?.ShowMessage("Level up! Você evoluiu!");
+            }
+        }
+
+        [ClientRpc]
+        private void RpcShowHeal(float amount)
+        {
+            FloatingTextManager.Instance?.Show(
+                $"+{amount:0} HP", transform.position + Vector3.up * 1.5f, Color.green);
+        }
+
+        [ClientRpc]
+        public void RpcSkillConfirmed(int skillIndex, float cooldown)
+        {
+            if (!isLocalPlayer) return;
+            GetComponent<SkillSystem>()?.OnServerSkillConfirmed(skillIndex, cooldown);
+        }
+
+        [ClientRpc]
+        public void RpcSkillRejected(int skillIndex, string reason)
+        {
+            if (!isLocalPlayer) return;
+            GetComponent<SkillSystem>()?.OnServerSkillRejected(skillIndex, reason);
+        }
+
+        // ── Morte / Respawn ────────────────────────────────────────────────
+
+        [Server]
+        private void ServerDie()
+        {
+            CurrentHP = 0f;
+            StopRegenLoop();
+            if (_agent != null) _agent.ResetPath();
+            ServerSaveCharacter();
+            RpcPlayerDied();
+        }
+
+        [Server]
+        private void ServerRespawn()
+        {
+            if (_serverStats == null) return;
+
+            Vector3 pos = GetRespawnPosition();
+            transform.position = pos;
+            if (_agent != null && _agent.isOnNavMesh) _agent.Warp(pos);
+
+            CurrentHP = MaxHP * 0.5f;
+            CurrentMP = MaxMP * 0.5f;
+
+            if (_serverCharData != null)
+            {
+                _serverCharData.CurrentHP = CurrentHP;
+                _serverCharData.CurrentMP = CurrentMP;
+                ServerSaveCharacter();
+            }
+
+            _lastDamageTime = -999f;
+            StartRegenLoop();
+
+            RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);
+        }
+
+        [Server]
+        private Vector3 GetRespawnPosition()
+        {
+            if (_respawnPoints != null && _respawnPoints.Length > 0)
+                return _respawnPoints[UnityEngine.Random.Range(0, _respawnPoints.Length)].position;
+
+            if (_serverCharData != null)
+            {
+                var nm = RPGNetworkManager.singleton;
+                if (nm != null)
+                    return nm.GetSpawnPositionForRace(_serverCharData.Race, _serverCharData);
+            }
+
+            return Vector3.zero;
+        }
+
+        // ── SyncVar Hooks ──────────────────────────────────────────────────
+
+        private void OnNetNameChanged(string _, string v)
+        {
+            if (_nameTagText != null) _nameTagText.text = v;
+        }
+
+        private void OnNetHPChanged(float _, float newHP)
+        {
+            if (_hpBarSlider != null)
+            {
+                _hpBarSlider.maxValue = MaxHP;
+                _hpBarSlider.value    = newHP;
+                _hpBarSlider.gameObject.SetActive(newHP < MaxHP);
+            }
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.SetHPFromServer(newHP, MaxHP);
+        }
+
+        private void OnNetMaxHPChanged(float _, float newMax)
+        {
+            if (_hpBarSlider != null) _hpBarSlider.maxValue = newMax;
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.RefreshStatsFromServer(newMax, MaxMP);
+        }
+
+        private void OnNetMaxMPChanged(float _, float newMax)
+        {
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.RefreshStatsFromServer(MaxHP, newMax);
+        }
+
+        private void OnNetMPChanged(float _, float newMP)
+        {
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.SetMPFromServer(newMP, MaxMP);
+        }
+
+        private void OnNetLevelChanged(int _, int v)
+        {
+            if (isLocalPlayer) UIManager.Instance?.RefreshLevel(v);
+        }
+
+        private void OnNetFreePointsChanged(int _, int newPoints)
+        {
+            if (!isLocalPlayer) return;
+            AttributeWindowUI.Instance?.OnFreePointsUpdated(newPoints);
+        }
+
+        private void OnNetMovingChanged(bool _, bool v)
+        {
+            if (!isLocalPlayer) _animator?.SetBool("IsMoving", v);
+        }
+
+        private void OnNetExpChanged(long _, long __)
+        {
+            if (!isLocalPlayer) return;
+            UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
+            AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
+        }
+
+        private void OnNetExpToNextChanged(long _, long __)
+        {
+            if (!isLocalPlayer) return;
+            UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
+            AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
+        }
+
+        /// <summary>
+        /// BUG-03 CORRIGIDO: Sincroniza TODOS os campos do Data (base + allocated)
+        /// para que FullRefreshStatsFromData() calcule com os valores corretos do servidor.
+        /// </summary>
+        private void OnAllocatedChanged(int _, int __)
+        {
+            if (!isLocalPlayer) return;
+            if (_playerEntity == null || !_playerEntity.IsInitialized) return;
+
+            if (_playerEntity.Data != null)
+            {
+                // BUG-03: sincroniza BaseAttributes também (não só Allocated)
+                _playerEntity.Data.BaseAttributes.STR = BaseSTR;
+                _playerEntity.Data.BaseAttributes.AGI = BaseAGI;
+                _playerEntity.Data.BaseAttributes.VIT = BaseVIT;
+                _playerEntity.Data.BaseAttributes.DEX = BaseDEX;
+                _playerEntity.Data.BaseAttributes.INT = BaseINT;
+                _playerEntity.Data.BaseAttributes.LUK = BaseLUK;
+
+                _playerEntity.Data.AllocatedSTR = AllocatedSTR;
+                _playerEntity.Data.AllocatedAGI = AllocatedAGI;
+                _playerEntity.Data.AllocatedVIT = AllocatedVIT;
+                _playerEntity.Data.AllocatedDEX = AllocatedDEX;
+                _playerEntity.Data.AllocatedINT = AllocatedINT;
+                _playerEntity.Data.AllocatedLUK = AllocatedLUK;
+            }
+
+            _playerEntity.FullRefreshStatsFromData();
+        }
+    }
+}
