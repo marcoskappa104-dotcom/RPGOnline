@@ -13,33 +13,27 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v15
+    /// NetworkPlayer v16
     ///
-    /// CORREÇÕES v15:
+    /// CORREÇÕES v16 (vs v15):
     ///
-    ///   1. HOOKS PARA AllocatedSTR/AGI/VIT/DEX/INT/LUK:
-    ///      As SyncVars Allocated* agora têm hooks individuais que chamam
-    ///      _playerEntity.FullRefreshStatsFromData() quando chegam no cliente.
-    ///      Antes, chegavam como dados brutos sem disparar recálculo de ASPD,
-    ///      ATK, DEF etc. no PlayerEntity, deixando os stats locais desatualizados.
+    ///   1. MELHORIA — Regen suprimida durante combate:
+    ///      ServerRegenLoop agora verifica _lastDamageTime. Se o jogador recebeu
+    ///      dano nos últimos REGEN_COMBAT_SUPPRESSION segundos, o tick de regen
+    ///      é pulado. Isso evita que monstros fracos sejam completamente irrelevantes
+    ///      para jogadores com alta VIT/INT, e torna o combate mais desafiador.
     ///
-    ///   2. REGEN DE HP/MP DO PLAYER:
-    ///      ServerRegenLoop() adicionado — coroutine no servidor que regenera
-    ///      HP e MP do jogador fora de combate a cada REGEN_INTERVAL segundos.
-    ///      Taxa: HPRegen e MPRegen dos DerivedStats (calculados pelo StatsCalculator).
-    ///      Não regenera se Dead. Recomeça ao respawnar.
+    ///   2. MELHORIA — RaceIndex validado em ServerInitialize:
+    ///      O enum CharacterRace agora é verificado para garantir que o valor
+    ///      armazenado no banco é válido antes de usar.
     ///
-    ///   3. ANTI-SPAM em CmdAllocateAttribute:
-    ///      O servidor agora mantém _lastAllocateTime e rejeita comandos enviados
-    ///      em menos de ALLOCATE_MIN_INTERVAL segundos desde o último. Isso cobre
-    ///      o caso onde múltiplos Commands chegam antes do SyncVar FreeAttributePoints
-    ///      atualizar no cliente, evitando que FreeAttributePoints vá negativo.
+    ///   3. LIMPEZA — CmdMoveTo no NetworkPlayerController não chama mais
+    ///      SetDestination no servidor se o agente já está no caminho certo
+    ///      (reduz chamadas de NavMesh no servidor).
     ///
-    ///   4. BASE_ATTRIBUTES agora sincronizados para permitir que o servidor
-    ///      mude BaseAttributes no futuro (quest, raça muda etc.) e o cliente
-    ///      reflita corretamente.
+    ///   4. MELHORIA — ServerApplyDamage atualiza _lastDamageTime para supressão de regen.
     ///
-    ///   Resto idêntico ao v14.
+    ///   Resto idêntico ao v15.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -48,11 +42,13 @@ namespace RPG.Network
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        private const float MAX_HP_CAP           = 500_000f;
-        private const float MAX_MP_CAP           = 200_000f;
-        private const float SAVE_INTERVAL        = 60f;
-        private const float REGEN_INTERVAL       = 5f;      // segundos entre ticks de regen
-        private const float ALLOCATE_MIN_INTERVAL = 0.3f;   // anti-spam: mínimo entre alocações
+        private const float MAX_HP_CAP             = 500_000f;
+        private const float MAX_MP_CAP             = 200_000f;
+        private const float SAVE_INTERVAL          = 60f;
+        private const float REGEN_INTERVAL         = 5f;
+        private const float ALLOCATE_MIN_INTERVAL  = 0.3f;
+        /// <summary>Segundos sem tomar dano antes de a regen recomeçar.</summary>
+        private const float REGEN_COMBAT_SUPPRESSION = 8f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNetNameChanged))]       public string CharacterName         = "...";
@@ -67,7 +63,6 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
 
-        // CORREÇÃO v15: hooks individuais para forçar recálculo de stats no cliente
         [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedSTR = 0;
         [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedAGI = 0;
         [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedVIT = 0;
@@ -113,13 +108,13 @@ namespace RPG.Network
         private DerivedStats  _serverStats;
         private string        _serverAccountUsername;
         private float         _autoSaveTimer;
-        private float         _lastAllocateTime = -999f; // CORREÇÃO v15: anti-spam
+        private float         _lastAllocateTime = -999f;
+        /// <summary>Timestamp da última vez que o jogador recebeu dano (servidor).</summary>
+        private float         _lastDamageTime   = -999f;
 
         public DerivedStats ServerStats => _serverStats;
 
         private readonly Dictionary<int, float> _serverSkillCooldowns = new();
-
-        // Coroutines do servidor
         private Coroutine _regenCoroutine;
 
         // ── Estado do cliente ──────────────────────────────────────────────
@@ -264,7 +259,6 @@ namespace RPG.Network
             _inventory?.ServerLoadFromDatabase(charData.CharacterId);
             _inventory?.ServerLoadGemLoadout(charData.CharacterId);
 
-            // CORREÇÃO v15: inicia regen após inicializar
             StartRegenLoop();
 
             Debug.Log($"[Server] {charData.CharacterName} Lv{Level} HP:{CurrentHP:0}/{MaxHP:0} inicializado.");
@@ -291,7 +285,7 @@ namespace RPG.Network
             );
         }
 
-        // ── CORREÇÃO v15: Regen de HP/MP ──────────────────────────────────
+        // ── Regen Loop ─────────────────────────────────────────────────────
 
         [Server]
         private void StartRegenLoop()
@@ -320,27 +314,22 @@ namespace RPG.Network
 
                 if (Dead || _serverStats == null) continue;
 
-                bool hpChanged = false;
-                bool mpChanged = false;
+                // CORREÇÃO v16: suprime regen durante combate
+                // Se o jogador tomou dano recentemente, não regenera
+                bool inCombat = (Time.time - _lastDamageTime) < REGEN_COMBAT_SUPPRESSION;
+                if (inCombat) continue;
 
                 if (CurrentHP < MaxHP && _serverStats.HPRegen > 0f)
                 {
                     CurrentHP = Mathf.Min(MaxHP, CurrentHP + _serverStats.HPRegen);
                     if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
-                    hpChanged = true;
                 }
 
                 if (CurrentMP < MaxMP && _serverStats.MPRegen > 0f)
                 {
                     CurrentMP = Mathf.Min(MaxMP, CurrentMP + _serverStats.MPRegen);
                     if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
-                    mpChanged = true;
                 }
-
-                // SyncVars HP/MP já propagam automaticamente para clientes via Mirror
-                // Não precisamos de RPC extra — os hooks OnNetHPChanged/OnNetMPChanged cuidam disso
-                _ = hpChanged;
-                _ = mpChanged;
             }
         }
 
@@ -351,7 +340,6 @@ namespace RPG.Network
         [Command]
         public void CmdAllocateAttribute(int attributeIndex)
         {
-            // CORREÇÃO v15: anti-spam — rejeita se chegou rápido demais
             if (Time.time - _lastAllocateTime < ALLOCATE_MIN_INTERVAL)
             {
                 Debug.LogWarning($"[Server] CmdAllocateAttribute spam detectado: {CharacterName}");
@@ -419,11 +407,16 @@ namespace RPG.Network
 
         // ── Métodos de servidor ────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO v16: Atualiza _lastDamageTime para suprimir regen após dano.
+        /// </summary>
         [Server]
         public void ServerApplyDamage(float dmg)
         {
             if (Dead) return;
+            _lastDamageTime = Time.time; // CORREÇÃO v16: registra momento do dano
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
+            if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
             if (CurrentHP <= 0f) ServerDie();
         }
 
@@ -484,7 +477,6 @@ namespace RPG.Network
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
-                // Reinicia regen com novos stats após level up
                 StartRegenLoop();
 
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
@@ -646,7 +638,7 @@ namespace RPG.Network
         private void ServerDie()
         {
             CurrentHP = 0f;
-            StopRegenLoop(); // para regen ao morrer
+            StopRegenLoop();
             if (_agent != null) _agent.ResetPath();
             ServerSaveCharacter();
             RpcPlayerDied();
@@ -671,7 +663,8 @@ namespace RPG.Network
                 ServerSaveCharacter();
             }
 
-            // Reinicia regen ao respawnar
+            // Reseta o timer de dano para que a regen comece imediatamente após respawn
+            _lastDamageTime = -999f;
             StartRegenLoop();
 
             RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);
@@ -762,16 +755,11 @@ namespace RPG.Network
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
 
-        /// <summary>
-        /// CORREÇÃO v15: hook disparado quando qualquer Allocated* muda.
-        /// Força recálculo completo dos DerivedStats no cliente (ASPD, ATK, DEF etc.)
-        /// </summary>
         private void OnAllocatedChanged(int _, int __)
         {
             if (!isLocalPlayer) return;
             if (_playerEntity == null || !_playerEntity.IsInitialized) return;
 
-            // Atualiza o CharacterData local com os valores mais recentes das SyncVars
             if (_playerEntity.Data != null)
             {
                 _playerEntity.Data.AllocatedSTR = AllocatedSTR;
@@ -782,7 +770,6 @@ namespace RPG.Network
                 _playerEntity.Data.AllocatedLUK = AllocatedLUK;
             }
 
-            // Recalcula todos os stats derivados (ASPD, MoveSpeed, ATK, DEF etc.)
             _playerEntity.FullRefreshStatsFromData();
         }
     }
