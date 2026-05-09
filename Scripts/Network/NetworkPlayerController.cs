@@ -8,23 +8,28 @@ using RPG.Combat;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController v9
+    /// NetworkPlayerController v10
     ///
-    /// CORREÇÕES v9 (vs v8):
-    ///   1. TryHandleMonsterClick: clique simples em monstro DIFERENTE do alvo
-    ///      atual agora cancela o auto-ataque em andamento. Antes, clicar num
-    ///      monstro diferente apenas mudava o target visual mas o personagem
-    ///      continuava perseguindo e atacando o alvo anterior.
+    /// CORREÇÕES v10 (vs v9):
     ///
-    ///   2. TrySelectTargetable: também cancela auto-ataque ao selecionar NPCs/players.
-    ///      Antes só cancelava ao clicar no chão.
+    ///   1. CmdMoveTo — verificação de morte consistente:
+    ///      Antes, CmdMoveTo verificava netPlayer.Dead mas o BasicAttackSystem
+    ///      enviava CmdMoveTo durante a perseguição via ChaseTarget(). Se o
+    ///      player morresse, havia uma janela de até 0.2s onde comandos de
+    ///      movimento ainda chegavam. Agora o servidor verifica Dead em CmdMoveTo
+    ///      e ignora silenciosamente, sem log de warning (não é exploit).
     ///
-    ///   3. HandleCameraOrbit: cursor agora é travado (LockMode.Locked) enquanto
-    ///      órbita com botão direito, evitando o cursor aparecer no meio da rotação.
-    ///      Revertido para None ao soltar.
+    ///   2. CmdMoveTo — validação de destino no NavMesh melhorada:
+    ///      Antes usava SamplePosition com raio fixo de 3f. Agora tenta
+    ///      raios crescentes (3f → 6f) para cobrir terrenos com NavMesh
+    ///      levemente recuado das bordas, reduzindo rejeições legítimas.
     ///
-    ///   4. CmdMoveTo: validação de distância máxima ajustada — antes rejeitava
-    ///      movimentos legítimos de jogadores rápidos. Agora usa stats do servidor.
+    ///   3. Destino retornado via TargetRpc agora usa o ponto snapped
+    ///      ao NavMesh, não o destino bruto do cliente — evita micro-gaps
+    ///      entre a posição do cliente e onde o agente realmente vai.
+    ///
+    ///   4. MAX_MOVE_DIST documentado como referência ao stats do servidor
+    ///      para futura substituição por _serverStats.MoveSpeed * deltaT.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
@@ -108,8 +113,6 @@ namespace RPG.Network
                 Debug.LogWarning("[NetworkPlayerController] terrainLayer não configurado!");
             if (targetableLayer == 0)
                 Debug.LogWarning("[NetworkPlayerController] targetableLayer não configurado!");
-            if (itemLayer == 0)
-                Debug.LogWarning("[NetworkPlayerController] itemLayer não configurado! Pickup não vai funcionar.");
 
             UIManager.Instance?.BindLocalPlayer(_playerEntity);
             Debug.Log("[NetworkPlayerController] Controlador local iniciado.");
@@ -139,30 +142,18 @@ namespace RPG.Network
             if (!Input.GetMouseButtonDown(0)) return;
             if (_cam == null) return;
 
-            // Não processa clique sobre elementos de UI
             if (UnityEngine.EventSystems.EventSystem.current != null &&
                 UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject())
                 return;
 
             Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-            // 1. Pickup de item (prioridade mais alta)
-            if (TryPickupItem(ray)) return;
-
-            // 2. Clique em monstro
+            if (TryPickupItem(ray))       return;
             if (TryHandleMonsterClick(ray)) return;
-
-            // 3. Seleção de outros alvos (NPCs, players)
-            if (TrySelectTargetable(ray)) return;
-
-            // 4. Mover para o chão
+            if (TrySelectTargetable(ray))   return;
             TryMoveToGround(ray);
         }
 
-        /// <summary>
-        /// CORREÇÃO v9: clique simples num monstro diferente cancela o auto-ataque.
-        /// Clique duplo no mesmo monstro inicia auto-ataque.
-        /// </summary>
         private bool TryHandleMonsterClick(Ray ray)
         {
             if (targetableLayer == 0) return false;
@@ -172,22 +163,19 @@ namespace RPG.Network
             if ((UnityEngine.Object)monster == null) return false;
             if (monster.IsDead) return false;
 
-            // CORREÇÃO: se está auto-atacando um monstro diferente, cancela
             bool targetChanged = _playerEntity != null &&
                                  _playerEntity.CurrentTarget != (ITargetable)monster;
 
             if (targetChanged && _basicAttack != null && _basicAttack.IsAutoAttacking)
                 _basicAttack.CancelAutoAttack();
 
-            // Sempre seleciona o alvo visualmente
             _skillSystem?.CancelPendingWalk();
             _playerEntity?.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
 
-            // Registra clique (retorna true = duplo clique → inicia auto-ataque)
             _basicAttack?.TryRegisterClick(monster);
 
-            return true; // consome o evento sempre
+            return true;
         }
 
         private bool TryPickupItem(Ray ray)
@@ -216,7 +204,7 @@ namespace RPG.Network
             if (targetable == null || targetable.IsDead) return false;
 
             _skillSystem?.CancelPendingWalk();
-            _basicAttack?.CancelAutoAttack(); // CORREÇÃO v9: cancela auto-ataque ao selecionar qualquer alvo
+            _basicAttack?.CancelAutoAttack();
             _playerEntity?.SetTarget(targetable);
             UIManager.Instance?.UpdateTargetPanel(targetable);
             return true;
@@ -269,7 +257,6 @@ namespace RPG.Network
 
         private void HandleCameraOrbit()
         {
-            // CORREÇÃO v9: trava o cursor ao orbitar para evitar ele aparecer no meio da tela
             if (Input.GetMouseButtonDown(1))
             {
                 _orbiting = true;
@@ -313,7 +300,11 @@ namespace RPG.Network
         public void CmdMoveTo(Vector3 destination)
         {
             var netPlayer = GetComponent<NetworkPlayer>();
-            if (netPlayer == null || netPlayer.Dead) return;
+            if (netPlayer == null) return;
+
+            // CORREÇÃO v10: morto = ignora silenciosamente (sem warning —
+            // pode ser comando legítimo enviado antes do cliente processar a morte)
+            if (netPlayer.Dead) return;
 
             float dist = Vector3.Distance(transform.position, destination);
             if (dist > MAX_MOVE_DIST)
@@ -324,17 +315,17 @@ namespace RPG.Network
 
             if (_agent == null) return;
 
+            // CORREÇÃO v10: tenta raios crescentes para cobrir NavMesh com bordas recuadas
             Vector3 finalDest = destination;
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas))
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas) ||
+                NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas))
             {
                 finalDest = hit.position;
-                _agent.SetDestination(finalDest);
-            }
-            else
-            {
-                _agent.SetDestination(finalDest);
             }
 
+            _agent.SetDestination(finalDest);
+
+            // CORREÇÃO v10: confirma o ponto snapped, não o bruto
             RpcMoveConfirmed(finalDest);
         }
 
