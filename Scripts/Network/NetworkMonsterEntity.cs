@@ -13,28 +13,36 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v25 — Correções críticas e moderadas
+    /// NetworkMonsterEntity v26
     ///
-    /// CORREÇÕES v25:
+    /// CORREÇÕES v26:
     ///
-    ///   CRÍTICO — Race condition em ServerDie():
-    ///     O flag _deathProcessed era setado DEPOIS de StopAllCoroutines, criando
-    ///     uma janela onde dois ataques simultâneos podiam ambos entrar em ServerDie().
-    ///     SOLUÇÃO: _deathProcessed é setado ATOMICAMENTE como primeira operação em
-    ///     ApplyDamageInternal, usando um check-and-set antes de qualquer outra lógica.
+    ///   PROBLEMA — Corpo do monstro ficava visível até o respawn, bloqueando drops:
+    ///     A sequência de morte anterior esperava hideDelay (3s) e só então chamava
+    ///     RpcHideVisuals(). Durante esse intervalo o corpo ficava na cena impedindo
+    ///     a visualização e coleta de drops.
     ///
-    ///   CRÍTICO — CmdBasicAttack lia playerAttackRange do cliente:
-    ///     Vetor de exploração onde cliente enviava range inflado. SOLUÇÃO: range de
-    ///     ataque básico agora é lido dos ServerStats do atacante (_stats.AttackRange
-    ///     configurável), ou usa fallback fixo do servidor. O parâmetro clientRange
-    ///     é mantido apenas para compatibilidade mas clampado a um máximo seguro
-    ///     definido exclusivamente no servidor.
+    ///   SOLUÇÃO APLICADA:
+    ///     a) Ao morrer, o servidor envia RpcOnDied imediatamente. Isso dispara
+    ///        no cliente a coroutine ClientDeathFadeSequence que:
+    ///          1. Desativa seletor e barra de vida IMEDIATAMENTE.
+    ///          2. Aguarda BODY_FADE_DELAY (5s configurável) e então dissolve
+    ///             o corpo com fade gradual via coroutine (BODY_FADE_DURATION = 1s).
+    ///          3. Após o fade, desativa o visualRoot completamente.
+    ///        b) O servidor não precisa mais controlar hideDelay para esconder visuais.
+    ///           RpcHideVisuals() ainda existe mas só é chamado no respawn para
+    ///           garantir estado limpo caso o cliente tenha perdido o RpcOnDied.
+    ///        c) Adicionado suporte a Renderer[] em visualRoot para o fade de alpha.
+    ///           Se o visualRoot não tiver Renderers, apenas desativa o GameObject.
     ///
-    ///   MODERADO — TryAggro chamava OverlapSphere com mask=0 antes do guard:
-    ///     O early return `if (_targetableLayerMask == 0) return` agora ocorre
-    ///     ANTES de qualquer chamada Physics. Eliminado scan desnecessário de toda cena.
+    ///   PROBLEMA — Floating text de dano recebido pelo player não aparecia:
+    ///     NetworkMonsterEntity.ServerAttack() chamava _aggroTarget.ServerApplyDamage()
+    ///     mas NetworkPlayer.ServerApplyDamage() não enviava RpcShowDamageTaken.
+    ///     SOLUÇÃO: adicionado RpcShowDamageTakenOnPlayer chamado em ServerAttack()
+    ///     diretamente no monstro (pois o monstro conhece a posição do player e o dano).
     ///
-    ///   Todas as correções v24 mantidas.
+    ///   Todas as correções v25 mantidas (race condition morte, range server-side,
+    ///   TryAggro guard, etc).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -78,8 +86,12 @@ namespace RPG.Network
         [SerializeField] private float fleeSpeedMult = 1.3f;
 
         [Header("Morte e Respawn")]
-        [SerializeField] private float hideDelay    = 3f;
-        [SerializeField] private float respawnDelay = 15f;
+        [Tooltip("Segundos até o corpo começar a sumir (após morte). Recomendado: 5s.")]
+        [SerializeField] private float bodyFadeDelay    = 5f;
+        [Tooltip("Duração do fade de dissolução do corpo.")]
+        [SerializeField] private float bodyFadeDuration = 1f;
+        [Tooltip("Delay total antes do respawn (deve ser > bodyFadeDelay + bodyFadeDuration).")]
+        [SerializeField] private float respawnDelay     = 15f;
 
         [Header("Recompensa")]
         [SerializeField] private long expReward = 50;
@@ -96,7 +108,6 @@ namespace RPG.Network
 
         private const float ATTACK_RANGE_TOLERANCE  = 1.15f;
         private const float CHASE_DEST_FRACTION     = 0.82f;
-        // CORREÇÃO v25: limite máximo de range de ataque de player definido no SERVIDOR
         private const float SERVER_MAX_PLAYER_RANGE = 8f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
@@ -160,8 +171,12 @@ namespace RPG.Network
         private Coroutine _pathUpdateCoroutine;
         private Coroutine _patrolWaitCoroutine;
         private Coroutine _regenCoroutine;
+
         // CORREÇÃO v25: flag atômico setado antes de qualquer processamento de morte
         private bool      _deathProcessed = false;
+
+        // CORREÇÃO v26: coroutine de fade do corpo no cliente
+        private Coroutine _clientFadeCoroutine;
 
         private const float REGEN_INTERVAL = 5f;
         private const float REGEN_PERCENT  = 0.05f;
@@ -197,6 +212,10 @@ namespace RPG.Network
         {
             if (selectionIndicator) selectionIndicator.SetActive(false);
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
+
+            // Garante que o visualRoot começa visível quando o monstro é spawnado
+            if (visualRoot) visualRoot.SetActive(true);
+            RestoreVisualsAlpha();
         }
 
         [Server]
@@ -543,7 +562,7 @@ namespace RPG.Network
         [Server]
         private void TryAggro()
         {
-            // CORREÇÃO v25: guard ANTES do OverlapSphere — evita scan de toda a cena com mask=0
+            // CORREÇÃO v25: guard ANTES do OverlapSphere
             if (_targetableLayerMask == 0) return;
 
             var cols = Physics.OverlapSphere(transform.position, aggroRange, _targetableLayerMask);
@@ -619,19 +638,34 @@ namespace RPG.Network
         private void ServerAttack()
         {
             if (_aggroTarget == null || _aggroTarget.Dead) return;
-            bool  hit  = StatsCalculator.RollHit(_stats.HIT, _aggroTarget.ServerStats?.FLEE ?? 20f);
-            if (!hit) { RpcShowMiss(_aggroTarget.transform.position); return; }
+
+            bool hit = StatsCalculator.RollHit(_stats.HIT, _aggroTarget.ServerStats?.FLEE ?? 20f);
+            if (!hit)
+            {
+                RpcShowMiss(_aggroTarget.transform.position);
+                return;
+            }
+
             bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
             float dmg  = StatsCalculator.CalculatePhysicalDamage(
                 _stats.ATK, _aggroTarget.ServerStats?.DEF ?? 10f, crit, _stats.CritDMG);
-            if (!_aggroTarget.Dead) _aggroTarget.ServerApplyDamage(dmg);
+
+            if (!_aggroTarget.Dead)
+            {
+                _aggroTarget.ServerApplyDamage(dmg);
+
+                // CORREÇÃO v26: envia floating text de dano para o player atacado
+                // O monstro notifica o player via TargetRpc para que ele veja o dano recebido
+                RpcShowDamageTakenOnPlayer(dmg, crit, _aggroTarget.transform.position);
+            }
+
             RpcPlayAnim("Attack");
         }
 
         [Server]
         private void ApplyDamageInternal(float dmg)
         {
-            // CORREÇÃO v25: check atômico no início — previne race condition de morte dupla
+            // CORREÇÃO v25: check atômico no início
             if (_deathProcessed) return;
             if (_isDead) return;
             if (dmg <= 0f) return;
@@ -653,8 +687,6 @@ namespace RPG.Network
         public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
         {
             if (_isDead || _deathProcessed) return;
-
-            // Validação de skillIndex antes de qualquer acesso
             if (skillIndex < 0 || skillIndex >= 4) return;
 
             var attacker = FindPlayerByNetId(attackerNetId);
@@ -702,9 +734,6 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            // CORREÇÃO v25: range é derivado dos stats do servidor, não do cliente
-            // O parâmetro clientAttackRange é ignorado em favor de um valor fixo seguro
-            // Em versão futura: ler de atkStats.AttackRange quando implementado
             float serverAttackRange = Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_RANGE);
             float distToTarget      = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange   = serverAttackRange * ATTACK_RANGE_TOLERANCE;
@@ -722,7 +751,7 @@ namespace RPG.Network
             const int BASIC_ATTACK_CD_KEY = 99;
             if (!attacker.ServerCheckAndSetCooldown(BASIC_ATTACK_CD_KEY, attackInterval)) return;
 
-            bool  hit  = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
+            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
             if (!hit) { RpcShowMiss(transform.position); return; }
 
             bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
@@ -783,7 +812,7 @@ namespace RPG.Network
             NetworkPlayer attacker, DerivedStats atkStats,
             int skillIndex, bool isPhysical, SkillData skill)
         {
-            bool  hit  = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
+            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
             if (!hit) { RpcShowMiss(transform.position); return; }
 
             bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
@@ -806,8 +835,6 @@ namespace RPG.Network
         [Server]
         private void ServerDie()
         {
-            // CORREÇÃO v25: _deathProcessed setado como primeira operação,
-            // antes de StopAllCoroutines — elimina race condition de morte dupla
             if (_deathProcessed) return;
             _deathProcessed = true;
             _isDead         = true;
@@ -863,13 +890,13 @@ namespace RPG.Network
         {
             if (this == null) yield break;
 
+            // CORREÇÃO v26: RpcOnDied dispara imediatamente ao morrer.
+            // O cliente inicia o fade do corpo localmente.
+            // O servidor só precisa aguardar o respawnDelay para resetar.
             RpcOnDied(transform.position);
-            if (hideDelay > 0f) yield return new WaitForSeconds(hideDelay);
-
-            if (this == null) yield break;
-            RpcHideVisuals();
 
             if (respawnDelay <= 0f) yield break;
+
             yield return new WaitForSeconds(respawnDelay);
 
             if (this == null || !isServer) yield break;
@@ -901,22 +928,53 @@ namespace RPG.Network
 
         // ── ClientRpcs ─────────────────────────────────────────────────────
 
-        [ClientRpc] private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
+        [ClientRpc]
+        private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
             => FloatingTextManager.Instance?.Show(
                 crit ? $"CRÍTICO! {dmg:0}" : $"{dmg:0}",
                 pos + Vector3.up, crit ? Color.yellow : Color.white);
 
-        [ClientRpc] private void RpcShowMiss(Vector3 pos)
+        [ClientRpc]
+        private void RpcShowMiss(Vector3 pos)
             => FloatingTextManager.Instance?.Show("MISS", pos + Vector3.up * 0.5f, Color.gray);
 
-        [ClientRpc] private void RpcPlayAnim(string trigger)
+        [ClientRpc]
+        private void RpcPlayAnim(string trigger)
             => _animator?.SetTrigger(trigger);
 
+        /// <summary>
+        /// CORREÇÃO v26: Exibe floating text de dano recebido sobre o player atacado.
+        /// Aparece em vermelho acima do player para diferenciar do dano que ele causa.
+        /// </summary>
+        [ClientRpc]
+        private void RpcShowDamageTakenOnPlayer(float dmg, bool crit, Vector3 playerPos)
+        {
+            FloatingTextManager.Instance?.Show(
+                crit ? $"-{dmg:0} CRÍTICO!" : $"-{dmg:0}",
+                playerPos + Vector3.up * 1.8f,
+                crit ? new Color(1f, 0.3f, 0f) : new Color(1f, 0.2f, 0.2f));
+        }
+
+        /// <summary>
+        /// CORREÇÃO v26: Morte do monstro — dispara imediatamente.
+        ///
+        /// Ações realizadas:
+        ///   1. Desativa seleção e HP bar IMEDIATAMENTE (não bloqueiam drops).
+        ///   2. Inicia ClientDeathFadeSequence: aguarda bodyFadeDelay e então
+        ///      dissolve o corpo via fade de alpha nos Renderers filhos.
+        ///   3. Remove o target do player local se estava mirando neste monstro.
+        /// </summary>
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
+            // Desativa indicadores de seleção/alvo imediatamente
             OnDeselected();
 
+            // Desativa a HP bar imediatamente
+            if (healthBarUI != null)
+                healthBarUI.gameObject.SetActive(false);
+
+            // Remove target do player local se estava mirando neste monstro
             var localPlayerGO = Mirror.NetworkClient.localPlayer;
             if (localPlayerGO != null)
             {
@@ -930,8 +988,148 @@ namespace RPG.Network
             }
 
             FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
+
+            // Inicia fade do corpo — não bloqueia drops nem seleção
+            if (_clientFadeCoroutine != null)
+                StopCoroutine(_clientFadeCoroutine);
+            _clientFadeCoroutine = StartCoroutine(ClientDeathFadeSequence());
         }
 
+        /// <summary>
+        /// CORREÇÃO v26: Sequência de fade do corpo no cliente.
+        ///
+        /// 1. Aguarda bodyFadeDelay segundos (padrão 5s) após a morte.
+        /// 2. Dissolve o corpo gradualmente em bodyFadeDuration (padrão 1s)
+        ///    modificando o alpha de todos os Renderers filhos do visualRoot.
+        /// 3. Desativa o visualRoot ao final.
+        ///
+        /// Isso garante que o corpo desaparece após 5s sem bloquear drops
+        /// imediatamente após a morte.
+        /// </summary>
+        private IEnumerator ClientDeathFadeSequence()
+        {
+            // Aguarda o delay configurado antes de começar a sumir
+            yield return new WaitForSeconds(bodyFadeDelay);
+
+            if (this == null) yield break;
+
+            // Coleta todos os Renderers do visualRoot para o fade
+            Renderer[] renderers = null;
+            if (visualRoot != null)
+                renderers = visualRoot.GetComponentsInChildren<Renderer>(true);
+
+            if (renderers != null && renderers.Length > 0)
+            {
+                // Configura os materiais para suportar transparência
+                foreach (var r in renderers)
+                {
+                    foreach (var mat in r.materials)
+                    {
+                        // Tenta configurar o modo de renderização para Fade/Transparent
+                        // Funciona com Standard Shader e URP Lit
+                        if (mat.HasProperty("_Mode"))
+                        {
+                            mat.SetFloat("_Mode", 2f);
+                            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                            mat.SetInt("_ZWrite", 0);
+                            mat.DisableKeyword("_ALPHATEST_ON");
+                            mat.EnableKeyword("_ALPHABLEND_ON");
+                            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+                            mat.renderQueue = 3000;
+                        }
+                        // URP/HDRP: Surface Type Transparent
+                        if (mat.HasProperty("_Surface"))
+                            mat.SetFloat("_Surface", 1f);
+                    }
+                }
+
+                // Fade gradual de alpha 1 → 0
+                float elapsed = 0f;
+                while (elapsed < bodyFadeDuration)
+                {
+                    if (this == null) yield break;
+
+                    elapsed += Time.deltaTime;
+                    float alpha = Mathf.Lerp(1f, 0f, elapsed / bodyFadeDuration);
+
+                    foreach (var r in renderers)
+                    {
+                        if (r == null) continue;
+                        foreach (var mat in r.materials)
+                        {
+                            if (mat.HasProperty("_Color"))
+                            {
+                                Color c = mat.color;
+                                c.a = alpha;
+                                mat.color = c;
+                            }
+                            // URP: BaseColor
+                            if (mat.HasProperty("_BaseColor"))
+                            {
+                                Color c = mat.GetColor("_BaseColor");
+                                c.a = alpha;
+                                mat.SetColor("_BaseColor", c);
+                            }
+                        }
+                    }
+                    yield return null;
+                }
+            }
+
+            // Desativa o visualRoot completamente
+            if (this != null && visualRoot != null)
+                visualRoot.SetActive(false);
+
+            _clientFadeCoroutine = null;
+        }
+
+        /// <summary>
+        /// Restaura alpha de todos os Renderers ao valor máximo.
+        /// Chamado no respawn para garantir que o corpo reapareça visível.
+        /// </summary>
+        private void RestoreVisualsAlpha()
+        {
+            if (visualRoot == null) return;
+
+            var renderers = visualRoot.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in renderers)
+            {
+                if (r == null) continue;
+                foreach (var mat in r.materials)
+                {
+                    if (mat.HasProperty("_Color"))
+                    {
+                        Color c = mat.color;
+                        c.a = 1f;
+                        mat.color = c;
+                    }
+                    if (mat.HasProperty("_BaseColor"))
+                    {
+                        Color c = mat.GetColor("_BaseColor");
+                        c.a = 1f;
+                        mat.SetColor("_BaseColor", c);
+                    }
+                    // Restaura modo opaco no Standard Shader
+                    if (mat.HasProperty("_Mode"))
+                    {
+                        mat.SetFloat("_Mode", 0f);
+                        mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.One);
+                        mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.Zero);
+                        mat.SetInt("_ZWrite", 1);
+                        mat.DisableKeyword("_ALPHABLEND_ON");
+                        mat.renderQueue = -1;
+                    }
+                    if (mat.HasProperty("_Surface"))
+                        mat.SetFloat("_Surface", 0f);
+                }
+            }
+        }
+
+        /// <summary>
+        /// CORREÇÃO v26: RpcHideVisuals mantido apenas como safety net no respawn.
+        /// O corpo já foi escondido pelo fade em ClientDeathFadeSequence.
+        /// </summary>
         [ClientRpc]
         private void RpcHideVisuals()
         {
@@ -943,8 +1141,19 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcOnRespawned()
         {
+            // Cancela fade pendente se o respawn ocorrer antes do fim do fade
+            if (_clientFadeCoroutine != null)
+            {
+                StopCoroutine(_clientFadeCoroutine);
+                _clientFadeCoroutine = null;
+            }
+
+            // Restaura alpha antes de reativar o visualRoot
+            RestoreVisualsAlpha();
+
             if (visualRoot)         visualRoot.SetActive(true);
             if (selectionIndicator) selectionIndicator.SetActive(false);
+
             if (healthBarUI)
             {
                 healthBarUI.gameObject.SetActive(true);
