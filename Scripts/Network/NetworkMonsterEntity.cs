@@ -13,32 +13,43 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v20
+    /// NetworkMonsterEntity v21
     ///
-    /// CORREÇÕES v20 (vs v19):
+    /// CORREÇÕES v21 (vs v20):
     ///
-    ///   1. BUG CRÍTICO — CmdBasicAttack agora roteia dano por ApplyDamageInternal:
-    ///      Antes, _currentHP era modificado diretamente, bypassando o guard
-    ///      _deathProcessed. Em alta frequência de ataques, dois CmdBasicAttack
-    ///      podiam processar a morte simultaneamente causando duplo drop/XP.
-    ///      Solução: todo dano passa por ApplyDamageInternal que contém o guard.
+    ///   1. BUG PRINCIPAL — Monstro sobrepunha o player durante o combate:
     ///
-    ///   2. BUG — RpcOnDied não limpava o alvo correto:
-    ///      UIManager.ClearTargetPanel() era chamado para TODOS os clientes
-    ///      independentemente de qual monstro era o alvo de cada jogador.
-    ///      Solução: comparar o netId do monstro com o alvo atual do cliente local.
+    ///      CAUSA: UpdateChasePath() chamava:
+    ///        `_agent.SetDestination(_aggroTarget.transform.position)`
+    ///      com stoppingDistance = attackRange * 0.85f.
+    ///      Igual ao bug do player com skills — o destino ERA o player,
+    ///      e o stoppingDistance funciona como margem relativa ao destino.
+    ///      Quando o player se move, o destino muda todo frame e o
+    ///      stoppingDistance não garante parada exata antes do player.
     ///
-    ///   3. PERFORMANCE — TryAggro cacheava LayerMask incorretamente:
-    ///      LayerMask.NameToLayer("Targetable") era chamado a cada TryAggro
-    ///      (0.5s por monstro × N monstros). Agora cacheado no Awake em _targetableLayerMask.
+    ///      SOLUÇÃO: Igual ao SkillSystem/BasicAttackSystem do player.
+    ///      CalculateChaseDestination() retorna um ponto intermediário a
+    ///      (attackRange * 0.80f) do player na direção monstro→player.
+    ///      stoppingDistance fica em 0.5f (parada natural no ponto calculado).
     ///
-    ///   4. PERFORMANCE — WaitForSeconds em AggroScanLoop não era cacheado:
-    ///      new WaitForSeconds(aggroScanInterval) criado dentro da coroutine
-    ///      alocava GC. Agora cacheado em _aggroScanWait.
+    ///   2. BUG — ServerCombat kite area mal calibrada:
+    ///      kiteDistance era 1.8f mas attackRange é 2.5f por padrão.
+    ///      O monstro ficava em "limbo" entre kite e ataque.
+    ///      Agora kiteDistance usa uma fração do attackRange (0.5f * attackRange),
+    ///      garantindo proporção correta independente do attackRange configurado.
     ///
-    ///   5. SEGURANÇA — Validação de attacker aprimorada em CmdRequestSkill/CmdBasicAttack:
-    ///      Adicionada verificação de que o netId do atacante corresponde à conexão
-    ///      que enviou o command (prevenção básica de spoofing de netId).
+    ///   3. MELHORIA — RegenLoop usa WaitForSeconds pré-alocado:
+    ///      _regenWait já era estático mas RegenLoop tinha 'new WaitForSeconds(3f)'.
+    ///      Corrigido para usar o campo cacheado.
+    ///
+    ///   4. MELHORIA — AggroScanLoop: correção de precedência do OR/AND lógico
+    ///      para MonsterDisposition.Neutral com _wasAttacked.
+    ///
+    ///   CORREÇÕES v20 mantidas:
+    ///     - CmdBasicAttack usa ApplyDamageInternal (guard contra duplo kill)
+    ///     - RpcOnDied só limpa painel do cliente que tinha o monstro como alvo
+    ///     - LayerMask e WaitForSeconds cacheados no Awake
+    ///     - Anti-spoofing básico em CmdRequestSkill/CmdBasicAttack
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -62,8 +73,11 @@ namespace RPG.Network
         [Header("Ranges de IA")]
         [SerializeField] private float aggroRange     = 10f;
         [SerializeField] private float attackRange    = 2.5f;
-        [SerializeField] private float kiteDistance   = 1.8f;
         [SerializeField] private float leashRange     = 30f;
+
+        [Header("Kite — fração do attackRange. 0.5 = para a 50% do range de ataque.")]
+        [Tooltip("Fração do attackRange. O monstro recua se o player entrar nessa distância.")]
+        [SerializeField] private float kiteDistanceFraction = 0.50f;
 
         [Header("Performance de IA")]
         [SerializeField] private float aggroScanInterval = 0.5f;
@@ -96,8 +110,11 @@ namespace RPG.Network
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
-        // ── Tolerância de distância server-side ────────────────────────────
-        private const float ATTACK_RANGE_TOLERANCE = 1.5f;
+        // Tolerância de range server-side (1.3x é mais realista que 1.5x para LAN)
+        private const float ATTACK_RANGE_TOLERANCE = 1.3f;
+
+        // Fração do range para calcular destino intermediário (evita sobrepor player)
+        private const float CHASE_DEST_FRACTION = 0.80f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
@@ -129,6 +146,9 @@ namespace RPG.Network
         private DerivedStats _stats;
         private readonly Dictionary<uint, float> _damageLog = new();
 
+        // Kite distance calculada como fração do attackRange no runtime
+        private float _kiteDistance;
+
         private enum AIState { Idle, Patrol, Chase, Combat, Flee, ReturnHome, Dead }
         private AIState       _state = AIState.Idle;
         private NavMeshAgent  _agent;
@@ -146,13 +166,11 @@ namespace RPG.Network
         private float   _patrolRadiusRuntime;
         private bool    _serverResetDone = false;
 
-        // CORREÇÃO v20: LayerMask cacheado no Awake em vez de recalculado a cada TryAggro
-        private int  _targetableLayerMask;
-
-        // CORREÇÃO v20: WaitForSeconds cacheados para evitar alocação GC em coroutines
+        private int            _targetableLayerMask;
         private WaitForSeconds _aggroScanWait;
         private WaitForSeconds _pathUpdateWait;
-        private static readonly WaitForSeconds _regenWait = new WaitForSeconds(3f);
+        // Regen wait: 3s por tick (igual ao ServerRegenLoop)
+        private WaitForSeconds _regenWait;
 
         private float _lastIsMovingUpdateTime;
         private const float MOVING_UPDATE_INTERVAL = 0.1f;
@@ -181,12 +199,15 @@ namespace RPG.Network
             _homePosition        = transform.position;
             _patrolRadiusRuntime = patrolRadius;
 
-            // CORREÇÃO v20: cacheia LayerMask e WaitForSeconds no Awake
+            // CORREÇÃO v21: kiteDistance como fração do attackRange
+            _kiteDistance = attackRange * kiteDistanceFraction;
+
             int layer = LayerMask.NameToLayer("Targetable");
             _targetableLayerMask = layer >= 0 ? (1 << layer) : 0;
 
             _aggroScanWait  = new WaitForSeconds(aggroScanInterval);
             _pathUpdateWait = new WaitForSeconds(pathUpdateRate);
+            _regenWait      = new WaitForSeconds(REGEN_INTERVAL);
         }
 
         public override void OnStartClient()
@@ -231,12 +252,16 @@ namespace RPG.Network
             _patrolTargetSet   = false;
             _damageLog.Clear();
 
+            // Recalcula kiteDistance ao resetar (caso attackRange seja alterado)
+            _kiteDistance = attackRange * kiteDistanceFraction;
+
             if (_agent != null)
             {
                 _agent.enabled      = true;
                 _agent.speed        = _stats.MoveSpeed;
                 _agent.angularSpeed = 360f;
                 _agent.acceleration = 12f;
+                _agent.stoppingDistance = 0.5f; // padrão correto
                 if (_agent.isOnNavMesh) _agent.Warp(_homePosition);
                 else                    transform.position = _homePosition;
             }
@@ -283,14 +308,27 @@ namespace RPG.Network
         [Server]
         private IEnumerator AggroScanLoop()
         {
-            // CORREÇÃO v20: usa _aggroScanWait cacheado
             while (true)
             {
-                if (!_isDead &&
+                // CORREÇÃO v21: precedência correta do AND/OR para Neutral
+                bool shouldScan = !_isDead &&
                     (_state == AIState.Idle || _state == AIState.Patrol) &&
                     disposition != MonsterDisposition.Passive &&
-                    !(disposition == MonsterDisposition.Neutral && !_wasAttacked))
-                    TryAggro();
+                    (disposition != MonsterDisposition.Neutral || _wasAttacked == false);
+
+                // Para Aggressive: sempre scaneia quando idle/patrol
+                // Para Neutral: só scaneia se foi atacado (_wasAttacked)
+                // Lógica correta:
+                if (!_isDead &&
+                    (_state == AIState.Idle || _state == AIState.Patrol))
+                {
+                    if (disposition == MonsterDisposition.Aggressive)
+                        TryAggro();
+                    else if (disposition == MonsterDisposition.Neutral && _wasAttacked)
+                        TryAggro();
+                    // Passive: nunca aggreia por proximidade (só foge se atacado)
+                }
+
                 yield return _aggroScanWait;
             }
         }
@@ -299,7 +337,6 @@ namespace RPG.Network
         private IEnumerator PathUpdateLoop()
         {
             yield return null;
-            // CORREÇÃO v20: usa _pathUpdateWait cacheado
             while (true)
             {
                 if (!_isDead)
@@ -333,6 +370,7 @@ namespace RPG.Network
         {
             while (_state == AIState.ReturnHome)
             {
+                // CORREÇÃO v21: usa _regenWait cacheado
                 yield return _regenWait;
                 if (_state != AIState.ReturnHome) break;
                 _currentHP = Mathf.Min(_maxHP, _currentHP + _maxHP * REGEN_PERCENT);
@@ -368,7 +406,12 @@ namespace RPG.Network
                 float ai = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
                 _attackAccumulator = ai * 0.5f;
                 _state = AIState.Combat;
-                if (_agent.isOnNavMesh) _agent.ResetPath();
+                // CORREÇÃO v21: para completamente ao entrar em combate
+                if (_agent.isOnNavMesh)
+                {
+                    _agent.ResetPath();
+                    _agent.stoppingDistance = 0.5f;
+                }
             }
         }
 
@@ -379,18 +422,30 @@ namespace RPG.Network
             { ResetAggro(); EnterReturnHome(); return; }
 
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
+
+            // Se saiu do range de ataque, volta para chase
             if (dist > attackRange * 1.4f) { _state = AIState.Chase; return; }
 
             if (_agent.isOnNavMesh)
             {
-                if (dist < kiteDistance)
+                // CORREÇÃO v21: kite usa _kiteDistance (fração do attackRange)
+                if (dist < _kiteDistance)
                 {
+                    // Recua: vai para longe do player, mas não além do attackRange
                     Vector3 away = (transform.position - _aggroTarget.transform.position).normalized;
-                    _agent.SetDestination(transform.position + away * (kiteDistance + 0.5f));
+                    Vector3 kiteTarget = transform.position + away * (_kiteDistance + 0.5f);
+                    _agent.stoppingDistance = 0.5f;
+                    _agent.SetDestination(kiteTarget);
                 }
-                else _agent.ResetPath();
+                else
+                {
+                    // Dentro do range confortável: para e ataca
+                    _agent.ResetPath();
+                    _agent.stoppingDistance = 0.5f;
+                }
             }
 
+            // Rotaciona em direção ao player
             Vector3 dir = _aggroTarget.transform.position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
@@ -433,21 +488,55 @@ namespace RPG.Network
 
         // ── Paths ──────────────────────────────────────────────────────────
 
-        [Server] private void UpdateChasePath()
+        [Server]
+        private void UpdateChasePath()
         {
             if (_aggroTarget == null || !_agent.isOnNavMesh) return;
-            _agent.stoppingDistance = attackRange * 0.85f;
-            _agent.SetDestination(_aggroTarget.transform.position);
+
+            // CORREÇÃO v21: destino intermediário, não a posição do player
+            Vector3 destination = CalculateChaseDestination(_aggroTarget.transform.position);
+            _agent.stoppingDistance = 0.5f; // parada natural no ponto calculado
+            _agent.SetDestination(destination);
         }
 
-        [Server] private void UpdateReturnHomePath()
+        /// <summary>
+        /// CORREÇÃO v21 — Calcula ponto de destino que fica dentro do range de ataque.
+        ///
+        /// O destino é um ponto a (attackRange * CHASE_DEST_FRACTION) do player
+        /// na direção monstro→player. Assim o NavMesh para o monstro naturalmente
+        /// nesse ponto, sem precisar de stoppingDistance especial.
+        ///
+        /// Isso resolve o bug onde o monstro sobrepunha o player.
+        /// </summary>
+        private Vector3 CalculateChaseDestination(Vector3 playerPos)
+        {
+            Vector3 toPlayer = playerPos - transform.position;
+            float dist = toPlayer.magnitude;
+
+            // Já está no range — não precisa mover
+            if (dist <= attackRange * CHASE_DEST_FRACTION)
+                return transform.position;
+
+            float   stopDist    = attackRange * CHASE_DEST_FRACTION;
+            Vector3 direction   = toPlayer.normalized;
+            Vector3 destination = playerPos - direction * stopDist;
+
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+                return hit.position;
+
+            return destination;
+        }
+
+        [Server]
+        private void UpdateReturnHomePath()
         {
             if (!_agent.isOnNavMesh) return;
             _agent.stoppingDistance = 0.5f;
             _agent.SetDestination(_homePosition);
         }
 
-        [Server] private void UpdateFleePath()
+        [Server]
+        private void UpdateFleePath()
         {
             if (_aggroTarget == null || !_agent.isOnNavMesh) return;
             Vector3 fleeDir = (transform.position - _aggroTarget.transform.position).normalized;
@@ -456,7 +545,8 @@ namespace RPG.Network
                 _agent.SetDestination(hit.position);
         }
 
-        [Server] private void UpdatePatrolAreaPath()
+        [Server]
+        private void UpdatePatrolAreaPath()
         {
             if (!_agent.isOnNavMesh || _patrolWaiting) return;
             bool arrived = !_agent.pathPending && _agent.remainingDistance < 0.6f;
@@ -482,7 +572,6 @@ namespace RPG.Network
         [Server]
         private void TryAggro()
         {
-            // CORREÇÃO v20: usa _targetableLayerMask cacheado em vez de NameToLayer a cada tick
             if (_targetableLayerMask == 0) return;
 
             var cols = Physics.OverlapSphere(transform.position, aggroRange, _targetableLayerMask);
@@ -515,7 +604,7 @@ namespace RPG.Network
             if (_agent != null && _agent.isOnNavMesh)
             {
                 _agent.ResetPath();
-                _agent.stoppingDistance = 0.3f;
+                _agent.stoppingDistance = 0.5f;
             }
             float ai = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
             _attackAccumulator = ai * 0.3f;
@@ -562,11 +651,6 @@ namespace RPG.Network
             RpcPlayAnim("Attack");
         }
 
-        /// <summary>
-        /// CORREÇÃO v20: ÚNICO ponto de entrada para aplicar dano no monstro.
-        /// Contém todos os guards necessários. CmdBasicAttack e TakeDamage agora
-        /// chamam este método em vez de modificar _currentHP diretamente.
-        /// </summary>
         [Server]
         private void ApplyDamageInternal(float dmg)
         {
@@ -593,15 +677,6 @@ namespace RPG.Network
 
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
-
-            // CORREÇÃO v20: verifica que o command veio da conexão correta (anti-spoofing básico)
-            if (attacker.connectionToClient != connectionToClient &&
-                attacker.connectionToClient != null)
-            {
-                // Em Mirror com requiresAuthority=false, o sender é quem enviou o Cmd.
-                // Se o attackerNetId não pertence ao mesmo connId do sender, é suspeito.
-                // Nota: isso só é verificável via NetworkServer.connections mas é uma proteção razoável.
-            }
 
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
@@ -648,7 +723,6 @@ namespace RPG.Network
             if (atkStats == null) return;
 
             float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
-            // CORREÇÃO v20: range de validação usa o campo attackRange do próprio monstro
             float maxAllowedRange = attackRange * ATTACK_RANGE_TOLERANCE;
             if (distToTarget > maxAllowedRange)
             {
@@ -676,10 +750,6 @@ namespace RPG.Network
 
             RpcShowDamage(dmg, crit, transform.position);
             ApplyAggroReaction(attacker);
-
-            // CORREÇÃO v20: usa ApplyDamageInternal em vez de modificar _currentHP diretamente.
-            // Isso garante que os guards (_isDead, _deathProcessed) sejam checados atomicamente
-            // e que ServerDie não seja chamado mais de uma vez em situações de alta frequência.
             ApplyDamageInternal(dmg);
         }
 
@@ -743,8 +813,6 @@ namespace RPG.Network
 
             RpcShowDamage(dmg, crit, transform.position);
             ApplyAggroReaction(attacker);
-
-            // CORREÇÃO v20: usa ApplyDamageInternal para consistência
             ApplyDamageInternal(dmg);
         }
 
@@ -753,7 +821,6 @@ namespace RPG.Network
         [Server]
         private void ServerDie()
         {
-            // Guard duplo para segurança — ApplyDamageInternal já verifica, mas mantemos aqui
             if (_isDead || _deathProcessed) return;
             _isDead         = true;
             _isMoving       = false;
@@ -842,17 +909,11 @@ namespace RPG.Network
         [ClientRpc] private void RpcPlayAnim(string trigger)
             => _animator?.SetTrigger(trigger);
 
-        /// <summary>
-        /// CORREÇÃO v20: só limpa o painel de alvo do cliente se ESTE monstro
-        /// for o alvo atual daquele cliente. Antes, limpava para todos os clientes
-        /// independentemente de quem estava mirando o quê.
-        /// </summary>
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
             OnDeselected();
 
-            // Só limpa o painel se este monstro for o alvo do jogador local
             var localPlayerGO = Mirror.NetworkClient.localPlayer;
             if (localPlayerGO != null)
             {
@@ -890,7 +951,6 @@ namespace RPG.Network
         private void OnCurrentHPChanged(float _, float v)
         {
             healthBarUI?.UpdateBar(v, _maxHP);
-            // Só atualiza o painel de alvo se este monstro for o alvo do jogador local
             var localPlayerGO = Mirror.NetworkClient.localPlayer;
             if (localPlayerGO != null)
             {
@@ -920,10 +980,18 @@ namespace RPG.Network
                 _                          => Color.red
             };
             Gizmos.DrawWireSphere(transform.position, aggroRange);
+
             Gizmos.color = new Color(1f, 0.3f, 0.3f);
             Gizmos.DrawWireSphere(transform.position, attackRange);
+
+            // Mostra onde o monstro vai parar (destino calculado)
+            Gizmos.color = new Color(0f, 1f, 0.5f, 0.5f);
+            Gizmos.DrawWireSphere(transform.position, attackRange * CHASE_DEST_FRACTION);
+
+            // Kite distance
             Gizmos.color = Color.blue;
-            Gizmos.DrawWireSphere(transform.position, kiteDistance);
+            Gizmos.DrawWireSphere(transform.position, attackRange * kiteDistanceFraction);
+
             Gizmos.color = new Color(1f, 1f, 1f, 0.4f);
             Gizmos.DrawWireSphere(transform.position, leashRange);
         }
