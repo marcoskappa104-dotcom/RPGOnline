@@ -9,19 +9,29 @@ using RPG.Data;
 namespace RPG.Combat
 {
     /// <summary>
-    /// BasicAttackSystem v1 — Ataque básico por duplo clique.
+    /// BasicAttackSystem v2
     ///
-    /// FUNCIONAMENTO:
-    ///   - Duplo clique esquerdo sobre um monstro → jogador anda até o alvo e
-    ///     ataca automaticamente em loop até cancelar.
-    ///   - Cancelamento: clique em outro lugar, clique em outro monstro,
-    ///     morte do alvo, ou morte do jogador.
-    ///   - Sem custo de MP, sem joia equipada, sem cooldown de skill.
-    ///     Usa ATK puro + ASPD do personagem.
+    /// CORREÇÕES v2 — Mesma família de bugs do SkillSystem v8.
     ///
-    /// SETUP:
-    ///   Adicione este componente no prefab do player (junto com SkillSystem).
-    ///   O NetworkPlayerController chama TryRegisterClick() automaticamente.
+    ///   BUG CORRIGIDO: Player sobrepunha o monstro durante o auto-ataque.
+    ///
+    ///   CAUSA: ChaseTarget() chamava `_agent.SetDestination(_attackTarget.Position)`,
+    ///   onde o destino ERA a posição exata do monstro. O stoppingDistance de
+    ///   (attackRange * 0.85f) funciona como margem de PARADA, não de DESTINO.
+    ///   O NavMesh move o agente até o destino e só para quando está a
+    ///   stoppingDistance do destino — mas se o destino muda todo frame (monstro
+    ///   se move), o stoppingDistance pode não ter efeito correto.
+    ///
+    ///   SOLUÇÃO: Igual ao SkillSystem — calculamos um ponto intermediário
+    ///   que fica dentro do range, na direção player→monstro. O NavMesh
+    ///   leva o player exatamente até esse ponto e para naturalmente.
+    ///
+    ///   stoppingDistance é mantido como fallback de segurança em 0.5f
+    ///   (o comportamento natural do agente) já que o destino calculado
+    ///   já garante a posição correta.
+    ///
+    ///   MELHORIA: Adicionado método público GetAttackRange() para que
+    ///   o NetworkMonsterEntity possa usar o mesmo range ao validar ataques.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -46,6 +56,10 @@ namespace RPG.Combat
         [Header("Debug")]
         [SerializeField] private bool debugLogs = false;
 
+        // Fração do attackRange para calcular o ponto de destino intermediário.
+        // Player vai até (attackRange * DEST_FRACTION) do monstro e para.
+        private const float DEST_FRACTION = 0.80f;
+
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
         private NavMeshAgent            _agent;
@@ -63,7 +77,8 @@ namespace RPG.Combat
         private float                _lastClickTime   = -999f;
         private NetworkMonsterEntity _lastClickTarget;
 
-        public bool IsAutoAttacking => _autoAttacking;
+        public bool  IsAutoAttacking => _autoAttacking;
+        public float AttackRange     => attackRange;
 
         // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -87,8 +102,7 @@ namespace RPG.Combat
 
         /// <summary>
         /// Chamado pelo NetworkPlayerController ao clicar em um monstro.
-        /// Registra o clique e detecta duplo clique.
-        /// Retorna true se foi duplo clique (auto-ataque iniciado).
+        /// Detecta duplo clique para iniciar auto-ataque.
         /// </summary>
         public bool TryRegisterClick(NetworkMonsterEntity monster)
         {
@@ -110,9 +124,7 @@ namespace RPG.Combat
             return false;
         }
 
-        /// <summary>
-        /// Cancela o auto-ataque. Chamado ao clicar no chão ou em outro alvo.
-        /// </summary>
+        /// <summary>Cancela o auto-ataque.</summary>
         public void CancelAutoAttack()
         {
             if (!_autoAttacking) return;
@@ -159,8 +171,6 @@ namespace RPG.Combat
                 return;
             }
 
-            // Compara como UnityEngine.Object para evitar CS0252
-            // (ITargetable não implementa == por valor, a comparação precisa ser por referência de objeto Unity)
             if (!ReferenceEquals(_player.CurrentTarget as UnityEngine.Object,
                                   _attackTarget as UnityEngine.Object))
             {
@@ -176,9 +186,12 @@ namespace RPG.Combat
             }
             else
             {
-                // Dentro de range: para o agente e tick de ataque
+                // CORREÇÃO v2: para o agente completamente quando está no range
                 if (_agent != null && _agent.isOnNavMesh && _agent.hasPath)
+                {
                     _agent.ResetPath();
+                    _agent.stoppingDistance = 0.5f;
+                }
 
                 _attackTimer += Time.deltaTime;
                 if (_attackTimer >= GetAttackInterval())
@@ -198,19 +211,55 @@ namespace RPG.Combat
             }
         }
 
+        /// <summary>
+        /// CORREÇÃO v2 — Perseguição usa destino intermediário, não posição do monstro.
+        ///
+        /// Calculamos um ponto que fica a (attackRange * DEST_FRACTION) do monstro
+        /// na direção player→monstro. O NavMesh para naturalmente nesse ponto.
+        /// O stoppingDistance volta para 0.5f padrão (destino intermediário = parada natural).
+        /// </summary>
         private void ChaseTarget()
         {
             if (_agent != null && _agent.isOnNavMesh)
             {
-                _agent.stoppingDistance = attackRange * 0.85f;
-                _agent.SetDestination(_attackTarget.Position);
+                // CORREÇÃO: destino é o ponto no range, não o monstro
+                Vector3 destination = CalculateChaseDestination(_attackTarget.Position);
+                _agent.stoppingDistance = 0.5f; // parada natural no ponto calculado
+                _agent.SetDestination(destination);
             }
 
+            // Throttle de CmdMoveTo para o servidor
             if (Time.time - _lastMoveCmd >= moveCommandInterval)
             {
                 _lastMoveCmd = Time.time;
-                _controller?.CmdMoveTo(_attackTarget.Position);
+                // Envia destino intermediário ao servidor também
+                Vector3 serverDest = CalculateChaseDestination(_attackTarget.Position);
+                _controller?.CmdMoveTo(serverDest);
             }
+        }
+
+        /// <summary>
+        /// Calcula ponto de destino dentro do range do ataque, evitando sobrepor o monstro.
+        /// </summary>
+        private Vector3 CalculateChaseDestination(Vector3 targetPos)
+        {
+            Vector3 toTarget = targetPos - transform.position;
+            float dist = toTarget.magnitude;
+
+            // Já está no range ou muito perto — não precisa mover
+            if (dist <= attackRange * DEST_FRACTION)
+                return transform.position;
+
+            // Ponto a (attackRange * DEST_FRACTION) do monstro, na direção do player
+            float   stopDist    = attackRange * DEST_FRACTION;
+            Vector3 direction   = toTarget.normalized;
+            Vector3 destination = targetPos - direction * stopDist;
+
+            // Snap ao NavMesh
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+                return hit.position;
+
+            return destination;
         }
 
         // ── Execução do ataque ─────────────────────────────────────────────
@@ -236,23 +285,11 @@ namespace RPG.Combat
             return attackInterval;
         }
 
-        /// <summary>
-        /// Verifica se o alvo foi destruído pelo Unity ou está morto no jogo.
-        /// Cast explícito para UnityEngine.Object evita o warning CS0252.
-        /// </summary>
         private static bool IsTargetGone(NetworkMonsterEntity target)
-        {
-            return IsUnityNull(target) || target.IsDead;
-        }
+            => IsUnityNull(target) || target.IsDead;
 
-        /// <summary>
-        /// Null-check correto para objetos Unity.
-        /// Evita CS0252 (comparação de referência com interface/classe não-Object).
-        /// </summary>
         private static bool IsUnityNull(NetworkMonsterEntity target)
-        {
-            return (UnityEngine.Object)target == null;
-        }
+            => (UnityEngine.Object)target == null;
 
         private void Log(string msg)
         {
@@ -264,6 +301,10 @@ namespace RPG.Combat
         {
             Gizmos.color = new Color(1f, 0.5f, 0f, 0.4f);
             Gizmos.DrawWireSphere(transform.position, attackRange);
+
+            // Mostra o raio efetivo de destino (onde o player vai parar)
+            Gizmos.color = new Color(0f, 1f, 0.5f, 0.25f);
+            Gizmos.DrawWireSphere(transform.position, attackRange * DEST_FRACTION);
         }
 #endif
     }
