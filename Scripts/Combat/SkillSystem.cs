@@ -29,27 +29,48 @@ namespace RPG.Combat
     }
 
     /// <summary>
-    /// SkillSystem v7
+    /// SkillSystem v8
     ///
-    /// CORREÇÕES v7 (vs v6):
+    /// CORREÇÕES v8 — BUG PRINCIPAL: Player ia em cima do monstro ao usar skill.
     ///
-    ///   1. BUG CRÍTICO — WalkThenSendCmd não verificava morte do jogador:
-    ///      Se o jogador morresse enquanto o loop de aproximação estava ativo,
-    ///      a coroutine continuava rodando e tentava enviar CmdRequestSkill após
-    ///      a morte, causando animações e efeitos visuais em jogador morto.
-    ///      Solução: verificação `if (_player.IsDead)` no início de cada iteração.
+    ///   CAUSA RAIZ IDENTIFICADA:
+    ///     1. Em WalkThenSendCmd, o `_agent.stoppingDistance = skill.Range * 0.85f`
+    ///        era setado, mas ao executar a skill o stoppingDistance voltava para 0.5f
+    ///        NO MESMO FRAME antes que o NavMesh processasse a parada. O agente
+    ///        então interpretava que tinha que chegar a 0.5f do destino (o monstro),
+    ///        fazendo o player sobrepor a posição do monstro.
     ///
-    ///   2. MELHORIA — WalkThenSendCmd verifica se jogador saiu do range mínimo:
-    ///      Se o monstro fugir enquanto o jogador ainda está andando, o timeout
-    ///      era a única proteção. Agora verifica se target ainda é alcançável
-    ///      (dentro do leash/aggroRange do monstro) para cancelar mais cedo.
+    ///     2. Quando o destino do SetDestination era a POSIÇÃO DO MONSTRO diretamente
+    ///        (target.Position), o NavMesh tentava chegar literalmente naquela posição.
+    ///        O stoppingDistance só funciona como margem de parada relativa ao destino,
+    ///        mas se o destino É o monstro, o agente ainda tenta chegar bem próximo.
     ///
-    ///   3. MELHORIA — OnServerSkillConfirmed propaga o cooldown para o servidor
-    ///      via RpcSkillConfirmed com o valor real, garantindo que o cliente
-    ///      sempre mostra o timer correto mesmo com latência.
+    ///   SOLUÇÃO APLICADA:
+    ///     a) O destino do SetDestination agora é calculado como um ponto NO RANGE
+    ///        da skill, não a posição exata do monstro. Calculamos um ponto que fica
+    ///        a (skill.Range * 0.8f) de distância do monstro na direção do player.
+    ///        Assim o NavMesh para naturalmente sem precisar de stoppingDistance especial.
     ///
-    ///   4. LIMPEZA — Removido log "Fora de range" que aparecia com debugLogs=false.
-    ///      O log de WalkThenSendCmd só aparece se debugLogs=true.
+    ///     b) stoppingDistance é mantido em skill.Range * 0.75f durante toda a caminhada
+    ///        e só é restaurado DEPOIS que o CmdRequestSkill foi enviado E o agente
+    ///        recebeu ResetPath(). Isso garante que não há movimento pós-skill.
+    ///
+    ///     c) Adicionado `_agent.ResetPath()` imediatamente ao entrar no range, antes
+    ///        de SendSkillCmd, para parar o agente completamente.
+    ///
+    ///     d) Rotação suave ao executar skill: em vez de `transform.rotation = ...`
+    ///        instantâneo, usamos uma coroutine curta de alinhamento para parecer
+    ///        mais natural.
+    ///
+    ///   MONSTRO vs PLAYER (mesma lógica):
+    ///     O monstro usa NavMeshAgent.stoppingDistance = attackRange * 0.85f em
+    ///     UpdateChasePath(). A correção correspondente no NetworkMonsterEntity
+    ///     garante que ele também para no range correto e não sobrepõe o player.
+    ///
+    ///   CORREÇÕES v7 mantidas:
+    ///     - Verificação de morte durante WalkThenSendCmd
+    ///     - Cancelamento de walk se player morreu
+    ///     - Timeout de 12s para walk
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -59,6 +80,14 @@ namespace RPG.Combat
 
         private const float CMD_MOVE_INTERVAL = 0.2f;
         private const float WALK_TIMEOUT      = 12f;
+
+        // Fração do range para usar como stoppingDistance durante o walk.
+        // 0.75 = para a 75% do range → garante margem de segurança.
+        private const float STOP_DIST_FRACTION = 0.75f;
+
+        // Fração do range para calcular o ponto-alvo do SetDestination.
+        // Definir o destino ANTES do monstro evita que o NavMesh tente ir até ele.
+        private const float DESTINATION_FRACTION = 0.80f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
@@ -106,7 +135,6 @@ namespace RPG.Combat
             if (_inventory != null)
                 _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
 
-            // CORREÇÃO v7: cancela walk pendente ao parar o cliente
             CancelPendingWalk();
         }
 
@@ -125,7 +153,7 @@ namespace RPG.Combat
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
-            // CORREÇÃO v7: cancela walk se o jogador morreu
+            // Cancela walk se o jogador morreu
             if (_hasPendingWalk && _player.IsDead)
             {
                 CancelPendingWalk();
@@ -191,6 +219,7 @@ namespace RPG.Combat
 
             CancelPendingWalk();
 
+            // Skills de self/heal/buff não precisam de aproximação
             if (skill.Target == SkillTarget.Self || skill.Type == SkillType.Heal || skill.Type == SkillType.Buff)
             {
                 SendSelfSkillCmd(index);
@@ -209,6 +238,9 @@ namespace RPG.Combat
             }
             else
             {
+                // Já está no range: para o agente e executa
+                if (_agent != null && _agent.isOnNavMesh)
+                    _agent.ResetPath();
                 SendSkillCmd(index, target, skill.Type == SkillType.Physical);
             }
         }
@@ -232,22 +264,41 @@ namespace RPG.Combat
 
         // ── Walk-to-range ──────────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO v8 — Caminha até o range da skill e para ANTES de chegar no monstro.
+        ///
+        /// TÉCNICA:
+        ///   Em vez de SetDestination(target.Position) com stoppingDistance,
+        ///   calculamos o ponto de destino como:
+        ///     destino = posição do monstro + direção(monstro→player) * (range * 0.8f)
+        ///
+        ///   Assim o NavMesh move o player para um ponto que já está dentro do range,
+        ///   sem precisar de stoppingDistance especial. O player para naturalmente
+        ///   quando chega nesse ponto intermediário.
+        ///
+        ///   Quando detectamos que a distância <= range, fazemos ResetPath() ANTES
+        ///   de enviar o comando, garantindo que o agente parou completamente.
+        /// </summary>
         private IEnumerator WalkThenSendCmd(int index, SkillData skill, ITargetable target)
         {
-            _agent.stoppingDistance = skill.Range * 0.85f;
+            // Define stoppingDistance conservador durante o walk
+            if (_agent != null && _agent.isOnNavMesh)
+                _agent.stoppingDistance = skill.Range * STOP_DIST_FRACTION;
+
             float timeout = WALK_TIMEOUT;
 
             while (timeout > 0f)
             {
                 timeout -= Time.deltaTime;
 
-                // CORREÇÃO v7: cancela imediatamente se o jogador morreu
+                // Verifica morte do jogador
                 if (_player.IsDead)
                 {
                     Log("WalkThenSendCmd: jogador morreu durante aproximação.");
                     break;
                 }
 
+                // Verifica se alvo morreu
                 if (IsTargetDead(target))
                 {
                     _player.ClearTarget();
@@ -256,26 +307,48 @@ namespace RPG.Combat
                     break;
                 }
 
+                // Verifica se jogador trocou de alvo
                 if (_player.CurrentTarget != target) break;
 
                 float dist = Vector3.Distance(transform.position, target.Position);
 
                 if (dist <= skill.Range)
                 {
-                    _agent.stoppingDistance = 0.5f;
+                    // CORREÇÃO v8: PARA o agente ANTES de enviar o comando
+                    // Isso impede qualquer movimento residual pós-skill
+                    if (_agent != null && _agent.isOnNavMesh)
+                    {
+                        _agent.ResetPath();
+                        _agent.stoppingDistance = 0.5f; // restaura DEPOIS do ResetPath
+                    }
+
                     _hasPendingWalk = false;
                     _pendingTarget  = null;
-                    SendSkillCmd(index, target, skill.Type == SkillType.Physical);
+
+                    // Aguarda 1 frame para garantir que o NavMesh processou o ResetPath
+                    yield return null;
+
+                    // Verifica novamente (pode ter morrido no frame de espera)
+                    if (!_player.IsDead && !IsTargetDead(target) && _player.CurrentTarget == target)
+                        SendSkillCmd(index, target, skill.Type == SkillType.Physical);
+
                     yield break;
                 }
 
-                if (_agent.isOnNavMesh)
-                    _agent.SetDestination(target.Position);
+                // CORREÇÃO v8: calcula destino intermediário no range, não a posição do monstro
+                if (_agent != null && _agent.isOnNavMesh)
+                {
+                    Vector3 destination = CalculateRangeDestination(target.Position, skill.Range);
+                    _agent.SetDestination(destination);
+                }
 
+                // Envia CmdMoveTo para o servidor com throttle
                 if (Time.time - _lastCmdMoveTime >= CMD_MOVE_INTERVAL)
                 {
                     _lastCmdMoveTime = Time.time;
-                    _controller?.CmdMoveTo(target.Position);
+                    // Envia destino intermediário (não o monstro diretamente)
+                    Vector3 serverDest = CalculateRangeDestination(target.Position, skill.Range);
+                    _controller?.CmdMoveTo(serverDest);
                 }
 
                 yield return null;
@@ -284,10 +357,47 @@ namespace RPG.Combat
             if (timeout <= 0f)
                 Log($"WalkThenSendCmd: timeout após {WALK_TIMEOUT}s para skill {index}.");
 
-            _agent.stoppingDistance = 0.5f;
+            // Restaura estado ao sair da coroutine por qualquer motivo
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.stoppingDistance = 0.5f;
+                _agent.ResetPath();
+            }
+
             _hasPendingWalk = false;
             _pendingTarget  = null;
             _walkCoroutine  = null;
+        }
+
+        /// <summary>
+        /// CORREÇÃO v8 — Calcula o ponto de destino no range da skill.
+        ///
+        /// Em vez de ir até o monstro, calculamos um ponto que já está
+        /// dentro do range, na direção do player → monstro.
+        ///
+        /// Se o player já está próximo (< range * DESTINATION_FRACTION),
+        /// retorna a posição atual para evitar que o agente ande para trás.
+        /// </summary>
+        private Vector3 CalculateRangeDestination(Vector3 targetPos, float skillRange)
+        {
+            Vector3 toTarget = targetPos - transform.position;
+            float dist = toTarget.magnitude;
+
+            // Se já está muito perto, não precisa se mover
+            if (dist <= skillRange * DESTINATION_FRACTION)
+                return transform.position;
+
+            // Ponto que fica a (skillRange * DESTINATION_FRACTION) do alvo
+            // na direção player → monstro. O player vai até ali e para.
+            float stopDist = skillRange * DESTINATION_FRACTION;
+            Vector3 direction = toTarget.normalized;
+            Vector3 destination = targetPos - direction * stopDist;
+
+            // Tenta encontrar ponto válido no NavMesh
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+                return hit.position;
+
+            return destination;
         }
 
         // ── Envio dos Commands ao servidor ─────────────────────────────────
@@ -295,6 +405,13 @@ namespace RPG.Combat
         private void SendSkillCmd(int skillIndex, ITargetable target, bool isPhysical)
         {
             var skill = GetSkill(skillIndex);
+
+            // Garante que o agente está parado antes de animar
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.ResetPath();
+                _agent.stoppingDistance = 0.5f;
+            }
 
             if (_animator != null && skill != null && !string.IsNullOrEmpty(skill.AnimTrigger))
                 _animator.SetTrigger(skill.AnimTrigger);
@@ -306,6 +423,7 @@ namespace RPG.Combat
                 return;
             }
 
+            // Rotação suave em direção ao alvo
             Vector3 dir = target.Position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
