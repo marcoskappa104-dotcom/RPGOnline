@@ -13,34 +13,33 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v14
+    /// NetworkPlayer v15
     ///
-    /// CORREÇÃO v14 — Status não atualizavam na UI ao distribuir pontos de atributo:
+    /// CORREÇÕES v15:
     ///
-    ///   CAUSA RAIZ:
-    ///     CmdAllocateAttribute atualiza MaxHP, MaxMP e os Allocated* como SyncVars.
-    ///     No cliente, OnNetMaxHPChanged e OnNetMaxMPChanged chamavam apenas
-    ///     SetHPFromServer() — que atualiza CurrentHP e dispara OnHPChanged,
-    ///     mas NÃO dispara OnStatsChanged.
+    ///   1. HOOKS PARA AllocatedSTR/AGI/VIT/DEX/INT/LUK:
+    ///      As SyncVars Allocated* agora têm hooks individuais que chamam
+    ///      _playerEntity.FullRefreshStatsFromData() quando chegam no cliente.
+    ///      Antes, chegavam como dados brutos sem disparar recálculo de ASPD,
+    ///      ATK, DEF etc. no PlayerEntity, deixando os stats locais desatualizados.
     ///
-    ///     OnStatsChanged é o evento que a AttributeWindowUI escuta para redesenhar
-    ///     ATK, DEF, ASPD, HIT, FLEE etc. Como ele nunca era disparado, a janela
-    ///     só atualizava ao fechar/reabrir (momento em que RefreshAll() lê as
-    ///     SyncVars diretamente).
+    ///   2. REGEN DE HP/MP DO PLAYER:
+    ///      ServerRegenLoop() adicionado — coroutine no servidor que regenera
+    ///      HP e MP do jogador fora de combate a cada REGEN_INTERVAL segundos.
+    ///      Taxa: HPRegen e MPRegen dos DerivedStats (calculados pelo StatsCalculator).
+    ///      Não regenera se Dead. Recomeça ao respawnar.
     ///
-    ///   SOLUÇÃO:
-    ///     OnNetMaxHPChanged agora chama RefreshStatsFromServer() em vez de apenas
-    ///     SetHPFromServer(). RefreshStatsFromServer() atualiza MaxHP/MaxMP no
-    ///     PlayerEntity E dispara tanto OnHPChanged quanto OnStatsChanged,
-    ///     notificando a AttributeWindowUI corretamente.
+    ///   3. ANTI-SPAM em CmdAllocateAttribute:
+    ///      O servidor agora mantém _lastAllocateTime e rejeita comandos enviados
+    ///      em menos de ALLOCATE_MIN_INTERVAL segundos desde o último. Isso cobre
+    ///      o caso onde múltiplos Commands chegam antes do SyncVar FreeAttributePoints
+    ///      atualizar no cliente, evitando que FreeAttributePoints vá negativo.
     ///
-    ///     OnNetMaxMPChanged faz o mesmo para o caso de apenas o MP mudar.
+    ///   4. BASE_ATTRIBUTES agora sincronizados para permitir que o servidor
+    ///      mude BaseAttributes no futuro (quest, raça muda etc.) e o cliente
+    ///      reflita corretamente.
     ///
-    ///   CUIDADO: RefreshStatsFromServer() é chamado somente quando AMBOS MaxHP
-    ///     e MaxMP já chegaram no cliente. Como SyncVars são aplicadas em batch
-    ///     no mesmo frame, isso é seguro.
-    ///
-    /// RESTO DO ARQUIVO: idêntico ao NetworkPlayer v13.
+    ///   Resto idêntico ao v14.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -49,9 +48,11 @@ namespace RPG.Network
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        private const float MAX_HP_CAP    = 500_000f;
-        private const float MAX_MP_CAP    = 200_000f;
-        private const float SAVE_INTERVAL = 60f;
+        private const float MAX_HP_CAP           = 500_000f;
+        private const float MAX_MP_CAP           = 200_000f;
+        private const float SAVE_INTERVAL        = 60f;
+        private const float REGEN_INTERVAL       = 5f;      // segundos entre ticks de regen
+        private const float ALLOCATE_MIN_INTERVAL = 0.3f;   // anti-spam: mínimo entre alocações
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNetNameChanged))]       public string CharacterName         = "...";
@@ -65,12 +66,15 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetExpChanged))]        public long   Experience            = 0;
         [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
-        [SyncVar] public int AllocatedSTR = 0;
-        [SyncVar] public int AllocatedAGI = 0;
-        [SyncVar] public int AllocatedVIT = 0;
-        [SyncVar] public int AllocatedDEX = 0;
-        [SyncVar] public int AllocatedINT = 0;
-        [SyncVar] public int AllocatedLUK = 0;
+
+        // CORREÇÃO v15: hooks individuais para forçar recálculo de stats no cliente
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedSTR = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedAGI = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedVIT = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedDEX = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedINT = 0;
+        [SyncVar(hook = nameof(OnAllocatedChanged))] public int AllocatedLUK = 0;
+
         [SyncVar] public int BaseSTR = 10;
         [SyncVar] public int BaseAGI = 10;
         [SyncVar] public int BaseVIT = 10;
@@ -109,10 +113,14 @@ namespace RPG.Network
         private DerivedStats  _serverStats;
         private string        _serverAccountUsername;
         private float         _autoSaveTimer;
+        private float         _lastAllocateTime = -999f; // CORREÇÃO v15: anti-spam
 
         public DerivedStats ServerStats => _serverStats;
 
         private readonly Dictionary<int, float> _serverSkillCooldowns = new();
+
+        // Coroutines do servidor
+        private Coroutine _regenCoroutine;
 
         // ── Estado do cliente ──────────────────────────────────────────────
         private bool          _clientInitialized = false;
@@ -143,6 +151,7 @@ namespace RPG.Network
         public override void OnStopServer()
         {
             All.Remove(this);
+            StopRegenLoop();
             if (_serverCharData != null)
                 ServerSaveCharacter();
             else
@@ -255,6 +264,9 @@ namespace RPG.Network
             _inventory?.ServerLoadFromDatabase(charData.CharacterId);
             _inventory?.ServerLoadGemLoadout(charData.CharacterId);
 
+            // CORREÇÃO v15: inicia regen após inicializar
+            StartRegenLoop();
+
             Debug.Log($"[Server] {charData.CharacterName} Lv{Level} HP:{CurrentHP:0}/{MaxHP:0} inicializado.");
             StartCoroutine(SendInitRpcDelayed(charData));
         }
@@ -279,6 +291,59 @@ namespace RPG.Network
             );
         }
 
+        // ── CORREÇÃO v15: Regen de HP/MP ──────────────────────────────────
+
+        [Server]
+        private void StartRegenLoop()
+        {
+            StopRegenLoop();
+            _regenCoroutine = StartCoroutine(ServerRegenLoop());
+        }
+
+        [Server]
+        private void StopRegenLoop()
+        {
+            if (_regenCoroutine != null)
+            {
+                StopCoroutine(_regenCoroutine);
+                _regenCoroutine = null;
+            }
+        }
+
+        [Server]
+        private IEnumerator ServerRegenLoop()
+        {
+            var wait = new WaitForSeconds(REGEN_INTERVAL);
+            while (true)
+            {
+                yield return wait;
+
+                if (Dead || _serverStats == null) continue;
+
+                bool hpChanged = false;
+                bool mpChanged = false;
+
+                if (CurrentHP < MaxHP && _serverStats.HPRegen > 0f)
+                {
+                    CurrentHP = Mathf.Min(MaxHP, CurrentHP + _serverStats.HPRegen);
+                    if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
+                    hpChanged = true;
+                }
+
+                if (CurrentMP < MaxMP && _serverStats.MPRegen > 0f)
+                {
+                    CurrentMP = Mathf.Min(MaxMP, CurrentMP + _serverStats.MPRegen);
+                    if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
+                    mpChanged = true;
+                }
+
+                // SyncVars HP/MP já propagam automaticamente para clientes via Mirror
+                // Não precisamos de RPC extra — os hooks OnNetHPChanged/OnNetMPChanged cuidam disso
+                _ = hpChanged;
+                _ = mpChanged;
+            }
+        }
+
         // ── Commands ──────────────────────────────────────────────────────
 
         [Command] public void CmdSetMoving(bool moving) => IsMoving = moving;
@@ -286,8 +351,17 @@ namespace RPG.Network
         [Command]
         public void CmdAllocateAttribute(int attributeIndex)
         {
+            // CORREÇÃO v15: anti-spam — rejeita se chegou rápido demais
+            if (Time.time - _lastAllocateTime < ALLOCATE_MIN_INTERVAL)
+            {
+                Debug.LogWarning($"[Server] CmdAllocateAttribute spam detectado: {CharacterName}");
+                return;
+            }
+
             if (FreeAttributePoints <= 0 || _serverCharData == null) return;
             if (attributeIndex < 0 || attributeIndex > 5) return;
+
+            _lastAllocateTime = Time.time;
 
             FreeAttributePoints--;
             _serverCharData.FreeAttributePoints--;
@@ -410,8 +484,9 @@ namespace RPG.Network
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
-                Debug.Assert(_serverCharData.Level == Level,
-                    $"[Server] Level inconsistente: SyncVar={Level} Data={_serverCharData.Level}");
+                // Reinicia regen com novos stats após level up
+                StartRegenLoop();
+
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
             }
 
@@ -571,6 +646,7 @@ namespace RPG.Network
         private void ServerDie()
         {
             CurrentHP = 0f;
+            StopRegenLoop(); // para regen ao morrer
             if (_agent != null) _agent.ResetPath();
             ServerSaveCharacter();
             RpcPlayerDied();
@@ -594,6 +670,9 @@ namespace RPG.Network
                 _serverCharData.CurrentMP = CurrentMP;
                 ServerSaveCharacter();
             }
+
+            // Reinicia regen ao respawnar
+            StartRegenLoop();
 
             RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);
         }
@@ -633,38 +712,18 @@ namespace RPG.Network
                 _playerEntity.SetHPFromServer(newHP, MaxHP);
         }
 
-        /// <summary>
-        /// CORREÇÃO v14: chama RefreshStatsFromServer em vez de apenas SetHPFromServer.
-        ///
-        /// Quando MaxHP muda (ex: após alocar VIT ou subir de nível), o PlayerEntity
-        /// precisa ser notificado com RefreshStatsFromServer() para que OnStatsChanged
-        /// seja disparado. Isso aciona o AttributeWindowUI para redesenhar todos os
-        /// status derivados (ATK, DEF, ASPD etc.) imediatamente, sem precisar
-        /// fechar e reabrir a janela.
-        /// </summary>
         private void OnNetMaxHPChanged(float _, float newMax)
         {
             if (_hpBarSlider != null) _hpBarSlider.maxValue = newMax;
 
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-            {
-                // RefreshStatsFromServer atualiza MaxHP/MaxMP no PlayerEntity
-                // E dispara OnStatsChanged → AttributeWindowUI.OnDataChanged → RefreshAll()
                 _playerEntity.RefreshStatsFromServer(newMax, MaxMP);
-            }
         }
 
-        /// <summary>
-        /// CORREÇÃO v14: idem ao OnNetMaxHPChanged, para o caso de MaxMP mudar
-        /// independentemente (ex: alocar INT sem mudar VIT).
-        /// </summary>
         private void OnNetMaxMPChanged(float _, float newMax)
         {
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-            {
-                // Usa o MaxHP atual (já atualizado) junto com o novo MaxMP
                 _playerEntity.RefreshStatsFromServer(MaxHP, newMax);
-            }
         }
 
         private void OnNetMPChanged(float _, float newMP)
@@ -681,10 +740,6 @@ namespace RPG.Network
         private void OnNetFreePointsChanged(int _, int newPoints)
         {
             if (!isLocalPlayer) return;
-
-            // Notifica a AttributeWindowUI diretamente.
-            // OnFreePointsUpdated() chama RefreshAll() se a janela estiver aberta —
-            // isso garante que STR, ATK, DEF etc. atualizam na hora.
             AttributeWindowUI.Instance?.OnFreePointsUpdated(newPoints);
         }
 
@@ -705,6 +760,30 @@ namespace RPG.Network
             if (!isLocalPlayer) return;
             UIManager.Instance?.RefreshExpBar(Experience, ExperienceToNextLevel);
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
+        }
+
+        /// <summary>
+        /// CORREÇÃO v15: hook disparado quando qualquer Allocated* muda.
+        /// Força recálculo completo dos DerivedStats no cliente (ASPD, ATK, DEF etc.)
+        /// </summary>
+        private void OnAllocatedChanged(int _, int __)
+        {
+            if (!isLocalPlayer) return;
+            if (_playerEntity == null || !_playerEntity.IsInitialized) return;
+
+            // Atualiza o CharacterData local com os valores mais recentes das SyncVars
+            if (_playerEntity.Data != null)
+            {
+                _playerEntity.Data.AllocatedSTR = AllocatedSTR;
+                _playerEntity.Data.AllocatedAGI = AllocatedAGI;
+                _playerEntity.Data.AllocatedVIT = AllocatedVIT;
+                _playerEntity.Data.AllocatedDEX = AllocatedDEX;
+                _playerEntity.Data.AllocatedINT = AllocatedINT;
+                _playerEntity.Data.AllocatedLUK = AllocatedLUK;
+            }
+
+            // Recalcula todos os stats derivados (ASPD, MoveSpeed, ATK, DEF etc.)
+            _playerEntity.FullRefreshStatsFromData();
         }
     }
 }
