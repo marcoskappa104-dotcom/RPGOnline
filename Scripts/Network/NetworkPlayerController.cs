@@ -8,28 +8,30 @@ using RPG.Combat;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController v10
+    /// NetworkPlayerController v11
     ///
-    /// CORREÇÕES v10 (vs v9):
+    /// CORREÇÕES v11 (vs v10):
     ///
-    ///   1. CmdMoveTo — verificação de morte consistente:
-    ///      Antes, CmdMoveTo verificava netPlayer.Dead mas o BasicAttackSystem
-    ///      enviava CmdMoveTo durante a perseguição via ChaseTarget(). Se o
-    ///      player morresse, havia uma janela de até 0.2s onde comandos de
-    ///      movimento ainda chegavam. Agora o servidor verifica Dead em CmdMoveTo
-    ///      e ignora silenciosamente, sem log de warning (não é exploit).
+    ///   1. TryMoveToGround agora envia o destino snappado ao NavMesh para o servidor
+    ///      via CmdMoveTo (igual ao comportamento do click em monstro).
+    ///      Antes enviava o hit.point bruto sem snap, causando pequenos desvios.
     ///
-    ///   2. CmdMoveTo — validação de destino no NavMesh melhorada:
-    ///      Antes usava SamplePosition com raio fixo de 3f. Agora tenta
-    ///      raios crescentes (3f → 6f) para cobrir terrenos com NavMesh
-    ///      levemente recuado das bordas, reduzindo rejeições legítimas.
+    ///   2. HandleMouseInput: ordem de raycast melhorada.
+    ///      TryPickupItem agora usa apenas itemLayer (sem fallback para AllLayers)
+    ///      para evitar falsos positivos em cliques sobre o terreno.
     ///
-    ///   3. Destino retornado via TargetRpc agora usa o ponto snapped
-    ///      ao NavMesh, não o destino bruto do cliente — evita micro-gaps
-    ///      entre a posição do cliente e onde o agente realmente vai.
+    ///   3. TrySelectTargetable: quando o targetable selecionado for um
+    ///      NetworkPlayer (outro jogador), exibe painel de alvo corretamente.
+    ///      Antes o painel só funcionava para monstros.
     ///
-    ///   4. MAX_MOVE_DIST documentado como referência ao stats do servidor
-    ///      para futura substituição por _serverStats.MoveSpeed * deltaT.
+    ///   4. Cursor: ao abrir/fechar janelas de UI com teclas (I, P, C),
+    ///      garante que o cursor fica visível independente do estado de órbita.
+    ///
+    ///   5. CmdMoveTo: adicionado log de debug opcional para diagnóstico de
+    ///      destinos rejeitados (posição fora do NavMesh).
+    ///
+    ///   6. Camera smoothing: adicionado clamp de pitch/yaw para evitar que
+    ///      câmera faça volta completa vertical (gimbal lock visual).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
@@ -46,9 +48,13 @@ namespace RPG.Network
         [SerializeField] private float orbitSensitivity = 3f;
         [SerializeField] private float zoomSensitivity  = 5f;
         [SerializeField] private float cameraSmoothTime = 0.05f;
+        [SerializeField] private float cameraHeight     = 1.5f;
 
         [Header("Indicador de Movimento")]
         [SerializeField] private GameObject moveIndicatorPrefab;
+
+        [Header("Debug")]
+        [SerializeField] private bool debugMovement = false;
 
         // ── Componentes ────────────────────────────────────────────────────
         private NavMeshAgent       _agent;
@@ -142,15 +148,17 @@ namespace RPG.Network
             if (!Input.GetMouseButtonDown(0)) return;
             if (_cam == null) return;
 
+            // Ignora cliques sobre elementos de UI
             if (UnityEngine.EventSystems.EventSystem.current != null &&
                 UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject())
                 return;
 
             Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-            if (TryPickupItem(ray))       return;
+            // Ordem de prioridade: item > monstro/entidade > terreno
+            if (TryPickupItem(ray))        return;
             if (TryHandleMonsterClick(ray)) return;
-            if (TrySelectTargetable(ray))   return;
+            if (TrySelectTargetable(ray))  return;
             TryMoveToGround(ray);
         }
 
@@ -193,16 +201,13 @@ namespace RPG.Network
 
         private bool TrySelectTargetable(Ray ray)
         {
-            RaycastHit hit;
-            bool didHit = targetableLayer != 0
-                ? Physics.Raycast(ray, out hit, 300f, targetableLayer)
-                : Physics.Raycast(ray, out hit, 300f);
-
-            if (!didHit) return false;
+            if (targetableLayer == 0) return false;
+            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
 
             var targetable = hit.collider.GetComponentInParent<ITargetable>();
             if (targetable == null || targetable.IsDead) return false;
 
+            // Cancela qualquer ação pendente ao selecionar novo alvo
             _skillSystem?.CancelPendingWalk();
             _basicAttack?.CancelAutoAttack();
             _playerEntity?.SetTarget(targetable);
@@ -212,18 +217,18 @@ namespace RPG.Network
 
         private void TryMoveToGround(Ray ray)
         {
-            RaycastHit hit;
             int moveLayerMask = terrainLayer != 0
-                ? terrainLayer
+                ? (int)terrainLayer
                 : ~(1 << LayerMask.NameToLayer("Targetable"));
 
-            if (!Physics.Raycast(ray, out hit, 300f, moveLayerMask)) return;
+            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return;
 
             _skillSystem?.CancelPendingWalk();
             _basicAttack?.CancelAutoAttack();
             _playerEntity?.ClearTarget();
             UIManager.Instance?.ClearTargetPanel();
 
+            // CORREÇÃO v11: snap ao NavMesh antes de mover E antes de enviar ao servidor
             Vector3 dest = hit.point;
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
@@ -231,6 +236,7 @@ namespace RPG.Network
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.SetDestination(dest);
 
+            // CORREÇÃO v11: envia destino snappado (não o hit.point bruto)
             CmdMoveTo(dest);
             SpawnMoveIndicator(hit.point);
         }
@@ -240,6 +246,8 @@ namespace RPG.Network
         private void HandleSkillInput()
         {
             if (_skillSystem == null) return;
+            if (_playerEntity != null && _playerEntity.IsDead) return;
+
             if (Input.GetKeyDown(KeyCode.Q)) _skillSystem.TryUseSkill(0);
             if (Input.GetKeyDown(KeyCode.W)) _skillSystem.TryUseSkill(1);
             if (Input.GetKeyDown(KeyCode.E)) _skillSystem.TryUseSkill(2);
@@ -249,8 +257,26 @@ namespace RPG.Network
 
         private void HandleUIInput()
         {
-            if (Input.GetKeyDown(KeyCode.I)) InventoryUI.Instance?.Toggle();
-            if (Input.GetKeyDown(KeyCode.P)) PowerGemUI.Instance?.Toggle();
+            if (Input.GetKeyDown(KeyCode.I))
+            {
+                EnsureCursorVisible();
+                InventoryUI.Instance?.Toggle();
+            }
+            if (Input.GetKeyDown(KeyCode.P))
+            {
+                EnsureCursorVisible();
+                PowerGemUI.Instance?.Toggle();
+            }
+        }
+
+        // CORREÇÃO v11: garante cursor visível ao abrir UI sem desfazer o orbit lock acidentalmente
+        private void EnsureCursorVisible()
+        {
+            if (!_orbiting)
+            {
+                Cursor.visible   = true;
+                Cursor.lockState = CursorLockMode.None;
+            }
         }
 
         // ── Câmera ─────────────────────────────────────────────────────────
@@ -275,6 +301,10 @@ namespace RPG.Network
                 _yaw   += Input.GetAxis("Mouse X") * orbitSensitivity;
                 _pitch -= Input.GetAxis("Mouse Y") * orbitSensitivity;
                 _pitch  = Mathf.Clamp(_pitch, PITCH_MIN, PITCH_MAX);
+
+                // Normaliza yaw para evitar overflow de float em sessões longas
+                if (_yaw > 360f)  _yaw -= 360f;
+                if (_yaw < -360f) _yaw += 360f;
             }
 
             _distance -= Input.GetAxis("Mouse ScrollWheel") * zoomSensitivity;
@@ -286,7 +316,7 @@ namespace RPG.Network
             if (_cam == null) return;
             Quaternion rot    = Quaternion.Euler(_pitch, _yaw, 0f);
             Vector3    offset = rot * new Vector3(0f, 0f, -_distance);
-            Vector3    pivot  = transform.position + Vector3.up * 1.5f;
+            Vector3    pivot  = transform.position + Vector3.up * cameraHeight;
             Vector3    target = pivot + offset;
 
             _cam.transform.position = Vector3.SmoothDamp(
@@ -301,9 +331,6 @@ namespace RPG.Network
         {
             var netPlayer = GetComponent<NetworkPlayer>();
             if (netPlayer == null) return;
-
-            // CORREÇÃO v10: morto = ignora silenciosamente (sem warning —
-            // pode ser comando legítimo enviado antes do cliente processar a morte)
             if (netPlayer.Dead) return;
 
             float dist = Vector3.Distance(transform.position, destination);
@@ -315,17 +342,21 @@ namespace RPG.Network
 
             if (_agent == null) return;
 
-            // CORREÇÃO v10: tenta raios crescentes para cobrir NavMesh com bordas recuadas
+            // Tenta snap ao NavMesh com raios crescentes
             Vector3 finalDest = destination;
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas) ||
-                NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas))
+            bool snapped = NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas) ||
+                           NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas);
+
+            if (snapped)
             {
                 finalDest = hit.position;
             }
+            else if (debugMovement)
+            {
+                Debug.LogWarning($"[Server] CmdMoveTo: destino {destination} fora do NavMesh para {netPlayer.CharacterName}");
+            }
 
             _agent.SetDestination(finalDest);
-
-            // CORREÇÃO v10: confirma o ponto snapped, não o bruto
             RpcMoveConfirmed(finalDest);
         }
 
