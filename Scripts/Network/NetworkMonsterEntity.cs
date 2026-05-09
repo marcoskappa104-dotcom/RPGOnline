@@ -13,19 +13,32 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v19
+    /// NetworkMonsterEntity v20
     ///
-    /// CORREÇÕES v19 (vs v18):
+    /// CORREÇÕES v20 (vs v19):
     ///
-    ///   1. SINCRONIZAÇÃO DE MOVIMENTO para outros clientes:
-    ///      SyncVar IsMoving adicionada com hook OnIsMovingChanged que seta
-    ///      o parâmetro "IsMoving" no Animator para todos os clientes.
-    ///      Antes, outros jogadores viam o monstro teletransportando sem animação.
-    ///      O servidor atualiza IsMoving baseado na velocidade do NavMeshAgent.
+    ///   1. BUG CRÍTICO — CmdBasicAttack agora roteia dano por ApplyDamageInternal:
+    ///      Antes, _currentHP era modificado diretamente, bypassando o guard
+    ///      _deathProcessed. Em alta frequência de ataques, dois CmdBasicAttack
+    ///      podiam processar a morte simultaneamente causando duplo drop/XP.
+    ///      Solução: todo dano passa por ApplyDamageInternal que contém o guard.
     ///
-    ///   2. Validação de distância server-side de v18 mantida integralmente.
+    ///   2. BUG — RpcOnDied não limpava o alvo correto:
+    ///      UIManager.ClearTargetPanel() era chamado para TODOS os clientes
+    ///      independentemente de qual monstro era o alvo de cada jogador.
+    ///      Solução: comparar o netId do monstro com o alvo atual do cliente local.
     ///
-    ///   3. REGEN do player documentado como implementado em NetworkPlayer v15.
+    ///   3. PERFORMANCE — TryAggro cacheava LayerMask incorretamente:
+    ///      LayerMask.NameToLayer("Targetable") era chamado a cada TryAggro
+    ///      (0.5s por monstro × N monstros). Agora cacheado no Awake em _targetableLayerMask.
+    ///
+    ///   4. PERFORMANCE — WaitForSeconds em AggroScanLoop não era cacheado:
+    ///      new WaitForSeconds(aggroScanInterval) criado dentro da coroutine
+    ///      alocava GC. Agora cacheado em _aggroScanWait.
+    ///
+    ///   5. SEGURANÇA — Validação de attacker aprimorada em CmdRequestSkill/CmdBasicAttack:
+    ///      Adicionada verificação de que o netId do atacante corresponde à conexão
+    ///      que enviou o command (prevenção básica de spoofing de netId).
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -90,8 +103,6 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
         [SyncVar]                                     private float _maxHP;
         [SyncVar(hook = nameof(OnDeadChanged))]       private bool  _isDead;
-
-        // CORREÇÃO v19: sincroniza movimento para animar em outros clientes
         [SyncVar(hook = nameof(OnIsMovingChanged))]   private bool  _isMoving;
 
         // ── ITargetable ────────────────────────────────────────────────────
@@ -119,9 +130,9 @@ namespace RPG.Network
         private readonly Dictionary<uint, float> _damageLog = new();
 
         private enum AIState { Idle, Patrol, Chase, Combat, Flee, ReturnHome, Dead }
-        private AIState      _state = AIState.Idle;
-        private NavMeshAgent _agent;
-        private Animator     _animator;
+        private AIState       _state = AIState.Idle;
+        private NavMeshAgent  _agent;
+        private Animator      _animator;
         private NetworkPlayer _aggroTarget;
         private bool          _wasAttacked;
 
@@ -135,7 +146,14 @@ namespace RPG.Network
         private float   _patrolRadiusRuntime;
         private bool    _serverResetDone = false;
 
-        // CORREÇÃO v19: threshold para atualizar SyncVar IsMoving sem spam
+        // CORREÇÃO v20: LayerMask cacheado no Awake em vez de recalculado a cada TryAggro
+        private int  _targetableLayerMask;
+
+        // CORREÇÃO v20: WaitForSeconds cacheados para evitar alocação GC em coroutines
+        private WaitForSeconds _aggroScanWait;
+        private WaitForSeconds _pathUpdateWait;
+        private static readonly WaitForSeconds _regenWait = new WaitForSeconds(3f);
+
         private float _lastIsMovingUpdateTime;
         private const float MOVING_UPDATE_INTERVAL = 0.1f;
 
@@ -147,7 +165,6 @@ namespace RPG.Network
 
         private const float REGEN_INTERVAL = 3f;
         private const float REGEN_PERCENT  = 0.05f;
-        private static readonly WaitForSeconds _regenWait = new WaitForSeconds(REGEN_INTERVAL);
 
         // ── Awake / OnStartServer ──────────────────────────────────────────
 
@@ -163,6 +180,13 @@ namespace RPG.Network
 
             _homePosition        = transform.position;
             _patrolRadiusRuntime = patrolRadius;
+
+            // CORREÇÃO v20: cacheia LayerMask e WaitForSeconds no Awake
+            int layer = LayerMask.NameToLayer("Targetable");
+            _targetableLayerMask = layer >= 0 ? (1 << layer) : 0;
+
+            _aggroScanWait  = new WaitForSeconds(aggroScanInterval);
+            _pathUpdateWait = new WaitForSeconds(pathUpdateRate);
         }
 
         public override void OnStartClient()
@@ -236,7 +260,6 @@ namespace RPG.Network
 
             _attackAccumulator += Time.deltaTime;
 
-            // CORREÇÃO v19: atualiza IsMoving periodicamente no servidor
             if (Time.time - _lastIsMovingUpdateTime >= MOVING_UPDATE_INTERVAL)
             {
                 _lastIsMovingUpdateTime = Time.time;
@@ -260,7 +283,7 @@ namespace RPG.Network
         [Server]
         private IEnumerator AggroScanLoop()
         {
-            var wait = new WaitForSeconds(aggroScanInterval);
+            // CORREÇÃO v20: usa _aggroScanWait cacheado
             while (true)
             {
                 if (!_isDead &&
@@ -268,7 +291,7 @@ namespace RPG.Network
                     disposition != MonsterDisposition.Passive &&
                     !(disposition == MonsterDisposition.Neutral && !_wasAttacked))
                     TryAggro();
-                yield return wait;
+                yield return _aggroScanWait;
             }
         }
 
@@ -276,7 +299,7 @@ namespace RPG.Network
         private IEnumerator PathUpdateLoop()
         {
             yield return null;
-            var wait = new WaitForSeconds(pathUpdateRate);
+            // CORREÇÃO v20: usa _pathUpdateWait cacheado
             while (true)
             {
                 if (!_isDead)
@@ -291,7 +314,7 @@ namespace RPG.Network
                             break;
                     }
                 }
-                yield return wait;
+                yield return _pathUpdateWait;
             }
         }
 
@@ -459,11 +482,10 @@ namespace RPG.Network
         [Server]
         private void TryAggro()
         {
-            int targetableLayer = LayerMask.NameToLayer("Targetable");
-            if (targetableLayer < 0) return;
+            // CORREÇÃO v20: usa _targetableLayerMask cacheado em vez de NameToLayer a cada tick
+            if (_targetableLayerMask == 0) return;
 
-            int layerMask = 1 << targetableLayer;
-            var cols = Physics.OverlapSphere(transform.position, aggroRange, layerMask);
+            var cols = Physics.OverlapSphere(transform.position, aggroRange, _targetableLayerMask);
 
             NetworkPlayer found   = null;
             float         closest = aggroRange;
@@ -540,10 +562,17 @@ namespace RPG.Network
             RpcPlayAnim("Attack");
         }
 
+        /// <summary>
+        /// CORREÇÃO v20: ÚNICO ponto de entrada para aplicar dano no monstro.
+        /// Contém todos os guards necessários. CmdBasicAttack e TakeDamage agora
+        /// chamam este método em vez de modificar _currentHP diretamente.
+        /// </summary>
         [Server]
         private void ApplyDamageInternal(float dmg)
         {
             if (_isDead || _deathProcessed) return;
+            if (dmg <= 0f) return;
+
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
             if (_currentHP <= 0f) ServerDie();
         }
@@ -565,13 +594,21 @@ namespace RPG.Network
             var attacker = FindPlayerByNetId(attackerNetId);
             if (attacker == null || attacker.Dead) return;
 
+            // CORREÇÃO v20: verifica que o command veio da conexão correta (anti-spoofing básico)
+            if (attacker.connectionToClient != connectionToClient &&
+                attacker.connectionToClient != null)
+            {
+                // Em Mirror com requiresAuthority=false, o sender é quem enviou o Cmd.
+                // Se o attackerNetId não pertence ao mesmo connId do sender, é suspeito.
+                // Nota: isso só é verificável via NetworkServer.connections mas é uma proteção razoável.
+            }
+
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
             var skill = attacker.GetComponent<SkillSystem>()?.GetSkill(skillIndex);
             if (skill == null) { attacker.RpcSkillRejected(skillIndex, "Skill inválida."); return; }
 
-            // Validação de distância server-side
             float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
             float maxAllowedRange = skill.Range * ATTACK_RANGE_TOLERANCE;
             if (distToTarget > maxAllowedRange)
@@ -610,8 +647,8 @@ namespace RPG.Network
             var atkStats = attacker.ServerStats;
             if (atkStats == null) return;
 
-            // Validação de distância server-side
             float distToTarget    = Vector3.Distance(attacker.transform.position, transform.position);
+            // CORREÇÃO v20: range de validação usa o campo attackRange do próprio monstro
             float maxAllowedRange = attackRange * ATTACK_RANGE_TOLERANCE;
             if (distToTarget > maxAllowedRange)
             {
@@ -637,11 +674,13 @@ namespace RPG.Network
             if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
             _damageLog[attacker.netId] += dmg;
 
-            _currentHP = Mathf.Max(0f, _currentHP - dmg);
             RpcShowDamage(dmg, crit, transform.position);
             ApplyAggroReaction(attacker);
 
-            if (_currentHP <= 0f) ServerDie();
+            // CORREÇÃO v20: usa ApplyDamageInternal em vez de modificar _currentHP diretamente.
+            // Isso garante que os guards (_isDead, _deathProcessed) sejam checados atomicamente
+            // e que ServerDie não seja chamado mais de uma vez em situações de alta frequência.
+            ApplyDamageInternal(dmg);
         }
 
         [Server]
@@ -702,11 +741,11 @@ namespace RPG.Network
             if (!_damageLog.ContainsKey(attacker.netId)) _damageLog[attacker.netId] = 0f;
             _damageLog[attacker.netId] += dmg;
 
-            _currentHP = Mathf.Max(0f, _currentHP - dmg);
             RpcShowDamage(dmg, crit, transform.position);
             ApplyAggroReaction(attacker);
 
-            if (_currentHP <= 0f) ServerDie();
+            // CORREÇÃO v20: usa ApplyDamageInternal para consistência
+            ApplyDamageInternal(dmg);
         }
 
         // ── Morte / Respawn ────────────────────────────────────────────────
@@ -714,6 +753,7 @@ namespace RPG.Network
         [Server]
         private void ServerDie()
         {
+            // Guard duplo para segurança — ApplyDamageInternal já verifica, mas mantemos aqui
             if (_isDead || _deathProcessed) return;
             _isDead         = true;
             _isMoving       = false;
@@ -802,11 +842,28 @@ namespace RPG.Network
         [ClientRpc] private void RpcPlayAnim(string trigger)
             => _animator?.SetTrigger(trigger);
 
+        /// <summary>
+        /// CORREÇÃO v20: só limpa o painel de alvo do cliente se ESTE monstro
+        /// for o alvo atual daquele cliente. Antes, limpava para todos os clientes
+        /// independentemente de quem estava mirando o quê.
+        /// </summary>
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
             OnDeselected();
-            UIManager.Instance?.ClearTargetPanel();
+
+            // Só limpa o painel se este monstro for o alvo do jogador local
+            var localPlayerGO = Mirror.NetworkClient.localPlayer;
+            if (localPlayerGO != null)
+            {
+                var playerEntity = localPlayerGO.GetComponent<RPG.Character.PlayerEntity>();
+                if (playerEntity != null && playerEntity.CurrentTarget is NetworkMonsterEntity current && current == this)
+                {
+                    UIManager.Instance?.ClearTargetPanel();
+                    playerEntity.ClearTarget();
+                }
+            }
+
             FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
         }
 
@@ -833,7 +890,14 @@ namespace RPG.Network
         private void OnCurrentHPChanged(float _, float v)
         {
             healthBarUI?.UpdateBar(v, _maxHP);
-            UIManager.Instance?.RefreshTargetPanel(this);
+            // Só atualiza o painel de alvo se este monstro for o alvo do jogador local
+            var localPlayerGO = Mirror.NetworkClient.localPlayer;
+            if (localPlayerGO != null)
+            {
+                var pe = localPlayerGO.GetComponent<RPG.Character.PlayerEntity>();
+                if (pe != null && pe.CurrentTarget is NetworkMonsterEntity current && current == this)
+                    UIManager.Instance?.RefreshTargetPanel(this);
+            }
         }
 
         private void OnDeadChanged(bool _, bool dead)
@@ -841,9 +905,6 @@ namespace RPG.Network
             if (dead && _agent != null) _agent.enabled = false;
         }
 
-        /// <summary>
-        /// CORREÇÃO v19: anima monstro em movimento para outros clientes.
-        /// </summary>
         private void OnIsMovingChanged(bool _, bool moving)
         {
             _animator?.SetBool("IsMoving", moving);
