@@ -13,43 +13,34 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v21
+    /// NetworkMonsterEntity v22
     ///
-    /// CORREÇÕES v21 (vs v20):
+    /// CORREÇÕES v22:
     ///
-    ///   1. BUG PRINCIPAL — Monstro sobrepunha o player durante o combate:
+    ///   1. ATTACK_RANGE_TOLERANCE ajustado de 1.3f para 1.35f:
+    ///      Com SkillSystem v9 usando RANGE_CHECK_MARGIN = 1.05f no cliente,
+    ///      o servidor precisa aceitar uma tolerância levemente maior para evitar
+    ///      rejeições falsas por latência. 1.35x é seguro e cobre jitter de rede
+    ///      sem abrir exploits significativos em LAN/WAN local.
     ///
-    ///      CAUSA: UpdateChasePath() chamava:
-    ///        `_agent.SetDestination(_aggroTarget.transform.position)`
-    ///      com stoppingDistance = attackRange * 0.85f.
-    ///      Igual ao bug do player com skills — o destino ERA o player,
-    ///      e o stoppingDistance funciona como margem relativa ao destino.
-    ///      Quando o player se move, o destino muda todo frame e o
-    ///      stoppingDistance não garante parada exata antes do player.
+    ///   2. CHASE_DEST_FRACTION ajustado de 0.80f para 0.82f:
+    ///      Alinhado com a mudança do BasicAttackSystem v3 (0.80) e SkillSystem v9 (0.85).
+    ///      0.82 garante que o monstro para DENTRO do range de ataque.
     ///
-    ///      SOLUÇÃO: Igual ao SkillSystem/BasicAttackSystem do player.
-    ///      CalculateChaseDestination() retorna um ponto intermediário a
-    ///      (attackRange * 0.80f) do player na direção monstro→player.
-    ///      stoppingDistance fica em 0.5f (parada natural no ponto calculado).
+    ///   3. ServerChaseCheck: quando entra em combate, _agent.velocity = Vector3.zero
+    ///      para parar o deslizamento residual do NavMesh.
     ///
-    ///   2. BUG — ServerCombat kite area mal calibrada:
-    ///      kiteDistance era 1.8f mas attackRange é 2.5f por padrão.
-    ///      O monstro ficava em "limbo" entre kite e ataque.
-    ///      Agora kiteDistance usa uma fração do attackRange (0.5f * attackRange),
-    ///      garantindo proporção correta independente do attackRange configurado.
+    ///   4. ServerCombat: ao parar para atacar, velocity zerada para evitar
+    ///      que o monstro "deslize" pelo player após parar.
     ///
-    ///   3. MELHORIA — RegenLoop usa WaitForSeconds pré-alocado:
-    ///      _regenWait já era estático mas RegenLoop tinha 'new WaitForSeconds(3f)'.
-    ///      Corrigido para usar o campo cacheado.
+    ///   5. RegenLoop: REGEN_INTERVAL aumentado de 3s para 5s — alinhado com
+    ///      ServerRegenLoop do NetworkPlayer (que usa 5s). Consistência entre monstro e player.
     ///
-    ///   4. MELHORIA — AggroScanLoop: correção de precedência do OR/AND lógico
-    ///      para MonsterDisposition.Neutral com _wasAttacked.
-    ///
-    ///   CORREÇÕES v20 mantidas:
+    ///   CORREÇÕES v21 mantidas:
     ///     - CmdBasicAttack usa ApplyDamageInternal (guard contra duplo kill)
-    ///     - RpcOnDied só limpa painel do cliente que tinha o monstro como alvo
+    ///     - kiteDistance como fração do attackRange
     ///     - LayerMask e WaitForSeconds cacheados no Awake
-    ///     - Anti-spoofing básico em CmdRequestSkill/CmdBasicAttack
+    ///     - Destino de chase intermediário para não sobrepor player
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -75,7 +66,7 @@ namespace RPG.Network
         [SerializeField] private float attackRange    = 2.5f;
         [SerializeField] private float leashRange     = 30f;
 
-        [Header("Kite — fração do attackRange. 0.5 = para a 50% do range de ataque.")]
+        [Header("Kite")]
         [Tooltip("Fração do attackRange. O monstro recua se o player entrar nessa distância.")]
         [SerializeField] private float kiteDistanceFraction = 0.50f;
 
@@ -110,11 +101,12 @@ namespace RPG.Network
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
-        // Tolerância de range server-side (1.3x é mais realista que 1.5x para LAN)
-        private const float ATTACK_RANGE_TOLERANCE = 1.3f;
+        // CORREÇÃO v22: tolerância levemente aumentada para cobrir latência de rede
+        // sem comprometer segurança anti-cheat
+        private const float ATTACK_RANGE_TOLERANCE = 1.35f;
 
-        // Fração do range para calcular destino intermediário (evita sobrepor player)
-        private const float CHASE_DEST_FRACTION = 0.80f;
+        // CORREÇÃO v22: 0.82f → monstro para dentro do range, alinhado com cliente
+        private const float CHASE_DEST_FRACTION = 0.82f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
@@ -146,7 +138,6 @@ namespace RPG.Network
         private DerivedStats _stats;
         private readonly Dictionary<uint, float> _damageLog = new();
 
-        // Kite distance calculada como fração do attackRange no runtime
         private float _kiteDistance;
 
         private enum AIState { Idle, Patrol, Chase, Combat, Flee, ReturnHome, Dead }
@@ -169,7 +160,7 @@ namespace RPG.Network
         private int            _targetableLayerMask;
         private WaitForSeconds _aggroScanWait;
         private WaitForSeconds _pathUpdateWait;
-        // Regen wait: 3s por tick (igual ao ServerRegenLoop)
+        // CORREÇÃO v22: alinhado com NetworkPlayer ServerRegenLoop (5s)
         private WaitForSeconds _regenWait;
 
         private float _lastIsMovingUpdateTime;
@@ -181,7 +172,8 @@ namespace RPG.Network
         private Coroutine _regenCoroutine;
         private bool      _deathProcessed = false;
 
-        private const float REGEN_INTERVAL = 3f;
+        // CORREÇÃO v22: 5s — alinhado com ServerRegenLoop do player
+        private const float REGEN_INTERVAL = 5f;
         private const float REGEN_PERCENT  = 0.05f;
 
         // ── Awake / OnStartServer ──────────────────────────────────────────
@@ -198,9 +190,7 @@ namespace RPG.Network
 
             _homePosition        = transform.position;
             _patrolRadiusRuntime = patrolRadius;
-
-            // CORREÇÃO v21: kiteDistance como fração do attackRange
-            _kiteDistance = attackRange * kiteDistanceFraction;
+            _kiteDistance        = attackRange * kiteDistanceFraction;
 
             int layer = LayerMask.NameToLayer("Targetable");
             _targetableLayerMask = layer >= 0 ? (1 << layer) : 0;
@@ -252,16 +242,16 @@ namespace RPG.Network
             _patrolTargetSet   = false;
             _damageLog.Clear();
 
-            // Recalcula kiteDistance ao resetar (caso attackRange seja alterado)
             _kiteDistance = attackRange * kiteDistanceFraction;
 
             if (_agent != null)
             {
-                _agent.enabled      = true;
-                _agent.speed        = _stats.MoveSpeed;
-                _agent.angularSpeed = 360f;
-                _agent.acceleration = 12f;
-                _agent.stoppingDistance = 0.5f; // padrão correto
+                _agent.enabled          = true;
+                _agent.speed            = _stats.MoveSpeed;
+                _agent.angularSpeed     = 360f;
+                _agent.acceleration     = 12f;
+                _agent.stoppingDistance = 0.5f;
+                _agent.velocity         = Vector3.zero;
                 if (_agent.isOnNavMesh) _agent.Warp(_homePosition);
                 else                    transform.position = _homePosition;
             }
@@ -310,15 +300,6 @@ namespace RPG.Network
         {
             while (true)
             {
-                // CORREÇÃO v21: precedência correta do AND/OR para Neutral
-                bool shouldScan = !_isDead &&
-                    (_state == AIState.Idle || _state == AIState.Patrol) &&
-                    disposition != MonsterDisposition.Passive &&
-                    (disposition != MonsterDisposition.Neutral || _wasAttacked == false);
-
-                // Para Aggressive: sempre scaneia quando idle/patrol
-                // Para Neutral: só scaneia se foi atacado (_wasAttacked)
-                // Lógica correta:
                 if (!_isDead &&
                     (_state == AIState.Idle || _state == AIState.Patrol))
                 {
@@ -326,7 +307,6 @@ namespace RPG.Network
                         TryAggro();
                     else if (disposition == MonsterDisposition.Neutral && _wasAttacked)
                         TryAggro();
-                    // Passive: nunca aggreia por proximidade (só foge se atacado)
                 }
 
                 yield return _aggroScanWait;
@@ -370,7 +350,6 @@ namespace RPG.Network
         {
             while (_state == AIState.ReturnHome)
             {
-                // CORREÇÃO v21: usa _regenWait cacheado
                 yield return _regenWait;
                 if (_state != AIState.ReturnHome) break;
                 _currentHP = Mathf.Min(_maxHP, _currentHP + _maxHP * REGEN_PERCENT);
@@ -406,11 +385,12 @@ namespace RPG.Network
                 float ai = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
                 _attackAccumulator = ai * 0.5f;
                 _state = AIState.Combat;
-                // CORREÇÃO v21: para completamente ao entrar em combate
+                // CORREÇÃO v22: para completamente ao entrar em combate
                 if (_agent.isOnNavMesh)
                 {
                     _agent.ResetPath();
                     _agent.stoppingDistance = 0.5f;
+                    _agent.velocity         = Vector3.zero;
                 }
             }
         }
@@ -423,15 +403,12 @@ namespace RPG.Network
 
             float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
 
-            // Se saiu do range de ataque, volta para chase
             if (dist > attackRange * 1.4f) { _state = AIState.Chase; return; }
 
             if (_agent.isOnNavMesh)
             {
-                // CORREÇÃO v21: kite usa _kiteDistance (fração do attackRange)
                 if (dist < _kiteDistance)
                 {
-                    // Recua: vai para longe do player, mas não além do attackRange
                     Vector3 away = (transform.position - _aggroTarget.transform.position).normalized;
                     Vector3 kiteTarget = transform.position + away * (_kiteDistance + 0.5f);
                     _agent.stoppingDistance = 0.5f;
@@ -439,13 +416,16 @@ namespace RPG.Network
                 }
                 else
                 {
-                    // Dentro do range confortável: para e ataca
-                    _agent.ResetPath();
-                    _agent.stoppingDistance = 0.5f;
+                    // CORREÇÃO v22: velocity zerrada ao parar para atacar
+                    if (_agent.hasPath)
+                    {
+                        _agent.ResetPath();
+                        _agent.stoppingDistance = 0.5f;
+                        _agent.velocity         = Vector3.zero;
+                    }
                 }
             }
 
-            // Rotaciona em direção ao player
             Vector3 dir = _aggroTarget.transform.position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
@@ -493,33 +473,29 @@ namespace RPG.Network
         {
             if (_aggroTarget == null || !_agent.isOnNavMesh) return;
 
-            // CORREÇÃO v21: destino intermediário, não a posição do player
+            // CORREÇÃO v22: destino intermediário com fração atualizada
             Vector3 destination = CalculateChaseDestination(_aggroTarget.transform.position);
-            _agent.stoppingDistance = 0.5f; // parada natural no ponto calculado
+            _agent.stoppingDistance = 0.2f; // fixo e pequeno — não múltiplo do range
             _agent.SetDestination(destination);
         }
 
         /// <summary>
-        /// CORREÇÃO v21 — Calcula ponto de destino que fica dentro do range de ataque.
-        ///
-        /// O destino é um ponto a (attackRange * CHASE_DEST_FRACTION) do player
-        /// na direção monstro→player. Assim o NavMesh para o monstro naturalmente
-        /// nesse ponto, sem precisar de stoppingDistance especial.
-        ///
-        /// Isso resolve o bug onde o monstro sobrepunha o player.
+        /// CORREÇÃO v22 — Calcula ponto de destino dentro do range de ataque.
+        /// CHASE_DEST_FRACTION = 0.82f → para a 82% do range do player.
+        /// stoppingDistance = 0.2f (fixo) → sem soma indesejada de frações.
         /// </summary>
         private Vector3 CalculateChaseDestination(Vector3 playerPos)
         {
             Vector3 toPlayer = playerPos - transform.position;
             float dist = toPlayer.magnitude;
 
-            // Já está no range — não precisa mover
-            if (dist <= attackRange * CHASE_DEST_FRACTION)
+            float safeStopDist = attackRange * CHASE_DEST_FRACTION;
+
+            if (dist <= safeStopDist * 0.95f)
                 return transform.position;
 
-            float   stopDist    = attackRange * CHASE_DEST_FRACTION;
             Vector3 direction   = toPlayer.normalized;
-            Vector3 destination = playerPos - direction * stopDist;
+            Vector3 destination = playerPos - direction * safeStopDist;
 
             if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
                 return hit.position;
@@ -605,6 +581,7 @@ namespace RPG.Network
             {
                 _agent.ResetPath();
                 _agent.stoppingDistance = 0.5f;
+                _agent.velocity         = Vector3.zero;
             }
             float ai = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
             _attackAccumulator = ai * 0.3f;
@@ -621,7 +598,11 @@ namespace RPG.Network
             _state       = AIState.ReturnHome;
             _aggroTarget = null;
             CancelPatrolWait();
-            if (_agent != null) _agent.stoppingDistance = 0.5f;
+            if (_agent != null)
+            {
+                _agent.stoppingDistance = 0.5f;
+                _agent.velocity         = Vector3.zero;
+            }
             if (_regenCoroutine != null) StopCoroutine(_regenCoroutine);
             _regenCoroutine = StartCoroutine(RegenLoop());
         }
@@ -689,7 +670,7 @@ namespace RPG.Network
             if (distToTarget > maxAllowedRange)
             {
                 Debug.LogWarning($"[Security] {attacker.CharacterName} usou skill fora de range: " +
-                                 $"dist={distToTarget:0.1} max={maxAllowedRange:0.1}");
+                                 $"dist={distToTarget:0.2f} max={maxAllowedRange:0.2f} range={skill.Range:0.1f}");
                 return;
             }
 
@@ -727,7 +708,7 @@ namespace RPG.Network
             if (distToTarget > maxAllowedRange)
             {
                 Debug.LogWarning($"[Security] {attacker.CharacterName} atacou fora de range: " +
-                                 $"dist={distToTarget:0.1} max={maxAllowedRange:0.1}");
+                                 $"dist={distToTarget:0.2f} max={maxAllowedRange:0.2f}");
                 return;
             }
 
@@ -832,7 +813,11 @@ namespace RPG.Network
 
             if (_agent != null)
             {
-                if (_agent.isOnNavMesh) _agent.ResetPath();
+                if (_agent.isOnNavMesh)
+                {
+                    _agent.ResetPath();
+                    _agent.velocity = Vector3.zero;
+                }
                 _agent.enabled = false;
             }
 
@@ -984,11 +969,9 @@ namespace RPG.Network
             Gizmos.color = new Color(1f, 0.3f, 0.3f);
             Gizmos.DrawWireSphere(transform.position, attackRange);
 
-            // Mostra onde o monstro vai parar (destino calculado)
             Gizmos.color = new Color(0f, 1f, 0.5f, 0.5f);
             Gizmos.DrawWireSphere(transform.position, attackRange * CHASE_DEST_FRACTION);
 
-            // Kite distance
             Gizmos.color = Color.blue;
             Gizmos.DrawWireSphere(transform.position, attackRange * kiteDistanceFraction);
 
