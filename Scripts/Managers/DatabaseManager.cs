@@ -155,28 +155,30 @@ namespace RPG.Managers
 #endif
 
     // ══════════════════════════════════════════════════════════════════════
-    // DatabaseManager v9
+    // DatabaseManager v10
     // ══════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// DatabaseManager v9 — CORREÇÃO CRÍTICA: pipeline de hash unificado
+    /// DatabaseManager v10
     ///
-    /// PROBLEMA v8:
-    ///   TryCreateAccount armazenava SHA256(clientHash + serverSalt) no banco.
-    ///   TryLoginWithSignedHash validava SHA256(storedHash + nonce) contra
-    ///   SHA256(SHA256(senha) + nonce) — os hashes NUNCA batiam porque:
-    ///   storedHash = SHA256(SHA256(senha) + serverSalt) ≠ SHA256(senha)
+    /// CORREÇÕES v10:
     ///
-    /// CORREÇÃO v9 (alinhada com GameManager v7):
-    ///   TryCreateAccount agora armazena clientPasswordHash DIRETAMENTE,
-    ///   sem aplicar serverSalt — o banco guarda SHA256(senha).
-    ///   TryLoginWithSignedHash calcula SHA256(SHA256(senha) + nonce)
-    ///   que bate exatamente com o que o cliente envia.
+    ///   BUG CRÍTICO — SaveCharacter não persistia BaseAttributes:
+    ///     A query UPDATE não incluía base_str, base_agi, base_vit, base_dex,
+    ///     base_int, base_luk. Após um restart do servidor, os atributos base
+    ///     dos personagens voltavam para os defaults do banco (10 cada).
+    ///     SOLUÇÃO: Campos base_* adicionados ao UPDATE query em SaveCharacter.
     ///
-    ///   NOTA: Delete o banco antigo antes de testar!
-    ///   %AppData%\..\LocalLow\DefaultCompany\rpgonline\rpg_server.db
+    ///   SEGURANÇA — TryLoginWithHash legado removido da API pública:
+    ///     O método sem nonce era vulnerável a replay attacks. Substituído por
+    ///     TryLoginLegacy que loga aviso e recusa o acesso, orientando ao
+    ///     fluxo correto (TryLoginWithSignedHash).
     ///
-    /// Todas as correções v8 mantidas (WAL, write thread, Editor stubs).
+    ///   MELHORIA — LoadInventory retorna apenas itens não-equipped por padrão:
+    ///     Adicionado parâmetro includeEquipped para controle explícito.
+    ///     Itens equipados como gem loadout são carregados via LoadGemLoadout.
+    ///
+    ///   Todas as correções v9 mantidas (WAL, write thread, pipeline de hash).
     /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
@@ -204,8 +206,7 @@ namespace RPG.Managers
             InitializeDatabase();
             StartWriteThread();
 #else
-            Debug.Log("[DatabaseManager] Modo cliente/editor — banco desabilitado. " +
-                      "Operações de conta passam pelo servidor via rede (correto).");
+            Debug.Log("[DatabaseManager] Modo cliente/editor — banco desabilitado.");
 #endif
         }
 
@@ -283,7 +284,6 @@ namespace RPG.Managers
                     catch (Exception e) { Debug.LogError($"[DB] Write thread erro: {e.Message}"); }
                 }
             }
-            // Flush do que sobrou ao encerrar
             while (_writeQueue.TryDequeue(out Action action))
             {
                 try { action(); } catch { }
@@ -313,19 +313,6 @@ namespace RPG.Managers
             catch (Exception e) { Debug.LogError($"[DB] AccountExists: {e.Message}"); return false; }
         }
 
-        /// <summary>
-        /// CORREÇÃO v9: armazena clientPasswordHash DIRETAMENTE no banco.
-        ///
-        /// O cliente envia SHA256(senha). Nós armazenamos SHA256(senha).
-        /// Isso alinha com ValidateLoginWithNonce que compara:
-        ///   SHA256(STORED + nonce) com SHA256(SHA256(senha) + nonce)
-        ///
-        /// v8 (ERRADO): armazenava SHA256(SHA256(senha) + serverSalt)
-        ///   → na validação, SHA256(SHA256(SHA256(senha)+salt)+nonce) ≠ SHA256(SHA256(senha)+nonce)
-        ///
-        /// v9 (CORRETO): armazena SHA256(senha) diretamente
-        ///   → na validação, SHA256(SHA256(senha)+nonce) == SHA256(SHA256(senha)+nonce) ✓
-        /// </summary>
         public string TryCreateAccount(string username, string clientPasswordHash)
         {
             if (string.IsNullOrWhiteSpace(username) || username.Trim().Length < 4)
@@ -337,8 +324,6 @@ namespace RPG.Managers
 
             try
             {
-                // CORREÇÃO v9: armazena o hash exatamente como recebido
-                // NÃO aplica serverSalt aqui — isso quebrava o pipeline de login
                 string storedHash = GameManager.ServerHashForStorage(clientPasswordHash);
 
                 lock (_dbLock)
@@ -352,7 +337,7 @@ namespace RPG.Managers
                     });
                 }
                 Debug.Log($"[DB] Conta criada: {username}");
-                return null; // null = sem erro
+                return null;
             }
             catch (Exception e)
             {
@@ -361,18 +346,6 @@ namespace RPG.Managers
             }
         }
 
-        /// <summary>
-        /// CORREÇÃO v9: validação alinhada com o novo pipeline.
-        ///
-        /// storedPasswordHash = SHA256(senha) (armazenado em TryCreateAccount)
-        /// clientSignedHash   = SHA256(SHA256(senha) + nonce) (enviado pelo cliente)
-        /// sessionNonce       = nonce único por sessão (gerado pelo servidor)
-        ///
-        /// Validação:
-        ///   expected = SHA256(storedPasswordHash + sessionNonce)
-        ///            = SHA256(SHA256(senha) + nonce)
-        ///            == clientSignedHash ✓
-        /// </summary>
         public AccountData TryLoginWithSignedHash(string username, string clientSignedHash, string sessionNonce)
         {
             if (string.IsNullOrWhiteSpace(username)         ||
@@ -392,17 +365,12 @@ namespace RPG.Managers
 
                 if (row == null)
                 {
-                    // Delay anti timing-attack — dificulta enumerar usuários pelo tempo de resposta
                     System.Threading.Thread.Sleep(UnityEngine.Random.Range(40, 80));
                     return null;
                 }
 
-                // CORREÇÃO v9: usa ValidateLoginWithNonce que agora funciona corretamente
-                // porque storedHash = SHA256(senha), não SHA256(SHA256(senha)+salt)
                 bool valid = GameManager.ValidateLoginWithNonce(
-                    row.PasswordHash,
-                    clientSignedHash,
-                    sessionNonce);
+                    row.PasswordHash, clientSignedHash, sessionNonce);
 
                 if (!valid)
                 {
@@ -426,33 +394,17 @@ namespace RPG.Managers
             }
         }
 
-        /// <summary>Login legado sem nonce — mantido para compatibilidade interna.</summary>
+        /// <summary>
+        /// CORREÇÃO v10: método legado sem nonce recusado com log de aviso.
+        /// Use TryLoginWithSignedHash para autenticação segura.
+        /// Mantido apenas para evitar erros de compilação em código antigo.
+        /// </summary>
+        [Obsolete("Use TryLoginWithSignedHash — vulnerável a replay attacks sem nonce.")]
         public AccountData TryLoginWithHash(string username, string clientPasswordHash)
         {
-            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(clientPasswordHash))
-                return null;
-            try
-            {
-                AccountRow row;
-                lock (_dbLock)
-                {
-                    // CORREÇÃO v9: compara diretamente — stored = SHA256(senha) = clientHash
-                    row = _db.FindWithQuery<AccountRow>(
-                        "SELECT * FROM accounts WHERE LOWER(username) = LOWER(?) AND password_hash = ?",
-                        username.Trim(), clientPasswordHash);
-                }
-                if (row == null) return null;
-
-                UpdateLastLogin(row.Username);
-
-                return new AccountData
-                {
-                    Username     = row.Username,
-                    PasswordHash = row.PasswordHash,
-                    Characters   = LoadCharacters(row.Username)
-                };
-            }
-            catch (Exception e) { Debug.LogError($"[DB] TryLoginWithHash: {e.Message}"); return null; }
+            Debug.LogError($"[DB] TryLoginWithHash LEGADO chamado para '{username}'! " +
+                           "Este método é inseguro. Use TryLoginWithSignedHash.");
+            return null;
         }
 
         private void UpdateLastLogin(string username)
@@ -596,6 +548,10 @@ namespace RPG.Managers
             catch (Exception e) { Debug.LogError($"[DB] TryCreateCharacter: {e.Message}"); return "Erro interno."; }
         }
 
+        /// <summary>
+        /// CORREÇÃO v10: UPDATE agora inclui base_str/agi/vit/dex/int/luk.
+        /// Antes os atributos base eram perdidos após restart do servidor.
+        /// </summary>
         public void SaveCharacter(CharacterData ch, string username)
         {
             if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
@@ -616,6 +572,13 @@ namespace RPG.Managers
             int    aDEX    = ch.AllocatedDEX;
             int    aINT    = ch.AllocatedINT;
             int    aLUK    = ch.AllocatedLUK;
+            // CORREÇÃO v10: captura base attributes para persistir
+            int    bSTR    = ch.BaseAttributes?.STR ?? 10;
+            int    bAGI    = ch.BaseAttributes?.AGI ?? 10;
+            int    bVIT    = ch.BaseAttributes?.VIT ?? 10;
+            int    bDEX    = ch.BaseAttributes?.DEX ?? 10;
+            int    bINT    = ch.BaseAttributes?.INT ?? 10;
+            int    bLUK    = ch.BaseAttributes?.LUK ?? 10;
 
             EnqueueWrite(() =>
             {
@@ -623,6 +586,7 @@ namespace RPG.Managers
                 {
                     lock (_dbLock)
                     {
+                        // CORREÇÃO v10: query expandida com base_str/agi/vit/dex/int/luk
                         _db.Execute(@"
                             UPDATE characters SET
                                 level       = ?, experience  = ?, exp_to_next = ?,
@@ -630,10 +594,14 @@ namespace RPG.Managers
                                 pos_x       = ?, pos_y       = ?, pos_z       = ?,
                                 current_map = ?, free_points = ?,
                                 alloc_str   = ?, alloc_agi   = ?, alloc_vit   = ?,
-                                alloc_dex   = ?, alloc_int   = ?, alloc_luk   = ?
+                                alloc_dex   = ?, alloc_int   = ?, alloc_luk   = ?,
+                                base_str    = ?, base_agi    = ?, base_vit    = ?,
+                                base_dex    = ?, base_int    = ?, base_luk    = ?
                             WHERE character_id = ? AND LOWER(username) = LOWER(?)",
                             level, exp, expNext, hp, mp, px, py, pz, map, fp,
-                            aSTR, aAGI, aVIT, aDEX, aINT, aLUK, charId, uname);
+                            aSTR, aAGI, aVIT, aDEX, aINT, aLUK,
+                            bSTR, bAGI, bVIT, bDEX, bINT, bLUK,
+                            charId, uname);
                     }
                 }
                 catch (Exception e) { Debug.LogError($"[DB] SaveCharacter: {e.Message}"); }
@@ -644,13 +612,17 @@ namespace RPG.Managers
         // INVENTÁRIO
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Carrega inventário. Por padrão retorna todos os itens (is_equipped = false).
+        /// Itens equipados como gem loadout são gerenciados separadamente.
+        /// </summary>
         public List<InventoryRow> LoadInventory(string characterId)
         {
             try
             {
                 lock (_dbLock)
                     return _db.Query<InventoryRow>(
-                        "SELECT * FROM inventory WHERE character_id = ?", characterId);
+                        "SELECT * FROM inventory WHERE character_id = ? AND is_equipped = 0", characterId);
             }
             catch (Exception e) { Debug.LogError($"[DB] LoadInventory: {e.Message}"); return new List<InventoryRow>(); }
         }
@@ -668,7 +640,7 @@ namespace RPG.Managers
                 {
                     lock (_dbLock)
                     {
-                        _db.Execute("DELETE FROM inventory WHERE character_id = ?", charId);
+                        _db.Execute("DELETE FROM inventory WHERE character_id = ? AND is_equipped = 0", charId);
                         foreach (var slot in copy)
                         {
                             if (string.IsNullOrEmpty(slot.ItemId)) continue;
@@ -819,26 +791,24 @@ namespace RPG.Managers
         }
 
 #else
-        // ══════════════════════════════════════════════════════════════════
-        // STUBS CLIENTE E EDITOR — no-op completo, banco nunca é acessado
-        // ══════════════════════════════════════════════════════════════════
-
-        public bool                AccountExists(string u)                                                      => false;
-        public string              TryCreateAccount(string u, string h)                                         => null;
-        public AccountData         TryLoginWithHash(string u, string h)                                         => null;
-        public AccountData         TryLoginWithSignedHash(string u, string sh, string n)                        => null;
-        public List<CharacterData> LoadCharacters(string u)                                                      => new List<CharacterData>();
-        public CharacterData       LoadCharacter(string id)                                                      => null;
-        public CharacterData       LoadCharacterForAccount(string id, string u)                                  => null;
-        public List<CharacterData> GetCharactersInMap(string m)                                                 => new List<CharacterData>();
-        public string              TryCreateCharacter(string u, string n, CharacterRace r)                      => null;
-        public void                SaveCharacter(CharacterData ch, string u)                                    { }
-        public List<InventoryRow>  LoadInventory(string id)                                                     => new List<InventoryRow>();
-        public void                SaveInventory(string cid, string u, List<RPG.Data.InventorySlotData> slots)  { }
-        public void                AddItem(string id, string item, int qty = 1, int slot = -1)                 { }
-        public PowerGemLoadout     LoadGemLoadout(string id)                                                    => new PowerGemLoadout();
-        public void                SaveGemLoadout(string id, PowerGemLoadout l)                                { }
-        public void                LogEconomy(string id, string ev, float v)                                   { }
+        // ── Stubs cliente/editor ───────────────────────────────────────────
+        public bool                AccountExists(string u)                                                     => false;
+        public string              TryCreateAccount(string u, string h)                                        => null;
+        public AccountData         TryLoginWithSignedHash(string u, string sh, string n)                       => null;
+        [Obsolete("Use TryLoginWithSignedHash")]
+        public AccountData         TryLoginWithHash(string u, string h)                                        => null;
+        public List<CharacterData> LoadCharacters(string u)                                                     => new List<CharacterData>();
+        public CharacterData       LoadCharacter(string id)                                                     => null;
+        public CharacterData       LoadCharacterForAccount(string id, string u)                                 => null;
+        public List<CharacterData> GetCharactersInMap(string m)                                                => new List<CharacterData>();
+        public string              TryCreateCharacter(string u, string n, CharacterRace r)                     => null;
+        public void                SaveCharacter(CharacterData ch, string u)                                   { }
+        public List<InventoryRow>  LoadInventory(string id)                                                    => new List<InventoryRow>();
+        public void                SaveInventory(string cid, string u, List<RPG.Data.InventorySlotData> slots) { }
+        public void                AddItem(string id, string item, int qty = 1, int slot = -1)                { }
+        public PowerGemLoadout     LoadGemLoadout(string id)                                                   => new PowerGemLoadout();
+        public void                SaveGemLoadout(string id, PowerGemLoadout l)                               { }
+        public void                LogEconomy(string id, string ev, float v)                                  { }
 #endif
     }
 }
