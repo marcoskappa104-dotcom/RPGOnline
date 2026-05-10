@@ -8,42 +8,44 @@ using RPG.Combat;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayerController v12
+    /// NetworkPlayerController v13
     ///
-    /// CORREÇÕES v12 (vs v11):
+    /// CORREÇÕES v13:
     ///
-    ///   1. CmdMoveTo: validação de distância máxima aumentada de 80 para 120
-    ///      para cobrir mapas maiores sem rejeitar movimentos legítimos.
-    ///      O warning de segurança é mantido mas logado com menos frequência
-    ///      (throttle de 2s para evitar flood de logs).
+    ///   BUG — HandleSkillInput ativava skills ao digitar em campos de texto:
+    ///     Input.GetKeyDown(KeyCode.W) disparava skill enquanto o jogador
+    ///     digitava o nome do personagem ou em qualquer TMP_InputField,
+    ///     porque não havia verificação de foco de UI.
+    ///     SOLUÇÃO: guard IsTypingInField() verifica EventSystem.currentSelectedGameObject
+    ///     e se é TMP_InputField antes de processar qualquer atalho de teclado.
     ///
-    ///   2. TryMoveToGround: ao clicar no chão, cancela auto-ataque E walk pendente
-    ///      antes de aplicar o novo destino — evita conflito entre sistemas.
+    ///   BUG — CmdMoveTo chamava RpcMoveConfirmed causando double SetDestination:
+    ///     O cliente chamava _agent.SetDestination localmente em TryMoveToGround,
+    ///     e o servidor confirmava via RpcMoveConfirmed que chamava SetDestination
+    ///     novamente no mesmo cliente — resultando em micro-jitter e possível
+    ///     conflito com o destino atual.
+    ///     SOLUÇÃO: RpcMoveConfirmed removido de CmdMoveTo. O servidor aplica
+    ///     o movimento autoritativo localmente; o cliente já aplica localmente
+    ///     sem precisar de confirmação (prediction local).
     ///
-    ///   3. HandleMouseInput: a ordem de raycast agora verifica terreno PRIMEIRO
-    ///      quando nenhum alvo é clicado, evitando que o click-move falhe em
-    ///      terrenos com colliders sobrepostos a objetos targetable distantes.
+    ///   BUG — Câmera podia passar por geometria com zoom máximo:
+    ///     UpdateCameraPosition não fazia raycast contra o terreno para detectar
+    ///     oclusão. Adicionado CameraOcclusionCheck que empurra a câmera para
+    ///     frente quando há geometria entre o pivot e a posição calculada.
     ///
-    ///   4. UpdateCameraPosition: adicionado clamp de distância mínima ao terreno
-    ///      (câmera não vai abaixo do chão mesmo com zoom máximo).
+    ///   MELHORIA — SetEnabled(false) agora reseta orbiting e cursor imediatamente.
     ///
-    ///   5. SetEnabled(false): garante cancelamento de auto-ataque e walk pendente
-    ///      quando o controlador é desativado (morte do player, menus, etc.).
-    ///
-    ///   6. MELHORIA: duplo clique em monstro cancela walk pendente de skill antes
-    ///      de registrar o clique no BasicAttackSystem — evita que as duas ações
-    ///      coexistam causando comportamento errático.
+    ///   Todas as correções v12 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class NetworkPlayerController : NetworkBehaviour
     {
         [Header("Layers — configure no Inspector")]
-        [Tooltip("Layer do terreno/chão.")]
         [SerializeField] private LayerMask terrainLayer;
-        [Tooltip("Layer de entidades selecionáveis (monstros, NPCs, players).")]
         [SerializeField] private LayerMask targetableLayer;
-        [Tooltip("Layer dos itens no chão (WorldItem).")]
         [SerializeField] private LayerMask itemLayer;
+        [Tooltip("Layers que bloqueiam a câmera (terreno + paredes). Normalmente = terrainLayer.")]
+        [SerializeField] private LayerMask cameraOcclusionLayer;
 
         [Header("Câmera")]
         [SerializeField] private float orbitSensitivity = 3f;
@@ -75,10 +77,9 @@ namespace RPG.Network
         private const float PITCH_MAX      = 80f;
         private const float DIST_MIN       = 3f;
         private const float DIST_MAX       = 30f;
-        // CORREÇÃO v12: aumentado de 80 para 120
         private const float MAX_MOVE_DIST  = 120f;
+        private const float CAM_SKIN_WIDTH = 0.3f;
 
-        // Throttle do warning de segurança
         private float _lastSecurityWarnTime = -999f;
         private const float SECURITY_WARN_INTERVAL = 2f;
 
@@ -160,10 +161,9 @@ namespace RPG.Network
 
             Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-            // Ordem de prioridade: item > monstro/entidade > terreno
-            if (TryPickupItem(ray))        return;
+            if (TryPickupItem(ray))         return;
             if (TryHandleMonsterClick(ray)) return;
-            if (TrySelectTargetable(ray))  return;
+            if (TrySelectTargetable(ray))   return;
             TryMoveToGround(ray);
         }
 
@@ -182,12 +182,9 @@ namespace RPG.Network
             if (targetChanged && _basicAttack != null && _basicAttack.IsAutoAttacking)
                 _basicAttack.CancelAutoAttack();
 
-            // CORREÇÃO v12: cancela walk pendente antes de registrar duplo clique
-            // Evita coexistência de walk de skill + auto-ataque
             _skillSystem?.CancelPendingWalk();
             _playerEntity?.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
-
             _basicAttack?.TryRegisterClick(monster);
 
             return true;
@@ -229,7 +226,6 @@ namespace RPG.Network
 
             if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return;
 
-            // CORREÇÃO v12: cancela ambos os sistemas antes de mover
             _skillSystem?.CancelPendingWalk();
             _basicAttack?.CancelAutoAttack();
             _playerEntity?.ClearTarget();
@@ -239,6 +235,7 @@ namespace RPG.Network
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
 
+            // Aplica localmente (prediction) — CmdMoveTo sincroniza com o servidor
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.SetDestination(dest);
 
@@ -248,10 +245,17 @@ namespace RPG.Network
 
         // ── Skills ─────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO v13: verifica se o jogador está digitando em algum campo de input
+        /// antes de processar atalhos de teclado. Previne skill ao digitar no chat, etc.
+        /// </summary>
         private void HandleSkillInput()
         {
             if (_skillSystem == null) return;
             if (_playerEntity != null && _playerEntity.IsDead) return;
+
+            // Não processa atalhos se estiver digitando em qualquer campo de texto
+            if (IsTypingInField()) return;
 
             if (Input.GetKeyDown(KeyCode.Q)) _skillSystem.TryUseSkill(0);
             if (Input.GetKeyDown(KeyCode.W)) _skillSystem.TryUseSkill(1);
@@ -260,8 +264,22 @@ namespace RPG.Network
             if (Input.GetKeyDown(KeyCode.C)) AttributeWindowUI.Instance?.Toggle();
         }
 
+        /// <summary>
+        /// Retorna true se o foco atual é um campo de texto (TMP_InputField ou InputField).
+        /// Impede que atalhos de gameplay se ativem enquanto o jogador digita.
+        /// </summary>
+        private static bool IsTypingInField()
+        {
+            var selected = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
+            if (selected == null) return false;
+            return selected.GetComponent<TMPro.TMP_InputField>() != null
+                || selected.GetComponent<UnityEngine.UI.InputField>() != null;
+        }
+
         private void HandleUIInput()
         {
+            if (IsTypingInField()) return;
+
             if (Input.GetKeyDown(KeyCode.I))
             {
                 EnsureCursorVisible();
@@ -314,15 +332,31 @@ namespace RPG.Network
             _distance  = Mathf.Clamp(_distance, DIST_MIN, DIST_MAX);
         }
 
+        /// <summary>
+        /// Posiciona a câmera com anti-oclusão: se houver geometria entre o pivot
+        /// e a posição calculada, empurra a câmera para frente (reduz distância).
+        /// </summary>
         private void UpdateCameraPosition()
         {
             if (_cam == null) return;
-            Quaternion rot    = Quaternion.Euler(_pitch, _yaw, 0f);
-            Vector3    offset = rot * new Vector3(0f, 0f, -_distance);
-            Vector3    pivot  = transform.position + Vector3.up * cameraHeight;
-            Vector3    target = pivot + offset;
 
-            // CORREÇÃO v12: evita câmera abaixo do terreno
+            Quaternion rot   = Quaternion.Euler(_pitch, _yaw, 0f);
+            Vector3    pivot = transform.position + Vector3.up * cameraHeight;
+            Vector3    dir   = rot * new Vector3(0f, 0f, -1f);
+
+            // Anti-oclusão: verifica se há obstáculo entre o pivot e a câmera
+            float effectiveDistance = _distance;
+            int   occlusionMask = cameraOcclusionLayer != 0 ? (int)cameraOcclusionLayer : (int)terrainLayer;
+            if (occlusionMask != 0 &&
+                Physics.SphereCast(pivot, CAM_SKIN_WIDTH, dir, out RaycastHit camHit,
+                                   _distance, occlusionMask))
+            {
+                effectiveDistance = Mathf.Max(DIST_MIN, camHit.distance - CAM_SKIN_WIDTH);
+            }
+
+            Vector3 target = pivot + dir * effectiveDistance;
+
+            // Clamp mínimo acima do chão
             if (target.y < transform.position.y + 0.5f)
                 target.y = transform.position.y + 0.5f;
 
@@ -333,6 +367,13 @@ namespace RPG.Network
 
         // ── Commands ───────────────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO v13: RpcMoveConfirmed REMOVIDO.
+        /// O cliente já aplicou SetDestination localmente (prediction).
+        /// O servidor apenas valida e aplica no objeto autoritativo.
+        /// Enviar RpcMoveConfirmed causava double SetDestination no cliente,
+        /// resultando em micro-jitter e conflito com destinos locais recentes.
+        /// </summary>
         [Command]
         public void CmdMoveTo(Vector3 destination)
         {
@@ -343,7 +384,6 @@ namespace RPG.Network
             float dist = Vector3.Distance(transform.position, destination);
             if (dist > MAX_MOVE_DIST)
             {
-                // CORREÇÃO v12: throttle do warning para não flodar logs
                 if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
                 {
                     _lastSecurityWarnTime = Time.time;
@@ -355,27 +395,18 @@ namespace RPG.Network
             if (_agent == null) return;
 
             Vector3 finalDest = destination;
-            bool snapped = NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas) ||
-                           NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas);
-
-            if (snapped)
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas) ||
+                NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas))
             {
                 finalDest = hit.position;
             }
             else if (debugMovement)
             {
-                Debug.LogWarning($"[Server] CmdMoveTo: destino {destination} fora do NavMesh para {netPlayer.CharacterName}");
+                Debug.LogWarning($"[Server] CmdMoveTo: destino fora do NavMesh para {netPlayer.CharacterName}");
             }
 
+            // Aplica apenas no servidor (sem RpcMoveConfirmed)
             _agent.SetDestination(finalDest);
-            RpcMoveConfirmed(finalDest);
-        }
-
-        [TargetRpc]
-        private void RpcMoveConfirmed(Vector3 destination)
-        {
-            if (_agent != null && _agent.isOnNavMesh)
-                _agent.SetDestination(destination);
         }
 
         // ── API pública ────────────────────────────────────────────────────
@@ -385,7 +416,6 @@ namespace RPG.Network
             enabled = value;
             if (!value)
             {
-                // CORREÇÃO v12: cancela todos os sistemas de movimento ao desativar
                 _basicAttack?.CancelAutoAttack();
                 _skillSystem?.CancelPendingWalk();
 
