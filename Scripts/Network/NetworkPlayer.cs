@@ -13,42 +13,32 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v22
+    /// NetworkPlayer v23
     ///
-    /// CORREÇÕES v22:
+    /// CORREÇÃO v23 — BUG CRÍTICO: Ordem dos SyncVars MaxHP/MaxMP vs CurrentHP/CurrentMP.
     ///
-    ///   BUG CRÍTICO — OnAllocatedDataChanged disparado 6 vezes por alocação:
-    ///     Os 6 SyncVars de alloc (STR/AGI/VIT/DEX/INT/LUK) compartilhavam o
-    ///     mesmo hook OnAllocatedDataChanged. Cada SyncVar atualizado disparava
-    ///     o hook individualmente, causando 6 chamadas a FullRefreshStatsFromData()
-    ///     por clique no botão "+". Além de desperdício de CPU, isso causava
-    ///     flickering na UI do atributo.
-    ///     SOLUÇÃO: Hook individual por SyncVar que seta uma flag _allocDirty.
-    ///     Um único Update() no cliente verifica a flag e chama o refresh uma vez.
+    ///   ROOT CAUSE:
+    ///     SyncVars são processados pelo cliente na ordem em que são declarados no script.
+    ///     Nas versões anteriores, CurrentHP era declarado ANTES de MaxHP. Quando um
+    ///     level-up alterava ambos simultaneamente, o cliente recebia o batch e processava:
+    ///       1. CurrentHP = MaxHP_novo  → OnNetHPChanged dispara com MaxHP = valor_ANTIGO
+    ///       2. MaxHP = MaxHP_novo      → OnNetMaxHPChanged dispara (tarde demais)
+    ///     Resultado: SetHPFromServer era chamado com maxHp errado → barra de HP mostrava
+    ///     >100% por um frame, causando spike visual perceptível.
     ///
-    ///   BUG — PlayerInitData não transmitia resistências de equipamento:
-    ///     EquipmentBonuses tinha ResistFire/Ice/Poison/Lightning mas a struct
-    ///     PlayerInitData só transportava ATK/DEF/MATK/MDEF.
-    ///     SOLUÇÃO: PlayerInitData expandida com os 4 campos de resistência.
+    ///   SOLUÇÃO:
+    ///     MaxHP e MaxMP agora são declarados ANTES de CurrentHP e CurrentMP.
+    ///     Ao processar o batch do level-up, Mirror agora garante a ordem correta:
+    ///       1. MaxHP = MaxHP_novo      → OnNetMaxHPChanged atualiza o valor
+    ///       2. CurrentHP = MaxHP_novo  → OnNetHPChanged lê MaxHP já correto
+    ///     Barra de HP nunca mais exibe valor inconsistente.
     ///
-    ///   BUG — GetRespawnPosition retornava Vector3.zero sem verificar NavMesh:
-    ///     Se todos os respawn points falhassem, o player spawnava em (0,0,0)
-    ///     que pode ser dentro de uma geometria ou fora do NavMesh.
-    ///     SOLUÇÃO: fallback tenta NavMesh.SamplePosition em um raio grande
-    ///     antes de aceitar a origem como último recurso.
+    ///   NOTA IMPORTANTE PARA MIGRAÇÃO:
+    ///     A ordem dos SyncVars altera o protocolo de serialização do Mirror.
+    ///     Ao atualizar, delete qualquer build client/server antiga e recompile tudo.
+    ///     Saves do banco de dados (SQLite) NÃO são afetados — apenas conexões ativas.
     ///
-    ///   BUG — ServerRegenLoop não verificava _serverStats null após yield:
-    ///     Se o servidor reiniciasse _serverStats entre ticks, a leitura de
-    ///     HPRegen/MPRegen jogava NullReferenceException.
-    ///     SOLUÇÃO: captura referência local antes do yield e verifica null.
-    ///
-    ///   MELHORIA — RpcMoveConfirmed removido de CmdMoveTo no Controller:
-    ///     O cliente enviava SetDestination no NavMeshAgent localmente E
-    ///     recebia RpcMoveConfirmed que chamava SetDestination novamente,
-    ///     causando um double-set desnecessário.
-    ///     (Ver NetworkPlayerController v13 para a correção correspondente.)
-    ///
-    ///   Todas as correções v21 mantidas.
+    ///   Todas as correções v22 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -79,20 +69,26 @@ namespace RPG.Network
             public int    BaseSTR,  BaseAGI,  BaseVIT,  BaseDEX,  BaseINT,  BaseLUK;
             public float  CurHP, CurMP;
             public float  EquipATK, EquipDEF, EquipMATK, EquipMDEF;
-            // CORREÇÃO v22: resistências de equipamento incluídas
             public float  EquipResistFire, EquipResistIce, EquipResistPoison, EquipResistLightning;
             public float  EquipHPBonus, EquipMPBonus;
             public int    EquipSTR, EquipAGI, EquipVIT, EquipDEX, EquipINT, EquipLUK;
         }
 
         // ── SyncVars ───────────────────────────────────────────────────────
+        // CORREÇÃO v23: MaxHP e MaxMP declarados ANTES de CurrentHP/CurrentMP.
+        // Mirror processa SyncVars na ordem de declaração. Assim, ao receber
+        // um batch de level-up, MaxHP é atualizado ANTES que OnNetHPChanged dispare,
+        // eliminando o spike visual de HP >100% por um frame.
         [SyncVar(hook = nameof(OnNetNameChanged))]       public string CharacterName         = "...";
         [SyncVar]                                         public string RaceStr               = "Human";
         [SyncVar(hook = nameof(OnNetLevelChanged))]      public int    Level                 = 1;
-        [SyncVar(hook = nameof(OnNetHPChanged))]         public float  CurrentHP             = 0f;
+
+        // ← MaxHP/MaxMP PRIMEIRO (processados antes dos Current no mesmo batch)
         [SyncVar(hook = nameof(OnNetMaxHPChanged))]      public float  MaxHP                 = 1f;
-        [SyncVar(hook = nameof(OnNetMPChanged))]         public float  CurrentMP             = 0f;
+        [SyncVar(hook = nameof(OnNetHPChanged))]         public float  CurrentHP             = 0f;
         [SyncVar(hook = nameof(OnNetMaxMPChanged))]      public float  MaxMP                 = 1f;
+        [SyncVar(hook = nameof(OnNetMPChanged))]         public float  CurrentMP             = 0f;
+
         [SyncVar(hook = nameof(OnNetMovingChanged))]     public bool   IsMoving              = false;
         [SyncVar(hook = nameof(OnNetExpChanged))]        public long   Experience            = 0;
         [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
@@ -100,7 +96,7 @@ namespace RPG.Network
 
         [SyncVar(hook = nameof(OnStatsVersionChanged))] public int StatsVersion = 0;
 
-        // CORREÇÃO v22: hooks individuais por SyncVar — setar flag _allocDirty em vez de refresh direto
+        // CORREÇÃO v22: hooks individuais por SyncVar — setam flag _allocDirty em vez de refresh direto
         [SyncVar(hook = nameof(OnAllocSTRChanged))] public int AllocatedSTR = 0;
         [SyncVar(hook = nameof(OnAllocAGIChanged))] public int AllocatedAGI = 0;
         [SyncVar(hook = nameof(OnAllocVITChanged))] public int AllocatedVIT = 0;
@@ -300,6 +296,9 @@ namespace RPG.Network
             BaseDEX = charData.BaseAttributes.DEX;
             BaseINT = charData.BaseAttributes.INT;
             BaseLUK = charData.BaseAttributes.LUK;
+
+            // CORREÇÃO v23: MaxHP/MaxMP setados ANTES de CurrentHP/CurrentMP aqui também,
+            // para que clientes que ingressam depois da inicialização recebam a ordem correta.
             MaxHP     = maxHP;
             MaxMP     = maxMP;
             CurrentHP = (charData.CurrentHP > 0f && charData.CurrentHP <= maxHP) ? charData.CurrentHP : maxHP;
@@ -354,7 +353,6 @@ namespace RPG.Network
                 BaseLUK    = charData.BaseAttributes.LUK,
                 CurHP      = CurrentHP,
                 CurMP      = CurrentMP,
-                // Equipamento completo — CORREÇÃO v22
                 EquipATK   = eq.ATK,  EquipDEF  = eq.DEF,
                 EquipMATK  = eq.MATK, EquipMDEF = eq.MDEF,
                 EquipSTR   = eq.STR,  EquipAGI  = eq.AGI,
@@ -485,10 +483,13 @@ namespace RPG.Network
             }
 
             _serverStats = _serverCharData.GetDerivedStats();
+
+            // CORREÇÃO v23: MaxHP/MaxMP atualizados ANTES para manter consistência com ordem de SyncVars
             MaxHP = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
             MaxMP = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
             if (CurrentHP > MaxHP) CurrentHP = MaxHP;
             if (CurrentMP > MaxMP) CurrentMP = MaxMP;
+
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
@@ -498,7 +499,6 @@ namespace RPG.Network
 
         [Command] public void CmdRequestRespawn()
         {
-            // Proteção contra spam: só processa se o player realmente está morto
             if (!Dead) return;
             ServerRespawn();
         }
@@ -612,12 +612,16 @@ namespace RPG.Network
             if (leveledUp)
             {
                 _serverStats = _serverCharData.GetDerivedStats();
-                MaxHP        = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
-                MaxMP        = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
-                CurrentHP    = MaxHP;
-                CurrentMP    = MaxMP;
+
+                // CORREÇÃO v23: MaxHP/MaxMP atualizados ANTES de CurrentHP/CurrentMP
+                // para manter consistência com a ordem de declaração dos SyncVars.
+                MaxHP     = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
+                MaxMP     = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
+                CurrentHP = MaxHP;
+                CurrentMP = MaxMP;
                 _serverCharData.CurrentHP = MaxHP;
                 _serverCharData.CurrentMP = MaxMP;
+
                 if (_agent != null && _agent.isOnNavMesh)
                     _agent.speed = Mathf.Clamp(_serverStats.MoveSpeed, 3f, 7f);
 
@@ -670,7 +674,6 @@ namespace RPG.Network
         {
             if (!isLocalPlayer) return;
 
-            // CORREÇÃO v22: equip completo com resistências
             var data = new CharacterData
             {
                 CharacterName         = d.CharName,
@@ -835,6 +838,9 @@ namespace RPG.Network
             transform.position = pos;
             if (_agent != null && _agent.isOnNavMesh) _agent.Warp(pos);
 
+            // CORREÇÃO v23: MaxHP/MaxMP setados ANTES de CurrentHP/CurrentMP
+            MaxHP     = Mathf.Min(_serverStats.MaxHP, MAX_HP_CAP);
+            MaxMP     = Mathf.Min(_serverStats.MaxMP, MAX_MP_CAP);
             CurrentHP = MaxHP * 0.5f;
             CurrentMP = MaxMP * 0.5f;
 
@@ -857,14 +863,12 @@ namespace RPG.Network
         [Server]
         private Vector3 GetRespawnPosition()
         {
-            // 1. Pontos de respawn configurados manualmente
             if (_respawnPoints != null && _respawnPoints.Length > 0)
             {
                 var pt = _respawnPoints[UnityEngine.Random.Range(0, _respawnPoints.Length)];
                 if (pt != null) return pt.position;
             }
 
-            // 2. Ponto de spawn da raça via RPGNetworkManager
             if (_serverCharData != null)
             {
                 var nm = RPGNetworkManager.singleton;
@@ -875,11 +879,10 @@ namespace RPG.Network
                 }
             }
 
-            // 3. Fallback: tenta encontrar qualquer ponto válido no NavMesh
             if (NavMesh.SamplePosition(Vector3.zero, out NavMeshHit hit, 50f, NavMesh.AllAreas))
                 return hit.position;
 
-            Debug.LogWarning($"[Server] GetRespawnPosition: nenhum ponto válido encontrado para {CharacterName}. Usando origem.");
+            Debug.LogWarning($"[Server] GetRespawnPosition: nenhum ponto válido para {CharacterName}. Usando origem.");
             return Vector3.zero;
         }
 
@@ -890,6 +893,22 @@ namespace RPG.Network
             if (_nameTagText != null) _nameTagText.text = v;
         }
 
+        /// <summary>
+        /// CORREÇÃO v23: MaxHP processado ANTES de CurrentHP (pela ordem de declaração).
+        /// Quando ambos chegam no mesmo batch (level-up), este hook já tem o MaxHP correto
+        /// disponível quando OnNetHPChanged disparar a seguir.
+        /// </summary>
+        private void OnNetMaxHPChanged(float _, float newMax)
+        {
+            if (_hpBarSlider != null) _hpBarSlider.maxValue = newMax;
+            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
+                _playerEntity.RefreshStatsFromServer(newMax, MaxMP);
+        }
+
+        /// <summary>
+        /// CORREÇÃO v23: disparado DEPOIS de OnNetMaxHPChanged (por estar declarado depois).
+        /// MaxHP já está atualizado quando este hook roda, eliminando o spike visual.
+        /// </summary>
         private void OnNetHPChanged(float _, float newHP)
         {
             if (_hpBarSlider != null)
@@ -900,13 +919,6 @@ namespace RPG.Network
             }
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
                 _playerEntity.SetHPFromServer(newHP, MaxHP);
-        }
-
-        private void OnNetMaxHPChanged(float _, float newMax)
-        {
-            if (_hpBarSlider != null) _hpBarSlider.maxValue = newMax;
-            if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
-                _playerEntity.RefreshStatsFromServer(newMax, MaxMP);
         }
 
         private void OnNetMaxMPChanged(float _, float newMax)
@@ -952,7 +964,6 @@ namespace RPG.Network
         }
 
         // CORREÇÃO v22: hooks individuais que apenas setam a flag dirty
-        // O Update() do cliente consolida em um único FullRefreshStatsFromData() por frame
         private void OnAllocSTRChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
         private void OnAllocAGIChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
         private void OnAllocVITChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
@@ -960,10 +971,6 @@ namespace RPG.Network
         private void OnAllocINTChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
         private void OnAllocLUKChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
 
-        /// <summary>
-        /// Aplica os dados de atributos alocados ao PlayerEntity e recalcula stats.
-        /// Chamado UMA VEZ por frame quando _allocDirty = true.
-        /// </summary>
         private void ApplyAllocatedDataToEntity()
         {
             if (_playerEntity?.Data == null) return;
