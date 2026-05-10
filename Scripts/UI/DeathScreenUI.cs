@@ -1,9 +1,22 @@
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
+using System.Collections;
 
 namespace RPG.UI
 {
+    /// <summary>
+    /// DeathScreenUI v2
+    ///
+    /// CORREÇÕES v2:
+    ///
+    ///   BUG-18 — ReenableButton usava Invoke com string (memory leak se destruído):
+    ///     `Invoke(nameof(ReenableButton), 1f)` lança MissingReferenceException se
+    ///     o objeto for destruído antes do 1s passar.
+    ///     SOLUÇÃO: substituído por Coroutine com verificação `if (this == null)`.
+    ///
+    ///   Todas as correções v1 mantidas (fade, cursor, servidor).
+    /// </summary>
     public class DeathScreenUI : MonoBehaviour
     {
         public static DeathScreenUI Instance { get; private set; }
@@ -33,6 +46,7 @@ namespace RPG.UI
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
             Instance = this;
 
+            // BUG-17: servidor dedicado não tem UI
             if (Application.isBatchMode) { enabled = false; return; }
 
             if (deathScreenPanel == null)
@@ -101,7 +115,6 @@ namespace RPG.UI
             _fadeTimer = 0f;
             _fadingIn  = true;
 
-            // CORREÇÃO: cursor visível para o jogador poder clicar em REVIVER
             Cursor.visible   = true;
             Cursor.lockState = CursorLockMode.None;
 
@@ -128,11 +141,22 @@ namespace RPG.UI
             if (_localPlayer == null) return;
             if (reviveButton != null) reviveButton.interactable = false;
             _localPlayer.CmdRequestRespawn();
-            Invoke(nameof(ReenableButton), 1f);
+
+            // BUG-18: Coroutine com null-check em vez de Invoke(string)
+            StartCoroutine(ReenableButtonCoroutine());
         }
 
-        private void ReenableButton()
+        /// <summary>
+        /// BUG-18 CORRIGIDO: Coroutine com verificação de null-safety.
+        /// Invoke(string, float) lança MissingReferenceException se o objeto
+        /// for destruído antes do tempo acabar.
+        /// </summary>
+        private IEnumerator ReenableButtonCoroutine()
         {
+            yield return new WaitForSecondsRealtime(1f);
+
+            // Verifica se o objeto ainda existe antes de acessar membros
+            if (this == null) yield break;
             if (reviveButton != null) reviveButton.interactable = true;
         }
     }

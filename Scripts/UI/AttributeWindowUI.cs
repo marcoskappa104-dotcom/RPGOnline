@@ -9,45 +9,14 @@ using NetworkPlayer = RPG.Network.NetworkPlayer;
 namespace RPG.UI
 {
     /// <summary>
-    /// AttributeWindowUI v5
+    /// AttributeWindowUI v6
     ///
-    /// CORREÇÃO v5 — Botões de atributo sumiam por tempo longo ao alocar pontos:
+    /// CORREÇÃO v6:
+    ///   Debug.Log de binding exibia string vazia porque usava player.Data?.CharacterName
+    ///   antes do personagem ser inicializado. Agora usa CharacterName do NetworkPlayer
+    ///   como fallback, e se nenhum nome estiver disponível, usa o nome do GameObject.
     ///
-    ///   CAUSA RAIZ (duas falhas combinadas):
-    ///
-    ///   1. SetActive(false) vs interactable = false:
-    ///      RefreshPlusButtons() chamava SetActive(can) nos GameObjects dos botões.
-    ///      Quando can=false (durante a alocação), os botões DESAPARECIAM visualmente.
-    ///      O correto é manter os botões VISÍVEIS mas não interagíveis durante a
-    ///      espera — apenas o interactable deve mudar, não a visibilidade.
-    ///
-    ///   2. Invoke de 0.6s + re-enable via FinishAllocating():
-    ///      A janela aguardava 0.6s fixos antes de re-habilitar os botões.
-    ///      Em conexões rápidas isso era muito lento; em conexões lentas era pouco.
-    ///      O mecanismo correto é aguardar o hook do servidor (OnFreePointsUpdated)
-    ///      que já é chamado quando o SyncVar FreeAttributePoints chega ao cliente.
-    ///
-    ///   SOLUÇÃO APLICADA:
-    ///
-    ///   a) RefreshPlusButtons() NUNCA chama SetActive() — apenas interactable.
-    ///      Os botões ficam sempre visíveis (presença constante na UI).
-    ///      Se não há pontos disponíveis, ficam visíveis porém cinzas/desabilitados.
-    ///
-    ///   b) FinishAllocating() é chamado por OnFreePointsUpdated() — o hook do
-    ///      servidor — em vez de um Invoke com delay fixo. Isso sincroniza
-    ///      a re-habilitação exatamente quando o servidor confirma a alocação,
-    ///      independente da latência.
-    ///
-    ///   c) Mantido um fallback de 1.5s (Invoke) para casos de alta latência ou
-    ///      perda de pacote, evitando que os botões fiquem presos desabilitados
-    ///      se o SyncVar demorar demais ou nunca chegar.
-    ///
-    ///   d) Adicionado feedback visual imediato: ao clicar no botão "+", o valor
-    ///      do atributo exibe um "..." indicando que a confirmação está chegando,
-    ///      substituído pelo valor real quando o servidor confirma.
-    ///
-    ///   Todas as correções v4 mantidas (RefreshAll em OnFreePointsUpdated,
-    ///   leitura de SyncVars, RecalculateStats, etc).
+    ///   Todas as correções v5 mantidas.
     /// </summary>
     public class AttributeWindowUI : MonoBehaviour
     {
@@ -109,7 +78,6 @@ namespace RPG.UI
         private bool          _isOpen;
         private bool          _allocating;
 
-        // Índice do atributo em alocação (para feedback visual imediato)
         private int _pendingAllocIndex = -1;
 
         private void Awake()
@@ -142,7 +110,6 @@ namespace RPG.UI
             bool samePlayer  = (_player == player && _netPlayer == newNetPlayer);
             if (samePlayer) return;
 
-            // Desvincula eventos anteriores
             if (_player != null)
             {
                 _player.OnStatsChanged -= OnDataChanged;
@@ -160,7 +127,16 @@ namespace RPG.UI
             _player.OnMPChanged    += OnHPMPChanged;
 
             if (player.IsInitialized) RefreshAll();
-            Debug.Log($"[AttributeWindowUI] Vinculado a {player.Data?.CharacterName}");
+
+            // CORREÇÃO v6: log de binding com nome correto do personagem
+            // Prioridade: Data.CharacterName > NetPlayer.CharacterName > GameObject.name
+            string charName = player.Data?.CharacterName;
+            if (string.IsNullOrEmpty(charName))
+                charName = newNetPlayer?.CharacterName;
+            if (string.IsNullOrEmpty(charName))
+                charName = player.gameObject.name;
+
+            Debug.Log($"[AttributeWindowUI] Vinculado a {charName}");
         }
 
         // ── Callbacks de eventos ───────────────────────────────────────────
@@ -176,29 +152,12 @@ namespace RPG.UI
             RefreshHPMP();
         }
 
-        /// <summary>
-        /// CORREÇÃO v5 — Chamado quando o servidor confirma a alocação via SyncVar.
-        ///
-        /// Este é o ponto central de atualização pós-alocação:
-        ///   1. Cancela o timeout de fallback (Invoke) pois a confirmação chegou.
-        ///   2. Chama FinishAllocating() para re-habilitar os botões IMEDIATAMENTE.
-        ///   3. Atualiza o banner de pontos e o RefreshAll para exibir novos valores.
-        ///
-        /// Resultado: botões ficam desabilitados apenas pelo tempo real de latência
-        /// até o servidor confirmar, não mais por 0.6s fixo.
-        /// </summary>
         public void OnFreePointsUpdated(int newPoints)
         {
-            // Cancela o fallback timeout — servidor confirmou
             CancelInvoke(nameof(FinishAllocatingTimeout));
-
-            // Re-habilita botões e limpa estado de alocação
             FinishAllocating();
-
             RefreshFreePointsBanner(newPoints);
             RefreshPlusButtons(newPoints);
-
-            // Atualiza todos os valores (atributos, status derivados, etc.)
             if (_isOpen) RefreshAll();
         }
 
@@ -339,7 +298,6 @@ namespace RPG.UI
             int bonusINT = bonus.INT + allocINT;
             int bonusLUK = bonus.LUK + allocLUK;
 
-            // CORREÇÃO v5: se há uma alocação pendente, mostra preview "+1" no atributo correspondente
             SetAttrText(strValueText, totalSTR, bonusSTR, _allocating && _pendingAllocIndex == 0);
             SetAttrText(agiValueText, totalAGI, bonusAGI, _allocating && _pendingAllocIndex == 1);
             SetAttrText(vitValueText, totalVIT, bonusVIT, _allocating && _pendingAllocIndex == 2);
@@ -348,17 +306,12 @@ namespace RPG.UI
             SetAttrText(lukValueText, totalLUK, bonusLUK, _allocating && _pendingAllocIndex == 5);
         }
 
-        /// <summary>
-        /// CORREÇÃO v5: parâmetro isPending mostra preview visual de "+1 (confirmando...)"
-        /// enquanto aguarda a resposta do servidor para o atributo em alocação.
-        /// </summary>
         private void SetAttrText(TMP_Text label, int total, int bonus, bool isPending = false)
         {
             if (label == null) return;
 
             if (isPending)
             {
-                // Mostra valor atual + indicador de pendência em amarelo
                 label.text = bonus > 0
                     ? $"{total} <color=#88FF88>(+{bonus})</color> <color=#FFD700>↑</color>"
                     : $"{total} <color=#FFD700>↑</color>";
@@ -409,18 +362,8 @@ namespace RPG.UI
                     : $"{freePoints} pontos disponíveis!";
         }
 
-        /// <summary>
-        /// CORREÇÃO v5: usa apenas interactable — NUNCA SetActive().
-        ///
-        /// Botões ficam SEMPRE visíveis. Apenas o interactable muda:
-        ///   - true  → pode clicar (há pontos livres e não está alocando)
-        ///   - false → cinza/desabilitado (sem pontos ou aguardando confirmação)
-        ///
-        /// Isso resolve o "sumiço" dos botões que ocorria com SetActive(false).
-        /// </summary>
         private void RefreshPlusButtons(int freePoints)
         {
-            // CORREÇÃO: interactable = can, mas NUNCA SetActive. Botões sempre visíveis.
             bool can = freePoints > 0 && !_allocating;
 
             if (strPlusButton != null) strPlusButton.interactable = can;
@@ -450,26 +393,16 @@ namespace RPG.UI
             _allocating         = true;
             _pendingAllocIndex  = attributeIndex;
 
-            // CORREÇÃO v5: desabilita interação (não visibilidade) imediatamente
             SetPlusButtonsInteractable(false);
 
-            // Envia o comando ao servidor
             _netPlayer.CmdAllocateAttribute(attributeIndex);
 
-            // Mostra preview visual imediato do atributo em alocação
             if (_isOpen) RefreshAll();
 
-            // CORREÇÃO v5: fallback timeout — re-habilita mesmo se o SyncVar não chegar
-            // (alta latência, perda de pacote, etc.)
-            // OnFreePointsUpdated() cancela este Invoke quando a confirmação chega.
             CancelInvoke(nameof(FinishAllocatingTimeout));
             Invoke(nameof(FinishAllocatingTimeout), allocateConfirmTimeout);
         }
 
-        /// <summary>
-        /// Finaliza o estado de alocação e re-habilita os botões.
-        /// Chamado por OnFreePointsUpdated (confirmação do servidor) — caminho normal.
-        /// </summary>
         private void FinishAllocating()
         {
             if (!_allocating) return;
@@ -480,17 +413,9 @@ namespace RPG.UI
             int fp = _netPlayer != null ? _netPlayer.FreeAttributePoints : 0;
             RefreshPlusButtons(fp);
 
-            // Garante refresh da janela para exibir valores atualizados
             if (_isOpen) RefreshAll();
         }
 
-        /// <summary>
-        /// CORREÇÃO v5: fallback de timeout para re-habilitar botões.
-        ///
-        /// Chamado via Invoke apenas se o servidor não respondeu dentro de
-        /// allocateConfirmTimeout segundos. Evita botões presos desabilitados
-        /// em caso de alta latência ou perda de pacote.
-        /// </summary>
         private void FinishAllocatingTimeout()
         {
             if (!_allocating) return;

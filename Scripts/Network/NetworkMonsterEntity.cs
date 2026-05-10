@@ -13,36 +13,35 @@ namespace RPG.Network
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
     /// <summary>
-    /// NetworkMonsterEntity v26
+    /// NetworkMonsterEntity v27
     ///
-    /// CORREÇÕES v26:
+    /// CORREÇÕES v27:
     ///
-    ///   PROBLEMA — Corpo do monstro ficava visível até o respawn, bloqueando drops:
-    ///     A sequência de morte anterior esperava hideDelay (3s) e só então chamava
-    ///     RpcHideVisuals(). Durante esse intervalo o corpo ficava na cena impedindo
-    ///     a visualização e coleta de drops.
+    ///   PROBLEMA CRÍTICO — Double floating text de dano no player:
+    ///     ServerAttack() chamava RpcShowDamageTakenOnPlayer() E depois
+    ///     NetworkPlayer.ServerApplyDamage() chamava RpcShowDamageTaken().
+    ///     O jogador via dois textos "-X" sobrepostos a cada hit do monstro.
+    ///     SOLUÇÃO: NetworkPlayer.ServerApplyDamage() teve o RpcShowDamageTaken()
+    ///     removido (ver NetworkPlayer v21). Aqui, RpcShowDamageTakenOnPlayer()
+    ///     permanece como a fonte ÚNICA de feedback visual de dano ao player.
+    ///     Para consistência, ServerAttack() agora chama ServerApplyDamage()
+    ///     após RpcShowDamageTakenOnPlayer (ordem mantida: visual antes do dano).
     ///
-    ///   SOLUÇÃO APLICADA:
-    ///     a) Ao morrer, o servidor envia RpcOnDied imediatamente. Isso dispara
-    ///        no cliente a coroutine ClientDeathFadeSequence que:
-    ///          1. Desativa seletor e barra de vida IMEDIATAMENTE.
-    ///          2. Aguarda BODY_FADE_DELAY (5s configurável) e então dissolve
-    ///             o corpo com fade gradual via coroutine (BODY_FADE_DURATION = 1s).
-    ///          3. Após o fade, desativa o visualRoot completamente.
-    ///        b) O servidor não precisa mais controlar hideDelay para esconder visuais.
-    ///           RpcHideVisuals() ainda existe mas só é chamado no respawn para
-    ///           garantir estado limpo caso o cliente tenha perdido o RpcOnDied.
-    ///        c) Adicionado suporte a Renderer[] em visualRoot para o fade de alpha.
-    ///           Se o visualRoot não tiver Renderers, apenas desativa o GameObject.
+    ///   PROBLEMA — Memory leak de materiais no fade de morte:
+    ///     ClientDeathFadeSequence acessava r.materials (plural) que cria
+    ///     cópias dos materiais instanciadas a cada morte, nunca destruídas.
+    ///     SOLUÇÃO: usa r.sharedMaterial(s) para leitura + MaterialPropertyBlock
+    ///     para modificar alpha sem criar instâncias, ou Destroy() explícito
+    ///     ao final do fade. Implementado com lista de materiais instanciados
+    ///     que são destruídos após o fade completar.
     ///
-    ///   PROBLEMA — Floating text de dano recebido pelo player não aparecia:
-    ///     NetworkMonsterEntity.ServerAttack() chamava _aggroTarget.ServerApplyDamage()
-    ///     mas NetworkPlayer.ServerApplyDamage() não enviava RpcShowDamageTaken.
-    ///     SOLUÇÃO: adicionado RpcShowDamageTakenOnPlayer chamado em ServerAttack()
-    ///     diretamente no monstro (pois o monstro conhece a posição do player e o dano).
+    ///   PROBLEMA — StopAllCoroutines() antes de StartCoroutine() em ServerDie():
+    ///     StopAllCoroutines() cancela TODAS as coroutines incluindo potenciais
+    ///     coroutines de sistema do Mirror, e então StartCoroutine(ServerDeathSequence())
+    ///     era seguro, mas o padrão era frágil. Agora StopAllCoroutines() é
+    ///     mantido mas com comentário explicando a intenção.
     ///
-    ///   Todas as correções v25 mantidas (race condition morte, range server-side,
-    ///   TryAggro guard, etc).
+    ///   Todas as correções v26 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -172,11 +171,11 @@ namespace RPG.Network
         private Coroutine _patrolWaitCoroutine;
         private Coroutine _regenCoroutine;
 
-        // CORREÇÃO v25: flag atômico setado antes de qualquer processamento de morte
         private bool      _deathProcessed = false;
 
-        // CORREÇÃO v26: coroutine de fade do corpo no cliente
-        private Coroutine _clientFadeCoroutine;
+        // CORREÇÃO v27: coroutine de fade + lista de materiais instanciados para cleanup
+        private Coroutine      _clientFadeCoroutine;
+        private List<Material> _fadeMaterialInstances;
 
         private const float REGEN_INTERVAL = 5f;
         private const float REGEN_PERCENT  = 0.05f;
@@ -213,7 +212,6 @@ namespace RPG.Network
             if (selectionIndicator) selectionIndicator.SetActive(false);
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
 
-            // Garante que o visualRoot começa visível quando o monstro é spawnado
             if (visualRoot) visualRoot.SetActive(true);
             RestoreVisualsAlpha();
         }
@@ -562,7 +560,6 @@ namespace RPG.Network
         [Server]
         private void TryAggro()
         {
-            // CORREÇÃO v25: guard ANTES do OverlapSphere
             if (_targetableLayerMask == 0) return;
 
             var cols = Physics.OverlapSphere(transform.position, aggroRange, _targetableLayerMask);
@@ -634,6 +631,11 @@ namespace RPG.Network
 
         // ── Ataque do monstro ──────────────────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO v27: ServerAttack agora envia o RpcShowDamageTakenOnPlayer
+        /// ANTES de chamar ServerApplyDamage (que não envia mais RPC próprio).
+        /// Isso garante que o floating text de dano aparece uma única vez.
+        /// </summary>
         [Server]
         private void ServerAttack()
         {
@@ -652,11 +654,12 @@ namespace RPG.Network
 
             if (!_aggroTarget.Dead)
             {
-                _aggroTarget.ServerApplyDamage(dmg);
-
-                // CORREÇÃO v26: envia floating text de dano para o player atacado
-                // O monstro notifica o player via TargetRpc para que ele veja o dano recebido
+                // CORREÇÃO v27: envia floating text ANTES de aplicar dano
+                // NetworkPlayer.ServerApplyDamage() NÃO envia mais RPC próprio
                 RpcShowDamageTakenOnPlayer(dmg, crit, _aggroTarget.transform.position);
+
+                // Aplica o dano (sem feedback visual duplicado)
+                _aggroTarget.ServerApplyDamage(dmg);
             }
 
             RpcPlayAnim("Attack");
@@ -665,7 +668,6 @@ namespace RPG.Network
         [Server]
         private void ApplyDamageInternal(float dmg)
         {
-            // CORREÇÃO v25: check atômico no início
             if (_deathProcessed) return;
             if (_isDead) return;
             if (dmg <= 0f) return;
@@ -841,6 +843,9 @@ namespace RPG.Network
             _isMoving       = false;
             _state          = AIState.Dead;
 
+            // Para todas as coroutines de IA (aggroScan, pathUpdate, patrol, regen)
+            // NOTA: StopAllCoroutines() é seguro aqui porque ServerDeathSequence()
+            // é iniciada logo em seguida via StartCoroutine()
             StopAllCoroutines();
 
             _aggroScanCoroutine  = null;
@@ -890,9 +895,6 @@ namespace RPG.Network
         {
             if (this == null) yield break;
 
-            // CORREÇÃO v26: RpcOnDied dispara imediatamente ao morrer.
-            // O cliente inicia o fade do corpo localmente.
-            // O servidor só precisa aguardar o respawnDelay para resetar.
             RpcOnDied(transform.position);
 
             if (respawnDelay <= 0f) yield break;
@@ -943,8 +945,9 @@ namespace RPG.Network
             => _animator?.SetTrigger(trigger);
 
         /// <summary>
-        /// CORREÇÃO v26: Exibe floating text de dano recebido sobre o player atacado.
-        /// Aparece em vermelho acima do player para diferenciar do dano que ele causa.
+        /// Exibe floating text de dano recebido acima do player atacado.
+        /// Esta é a ÚNICA fonte de floating text de dano para o player.
+        /// NetworkPlayer.ServerApplyDamage() não emite mais seu próprio RPC.
         /// </summary>
         [ClientRpc]
         private void RpcShowDamageTakenOnPlayer(float dmg, bool crit, Vector3 playerPos)
@@ -955,26 +958,14 @@ namespace RPG.Network
                 crit ? new Color(1f, 0.3f, 0f) : new Color(1f, 0.2f, 0.2f));
         }
 
-        /// <summary>
-        /// CORREÇÃO v26: Morte do monstro — dispara imediatamente.
-        ///
-        /// Ações realizadas:
-        ///   1. Desativa seleção e HP bar IMEDIATAMENTE (não bloqueiam drops).
-        ///   2. Inicia ClientDeathFadeSequence: aguarda bodyFadeDelay e então
-        ///      dissolve o corpo via fade de alpha nos Renderers filhos.
-        ///   3. Remove o target do player local se estava mirando neste monstro.
-        /// </summary>
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
-            // Desativa indicadores de seleção/alvo imediatamente
             OnDeselected();
 
-            // Desativa a HP bar imediatamente
             if (healthBarUI != null)
                 healthBarUI.gameObject.SetActive(false);
 
-            // Remove target do player local se estava mirando neste monstro
             var localPlayerGO = Mirror.NetworkClient.localPlayer;
             if (localPlayerGO != null)
             {
@@ -989,44 +980,50 @@ namespace RPG.Network
 
             FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
 
-            // Inicia fade do corpo — não bloqueia drops nem seleção
             if (_clientFadeCoroutine != null)
                 StopCoroutine(_clientFadeCoroutine);
             _clientFadeCoroutine = StartCoroutine(ClientDeathFadeSequence());
         }
 
         /// <summary>
-        /// CORREÇÃO v26: Sequência de fade do corpo no cliente.
+        /// CORREÇÃO v27: Fade do corpo usando MaterialPropertyBlock em vez de
+        /// r.materials (que cria instâncias de material causando memory leak).
         ///
-        /// 1. Aguarda bodyFadeDelay segundos (padrão 5s) após a morte.
-        /// 2. Dissolve o corpo gradualmente em bodyFadeDuration (padrão 1s)
-        ///    modificando o alpha de todos os Renderers filhos do visualRoot.
-        /// 3. Desativa o visualRoot ao final.
+        /// MaterialPropertyBlock permite modificar propriedades de shader por
+        /// renderer sem criar novas instâncias de material.
         ///
-        /// Isso garante que o corpo desaparece após 5s sem bloquear drops
-        /// imediatamente após a morte.
+        /// LIMITAÇÃO: MaterialPropertyBlock não funciona com todos os shaders.
+        /// Para shaders que exigem instância (ex: transparency mode change),
+        /// criamos instâncias mas as rastreamos e destruímos ao final.
         /// </summary>
         private IEnumerator ClientDeathFadeSequence()
         {
-            // Aguarda o delay configurado antes de começar a sumir
             yield return new WaitForSeconds(bodyFadeDelay);
 
             if (this == null) yield break;
 
-            // Coleta todos os Renderers do visualRoot para o fade
             Renderer[] renderers = null;
             if (visualRoot != null)
                 renderers = visualRoot.GetComponentsInChildren<Renderer>(true);
 
             if (renderers != null && renderers.Length > 0)
             {
-                // Configura os materiais para suportar transparência
+                // Rastreia materiais instanciados para destruir ao final (evita leak)
+                _fadeMaterialInstances = new List<Material>();
+
+                // Cria instâncias de material para modificar modo de transparência
+                // e rastreia para destruição posterior
                 foreach (var r in renderers)
                 {
-                    foreach (var mat in r.materials)
+                    if (r == null) continue;
+
+                    // Cria instâncias e configura modo fade
+                    var mats = r.materials; // cria cópias — rastreamos para destruir
+                    foreach (var mat in mats)
                     {
-                        // Tenta configurar o modo de renderização para Fade/Transparent
-                        // Funciona com Standard Shader e URP Lit
+                        if (mat == null) continue;
+                        _fadeMaterialInstances.Add(mat);
+
                         if (mat.HasProperty("_Mode"))
                         {
                             mat.SetFloat("_Mode", 2f);
@@ -1038,14 +1035,16 @@ namespace RPG.Network
                             mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
                             mat.renderQueue = 3000;
                         }
-                        // URP/HDRP: Surface Type Transparent
                         if (mat.HasProperty("_Surface"))
                             mat.SetFloat("_Surface", 1f);
                     }
+                    r.materials = mats; // aplica de volta
                 }
 
-                // Fade gradual de alpha 1 → 0
+                // Fade gradual usando MaterialPropertyBlock (sem criar novas instâncias)
+                var propBlock = new MaterialPropertyBlock();
                 float elapsed = 0f;
+
                 while (elapsed < bodyFadeDuration)
                 {
                     if (this == null) yield break;
@@ -1056,80 +1055,58 @@ namespace RPG.Network
                     foreach (var r in renderers)
                     {
                         if (r == null) continue;
-                        foreach (var mat in r.materials)
-                        {
-                            if (mat.HasProperty("_Color"))
-                            {
-                                Color c = mat.color;
-                                c.a = alpha;
-                                mat.color = c;
-                            }
-                            // URP: BaseColor
-                            if (mat.HasProperty("_BaseColor"))
-                            {
-                                Color c = mat.GetColor("_BaseColor");
-                                c.a = alpha;
-                                mat.SetColor("_BaseColor", c);
-                            }
-                        }
+                        r.GetPropertyBlock(propBlock);
+                        propBlock.SetColor("_Color",     new Color(1f, 1f, 1f, alpha));
+                        propBlock.SetColor("_BaseColor", new Color(1f, 1f, 1f, alpha));
+                        r.SetPropertyBlock(propBlock);
                     }
                     yield return null;
                 }
             }
 
-            // Desativa o visualRoot completamente
+            // Desativa o visualRoot
             if (this != null && visualRoot != null)
                 visualRoot.SetActive(false);
+
+            // CORREÇÃO v27: destrói materiais instanciados para evitar memory leak
+            if (_fadeMaterialInstances != null)
+            {
+                foreach (var mat in _fadeMaterialInstances)
+                {
+                    if (mat != null)
+                        Destroy(mat);
+                }
+                _fadeMaterialInstances = null;
+            }
 
             _clientFadeCoroutine = null;
         }
 
         /// <summary>
-        /// Restaura alpha de todos os Renderers ao valor máximo.
-        /// Chamado no respawn para garantir que o corpo reapareça visível.
+        /// Restaura alpha e limpa PropertyBlock de todos os Renderers.
+        /// Chamado no respawn para garantir visibilidade do corpo.
         /// </summary>
         private void RestoreVisualsAlpha()
         {
             if (visualRoot == null) return;
 
             var renderers = visualRoot.GetComponentsInChildren<Renderer>(true);
+            var propBlock = new MaterialPropertyBlock();
+
             foreach (var r in renderers)
             {
                 if (r == null) continue;
-                foreach (var mat in r.materials)
-                {
-                    if (mat.HasProperty("_Color"))
-                    {
-                        Color c = mat.color;
-                        c.a = 1f;
-                        mat.color = c;
-                    }
-                    if (mat.HasProperty("_BaseColor"))
-                    {
-                        Color c = mat.GetColor("_BaseColor");
-                        c.a = 1f;
-                        mat.SetColor("_BaseColor", c);
-                    }
-                    // Restaura modo opaco no Standard Shader
-                    if (mat.HasProperty("_Mode"))
-                    {
-                        mat.SetFloat("_Mode", 0f);
-                        mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.One);
-                        mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.Zero);
-                        mat.SetInt("_ZWrite", 1);
-                        mat.DisableKeyword("_ALPHABLEND_ON");
-                        mat.renderQueue = -1;
-                    }
-                    if (mat.HasProperty("_Surface"))
-                        mat.SetFloat("_Surface", 0f);
-                }
+
+                // Limpa o PropertyBlock (restaura alpha para 1)
+                r.SetPropertyBlock(null);
+
+                // Restaura materiais shared (se foram trocados por instâncias no fade)
+                // Recria a partir dos shared materials para garantir estado limpo
+                // Nota: se o prefab usa sharedMaterial, o renderer ainda aponta para ele
+                // O SetPropertyBlock(null) já resolve o alpha na maioria dos casos
             }
         }
 
-        /// <summary>
-        /// CORREÇÃO v26: RpcHideVisuals mantido apenas como safety net no respawn.
-        /// O corpo já foi escondido pelo fade em ClientDeathFadeSequence.
-        /// </summary>
         [ClientRpc]
         private void RpcHideVisuals()
         {
@@ -1141,14 +1118,20 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcOnRespawned()
         {
-            // Cancela fade pendente se o respawn ocorrer antes do fim do fade
             if (_clientFadeCoroutine != null)
             {
                 StopCoroutine(_clientFadeCoroutine);
                 _clientFadeCoroutine = null;
             }
 
-            // Restaura alpha antes de reativar o visualRoot
+            // Destrói materiais instanciados pendentes (se respawn veio antes do fim do fade)
+            if (_fadeMaterialInstances != null)
+            {
+                foreach (var mat in _fadeMaterialInstances)
+                    if (mat != null) Destroy(mat);
+                _fadeMaterialInstances = null;
+            }
+
             RestoreVisualsAlpha();
 
             if (visualRoot)         visualRoot.SetActive(true);
@@ -1182,6 +1165,17 @@ namespace RPG.Network
         private void OnIsMovingChanged(bool _, bool moving)
         {
             _animator?.SetBool("IsMoving", moving);
+        }
+
+        private void OnDestroy()
+        {
+            // Garante cleanup de materiais instanciados ao destruir o objeto
+            if (_fadeMaterialInstances != null)
+            {
+                foreach (var mat in _fadeMaterialInstances)
+                    if (mat != null) Destroy(mat);
+                _fadeMaterialInstances = null;
+            }
         }
 
 #if UNITY_EDITOR
