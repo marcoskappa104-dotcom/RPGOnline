@@ -7,6 +7,7 @@ using Mirror;
 using RPG.Character;
 using RPG.UI;
 using RPG.Network;
+using RPG.Data;
 
 namespace RPG.Combat
 {
@@ -23,56 +24,31 @@ namespace RPG.Combat
         public float       ManaCost      = 10f;
         public float       Range         = 4f;
         public float       AtkMultiplier = 1.0f;
+        /// <summary>
+        /// Tempo base de cast em segundos. 0 = instantâneo.
+        /// O tempo efetivo é reduzido pelo CastSpeed do personagem:
+        ///   effectiveCastTime = CastTime / (1 + CastSpeed/100)
+        /// </summary>
         public float       CastTime      = 0f;
         public string      AnimTrigger   = "Attack";
         public Sprite      Icon;
     }
 
     /// <summary>
-    /// SkillSystem v9
+    /// SkillSystem v10
     ///
-    /// CORREÇÃO CRÍTICA v9 — BUG: Player parava antes do range e não usava a skill.
+    /// CORREÇÕES v10:
     ///
-    ///   CAUSA RAIZ (identificada na análise do código v8):
+    ///   NOVO — CastTime agora é reduzido pelo CastSpeed do personagem:
+    ///     Se uma skill tem CastTime=2.0s e o player tem CastSpeed=50,
+    ///     effectiveCastTime = 2.0 / (1 + 50/100) = 2.0/1.5 = 1.33s.
+    ///     O personagem fica parado durante o cast (canal), então o
+    ///     WalkThenSendCmd aguarda o cast antes de continuar.
     ///
-    ///     O SkillSystem v8 usava DOIS valores de fração que se SOMAVAM:
-    ///       • STOP_DIST_FRACTION  = 0.75  → stoppingDistance = skill.Range * 0.75
-    ///       • DESTINATION_FRACTION = 0.80 → destino a 0.80 * range do alvo
+    ///   NOVO — CastBar UI notificada via evento OnCastStarted/OnCastProgress/OnCastFinished.
+    ///     A UIManager pode se inscrever para exibir uma barra de cast.
     ///
-    ///     O NavMesh move o agente até um ponto a (range * 0.80) do alvo,
-    ///     mas pára a stoppingDistance (range * 0.75) ANTES desse ponto.
-    ///     Resultado: player parava a (range * 0.80 + range * 0.75) do alvo
-    ///     em vez de entrar no range.
-    ///
-    ///     Além disso, CalculateRangeDestination retornava transform.position
-    ///     quando dist <= skillRange * 0.80, o que fazia o agente parar no lugar
-    ///     mesmo estando fora do range de uso da skill.
-    ///
-    ///   SOLUÇÃO APLICADA:
-    ///
-    ///     a) stoppingDistance zerado durante o walk (0.1f apenas como safety margin).
-    ///        Não mais um múltiplo do range — isso eliminava a soma indesejada.
-    ///
-    ///     b) CalculateRangeDestination agora usa WALK_DEST_FRACTION = 0.85f
-    ///        para definir onde o player vai parar (a 85% do range do alvo).
-    ///        O check de "está no range?" usa skill.Range completo, garantindo
-    ///        que 0.85 * range < range → o player SEMPRE entra no range.
-    ///
-    ///     c) Adicionado RANGE_CHECK_MARGIN = 1.05f: o player considera que está
-    ///        "no range" quando dist <= skill.Range * 1.05. Isso absorve micro-jitter
-    ///        do NavMesh sem abrir brechas de exploração (1.05 é conservador).
-    ///
-    ///     d) WalkThenSendCmd verifica range a cada frame ANTES de recalcular destino.
-    ///        Se entrou no range, para imediatamente e envia o Command.
-    ///
-    ///     e) Loop de caminhar refatorado para ser mais direto:
-    ///        cada frame: checar range → se sim, executar; se não, mover.
-    ///
-    ///   MELHORIAS ADICIONAIS:
-    ///     - Verificação de alvo morto/mudado consolidada em IsTargetValid().
-    ///     - Log mais informativo com contexto de range e distância.
-    ///     - Timeout mantido em 15s (aumentado de 12s para mapas maiores).
-    ///     - BasicAttackSystem recebe a mesma correção de frações.
+    ///   Todas as correções v9 mantidas.
     /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     public class SkillSystem : NetworkBehaviour
@@ -82,17 +58,9 @@ namespace RPG.Combat
 
         private const float CMD_MOVE_INTERVAL = 0.15f;
         private const float WALK_TIMEOUT      = 15f;
-
-        // CORREÇÃO v9: destino a 85% do range → garante que dist ao alvo seja < range
-        // Antes: 0.80 de destino + 0.75 de stoppingDistance = player parava longe demais
         private const float WALK_DEST_FRACTION = 0.85f;
-
-        // Margem de tolerância no check de range (absorve jitter do NavMesh)
-        // O servidor usa 1.3x, o cliente usa 1.05x (mais conservador)
         private const float RANGE_CHECK_MARGIN = 1.05f;
-
-        // stoppingDistance mínimo durante walk — não mais um múltiplo do range
-        private const float WALK_STOP_DIST = 0.2f;
+        private const float WALK_STOP_DIST     = 0.2f;
 
         // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
@@ -107,16 +75,25 @@ namespace RPG.Combat
 
         // ── Walk-to-range state ────────────────────────────────────────────
         private Coroutine   _walkCoroutine;
+        private Coroutine   _castCoroutine;
         private bool        _hasPendingWalk;
+        private bool        _isCasting;
         private ITargetable _pendingTarget;
         private float       _lastCmdMoveTime;
 
-        // ── Eventos para SkillBar UI ───────────────────────────────────────
+        // ── Eventos para a UI ──────────────────────────────────────────────
         public event Action<int, float>  OnCooldownStarted;
         public event Action<int>         OnSkillFired;
         public event Action              OnSkillBarNeedsRefresh;
+        /// <summary>Disparado quando um cast começa. Parâmetros: skillName, castDuration.</summary>
+        public event Action<string, float> OnCastStarted;
+        /// <summary>Disparado a cada frame durante o cast. Parâmetro: progresso 0-1.</summary>
+        public event Action<float>         OnCastProgress;
+        /// <summary>Disparado quando o cast termina (sucesso ou cancelamento).</summary>
+        public event Action                OnCastFinished;
 
-        public bool HasPendingAction => _hasPendingWalk;
+        public bool HasPendingAction => _hasPendingWalk || _isCasting;
+        public bool IsCasting        => _isCasting;
 
         // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -141,6 +118,7 @@ namespace RPG.Combat
                 _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
 
             CancelPendingWalk();
+            CancelCast();
         }
 
         private void OnGemLoadoutChanged()
@@ -158,9 +136,10 @@ namespace RPG.Combat
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
-            if (_hasPendingWalk && _player.IsDead)
+            if ((_hasPendingWalk || _isCasting) && _player.IsDead)
             {
                 CancelPendingWalk();
+                CancelCast();
                 return;
             }
 
@@ -188,6 +167,7 @@ namespace RPG.Combat
         {
             if (!isLocalPlayer) return;
             if (!_player.IsInitialized || _player.IsDead) return;
+            if (_isCasting) return; // não interrompe cast em andamento
 
             var skill = GetSkill(index);
             if (skill == null)
@@ -222,25 +202,24 @@ namespace RPG.Combat
 
             CancelPendingWalk();
 
-            // Skills de self/heal/buff não precisam de aproximação
+            // Skills de self/heal/buff não precisam de alvo e ignoram cast time de aproximação
             if (skill.Target == SkillTarget.Self || skill.Type == SkillType.Heal || skill.Type == SkillType.Buff)
             {
-                SendSelfSkillCmd(index);
+                StartCastAndSend(index, skill, null, isSelf: true);
                 return;
             }
 
             float dist = target != null ? Vector3.Distance(transform.position, target.Position) : 0f;
 
-            // CORREÇÃO v9: usa RANGE_CHECK_MARGIN para ser levemente permissivo
             if (dist <= skill.Range * RANGE_CHECK_MARGIN)
             {
-                // Já no range: para e executa imediatamente
+                // Já no range: para e começa o cast
                 if (_agent != null && _agent.isOnNavMesh)
                 {
                     _agent.ResetPath();
                     _agent.stoppingDistance = 0.5f;
                 }
-                SendSkillCmd(index, target, skill.Type == SkillType.Physical);
+                StartCastAndSend(index, skill, target, isSelf: false);
             }
             else
             {
@@ -249,6 +228,108 @@ namespace RPG.Combat
                 _pendingTarget   = target;
                 _lastCmdMoveTime = -CMD_MOVE_INTERVAL;
                 _walkCoroutine   = StartCoroutine(WalkThenSendCmd(index, skill, target));
+            }
+        }
+
+        /// <summary>
+        /// Inicia o canal de cast (se CastTime > 0) e envia o Command ao servidor.
+        /// Se CastTime = 0, envia imediatamente.
+        /// CastSpeed do personagem reduz o CastTime efetivo.
+        /// </summary>
+        private void StartCastAndSend(int index, SkillData skill, ITargetable target, bool isSelf)
+        {
+            // Calcula cast time efetivo considerando CastSpeed do personagem
+            float effectiveCastTime = 0f;
+            if (skill.CastTime > 0f && _player.Stats != null)
+            {
+                effectiveCastTime = StatsCalculator.CalculateEffectiveCastTime(
+                    skill.CastTime, _player.Stats.CastSpeed);
+            }
+
+            if (effectiveCastTime <= 0.05f)
+            {
+                // Cast instantâneo
+                if (isSelf)
+                    SendSelfSkillCmd(index);
+                else
+                    SendSkillCmd(index, target, skill.Type == SkillType.Physical);
+            }
+            else
+            {
+                // Cast com tempo
+                if (_castCoroutine != null) StopCoroutine(_castCoroutine);
+                _castCoroutine = StartCoroutine(CastSequence(index, skill, target, isSelf, effectiveCastTime));
+            }
+        }
+
+        /// <summary>
+        /// Coroutine de canal de cast. Exibe progresso via eventos de UI.
+        /// Se o player se mover ou o alvo morrer, o cast é cancelado.
+        /// </summary>
+        private IEnumerator CastSequence(int index, SkillData skill, ITargetable target, bool isSelf, float castTime)
+        {
+            _isCasting = true;
+            OnCastStarted?.Invoke(skill.Name, castTime);
+
+            // Para o agente durante o cast
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.ResetPath();
+                _agent.velocity = Vector3.zero;
+            }
+
+            if (!string.IsNullOrEmpty(skill.AnimTrigger))
+                _animator?.SetTrigger("CastStart");
+
+            float elapsed = 0f;
+            while (elapsed < castTime)
+            {
+                elapsed += Time.deltaTime;
+
+                // Cancela cast se morreu ou alvo inválido
+                if (_player.IsDead)
+                {
+                    Log("Cast cancelado: player morreu.");
+                    break;
+                }
+                if (!isSelf && !IsTargetValid(target))
+                {
+                    Log("Cast cancelado: alvo morreu.");
+                    UIManager.Instance?.ShowMessage("Alvo inválido — cast cancelado.");
+                    break;
+                }
+
+                OnCastProgress?.Invoke(elapsed / castTime);
+                yield return null;
+            }
+
+            bool success = elapsed >= castTime && !_player.IsDead;
+            success = success && (isSelf || IsTargetValid(target));
+
+            _isCasting     = false;
+            _castCoroutine = null;
+            OnCastFinished?.Invoke();
+
+            if (success)
+            {
+                if (isSelf)
+                    SendSelfSkillCmd(index);
+                else
+                    SendSkillCmd(index, target, skill.Type == SkillType.Physical);
+            }
+        }
+
+        public void CancelCast()
+        {
+            if (_castCoroutine != null)
+            {
+                StopCoroutine(_castCoroutine);
+                _castCoroutine = null;
+            }
+            if (_isCasting)
+            {
+                _isCasting = false;
+                OnCastFinished?.Invoke();
             }
         }
 
@@ -271,33 +352,10 @@ namespace RPG.Combat
 
         // ── Walk-to-range ──────────────────────────────────────────────────
 
-        /// <summary>
-        /// CORREÇÃO v9 — Walk que realmente entra no range antes de disparar a skill.
-        ///
-        /// LÓGICA CORRIGIDA:
-        ///   1. stoppingDistance = WALK_STOP_DIST (0.2f) — NÃO um múltiplo do range.
-        ///      Isso evita que stoppingDistance e destino se somem.
-        ///
-        ///   2. Destino = targetPos - dir * (skill.Range * WALK_DEST_FRACTION)
-        ///      WALK_DEST_FRACTION = 0.85 → player vai até 85% do range do alvo.
-        ///      Como 0.85 < 1.0, o player SEMPRE entra no range antes de parar.
-        ///
-        ///   3. Check de range usa skill.Range * RANGE_CHECK_MARGIN (1.05).
-        ///      Isso absorve micro-oscilações do NavMesh sem abrir exploits.
-        ///
-        ///   4. Ao detectar que está no range:
-        ///      a) ResetPath() imediato para parar o agente
-        ///      b) yield return null para garantir que o NavMesh processou
-        ///      c) Verifica novamente se o alvo ainda é válido
-        ///      d) Dispara SendSkillCmd
-        /// </summary>
         private IEnumerator WalkThenSendCmd(int index, SkillData skill, ITargetable target)
         {
-            // CORREÇÃO v9: stoppingDistance pequeno — não mais um múltiplo do range
             if (_agent != null && _agent.isOnNavMesh)
-            {
                 _agent.stoppingDistance = WALK_STOP_DIST;
-            }
 
             float timeout        = WALK_TIMEOUT;
             float effectiveRange = skill.Range * RANGE_CHECK_MARGIN;
@@ -306,7 +364,6 @@ namespace RPG.Combat
             {
                 timeout -= Time.deltaTime;
 
-                // Verifica condições de cancelamento
                 if (_player.IsDead)
                 {
                     Log("WalkThenSendCmd: jogador morreu.");
@@ -329,10 +386,8 @@ namespace RPG.Combat
 
                 float dist = Vector3.Distance(transform.position, target.Position);
 
-                // CORREÇÃO v9: check de range com margem — entra no range e executa
                 if (dist <= effectiveRange)
                 {
-                    // Para o agente COMPLETAMENTE antes de executar
                     if (_agent != null && _agent.isOnNavMesh)
                     {
                         _agent.ResetPath();
@@ -343,28 +398,23 @@ namespace RPG.Combat
                     _hasPendingWalk = false;
                     _pendingTarget  = null;
 
-                    // Aguarda 1 frame para o NavMesh processar o ResetPath
                     yield return null;
 
-                    // Verifica novamente após o yield
                     if (!_player.IsDead && IsTargetValid(target) && _player.CurrentTarget == target)
                     {
                         Log($"No range ({dist:0.2}/{skill.Range:0.1}). Executando skill {index}.");
-                        SendSkillCmd(index, target, skill.Type == SkillType.Physical);
+                        StartCastAndSend(index, skill, target, isSelf: false);
                     }
 
                     yield break;
                 }
 
-                // CORREÇÃO v9: destino a WALK_DEST_FRACTION do range
-                // Isso garante que o player vai parar DENTRO do range de uso
                 if (_agent != null && _agent.isOnNavMesh)
                 {
                     Vector3 destination = CalculateWalkDestination(target.Position, skill.Range);
                     _agent.SetDestination(destination);
                 }
 
-                // Envia CmdMoveTo ao servidor com throttle
                 if (Time.time - _lastCmdMoveTime >= CMD_MOVE_INTERVAL)
                 {
                     _lastCmdMoveTime = Time.time;
@@ -378,7 +428,6 @@ namespace RPG.Combat
             if (timeout <= 0f)
                 Log($"WalkThenSendCmd: timeout após {WALK_TIMEOUT}s para skill {index}.");
 
-            // Restaura estado ao sair por qualquer motivo
             if (_agent != null && _agent.isOnNavMesh)
             {
                 _agent.stoppingDistance = 0.5f;
@@ -390,18 +439,6 @@ namespace RPG.Combat
             _walkCoroutine  = null;
         }
 
-        /// <summary>
-        /// CORREÇÃO v9 — Calcula destino de caminhada dentro do range da skill.
-        ///
-        /// O destino fica a (skill.Range * WALK_DEST_FRACTION) do alvo.
-        /// Como WALK_DEST_FRACTION = 0.85 e o check de range usa 1.0 (ou 1.05),
-        /// o player SEMPRE entra no range antes de chegar ao destino calculado.
-        ///
-        /// Diferença do v8:
-        ///   v8: destino a 0.80 do range + stoppingDistance a 0.75 do range = para longe demais
-        ///   v9: destino a 0.85 do range + stoppingDistance = 0.2f (fixo, pequeno)
-        ///       → player para bem dentro do range de uso
-        /// </summary>
         private Vector3 CalculateWalkDestination(Vector3 targetPos, float skillRange)
         {
             Vector3 toTarget = targetPos - transform.position;
@@ -409,7 +446,6 @@ namespace RPG.Combat
 
             float safeStopDist = skillRange * WALK_DEST_FRACTION;
 
-            // Se já está bem próximo do destino ideal, não mover
             if (dist <= safeStopDist * 0.95f)
                 return transform.position;
 
@@ -428,7 +464,6 @@ namespace RPG.Combat
         {
             var skill = GetSkill(skillIndex);
 
-            // Para o agente ao executar
             if (_agent != null && _agent.isOnNavMesh)
             {
                 _agent.ResetPath();
@@ -446,7 +481,6 @@ namespace RPG.Combat
                 return;
             }
 
-            // Rotaciona em direção ao alvo
             Vector3 dir = target.Position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
@@ -493,10 +527,6 @@ namespace RPG.Combat
 
         // ── Helpers ────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Verifica se o alvo ainda é válido (não nulo, não morto, objeto Unity vivo).
-        /// Centraliza a lógica que antes estava duplicada em vários lugares.
-        /// </summary>
         private static bool IsTargetValid(ITargetable target)
         {
             if (target == null) return false;
