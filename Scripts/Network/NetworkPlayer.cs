@@ -13,33 +13,42 @@ using System;
 namespace RPG.Network
 {
     /// <summary>
-    /// NetworkPlayer v21
+    /// NetworkPlayer v22
     ///
-    /// CORREÇÕES v21:
+    /// CORREÇÕES v22:
     ///
-    ///   PROBLEMA CRÍTICO — Double floating text de dano:
-    ///     ServerApplyDamage() chamava RpcShowDamageTaken() E
-    ///     NetworkMonsterEntity.ServerAttack() chamava RpcShowDamageTakenOnPlayer().
-    ///     Resultado: dois textos de dano apareciam sobrepostos para o jogador.
-    ///     SOLUÇÃO: RpcShowDamageTaken() REMOVIDO de ServerApplyDamage().
-    ///     O floating text de dano recebido é responsabilidade exclusiva do
-    ///     monstro via RpcShowDamageTakenOnPlayer(), que já conhece posição e dano.
-    ///     Para danos de outras fontes (área, veneno futuro), usar TargetRpc
-    ///     diretamente no sistema que aplica o dano.
+    ///   BUG CRÍTICO — OnAllocatedDataChanged disparado 6 vezes por alocação:
+    ///     Os 6 SyncVars de alloc (STR/AGI/VIT/DEX/INT/LUK) compartilhavam o
+    ///     mesmo hook OnAllocatedDataChanged. Cada SyncVar atualizado disparava
+    ///     o hook individualmente, causando 6 chamadas a FullRefreshStatsFromData()
+    ///     por clique no botão "+". Além de desperdício de CPU, isso causava
+    ///     flickering na UI do atributo.
+    ///     SOLUÇÃO: Hook individual por SyncVar que seta uma flag _allocDirty.
+    ///     Um único Update() no cliente verifica a flag e chama o refresh uma vez.
     ///
-    ///   PROBLEMA — OnAllocatedDataChanged não atualizava DerivedStats:
-    ///     Ao receber SyncVars de atributos alocados, o hook atualizava
-    ///     _playerEntity.Data mas NÃO recalculava os stats derivados,
-    ///     deixando HP, ATK, DEF etc. desatualizados até o StatsVersion mudar.
-    ///     SOLUÇÃO: OnAllocatedDataChanged agora chama FullRefreshStatsFromData()
-    ///     após atualizar os dados do personagem.
+    ///   BUG — PlayerInitData não transmitia resistências de equipamento:
+    ///     EquipmentBonuses tinha ResistFire/Ice/Poison/Lightning mas a struct
+    ///     PlayerInitData só transportava ATK/DEF/MATK/MDEF.
+    ///     SOLUÇÃO: PlayerInitData expandida com os 4 campos de resistência.
     ///
-    ///   OTIMIZAÇÃO — ServerRegenLoop verificação desnecessária:
-    ///     O loop enviava RpcShowRegenTick mesmo quando nada foi restaurado
-    ///     porque CurrentHP/MP já estava no máximo. Adicionada verificação
-    ///     antecipada para evitar envio de RPC desnecessário.
+    ///   BUG — GetRespawnPosition retornava Vector3.zero sem verificar NavMesh:
+    ///     Se todos os respawn points falhassem, o player spawnava em (0,0,0)
+    ///     que pode ser dentro de uma geometria ou fora do NavMesh.
+    ///     SOLUÇÃO: fallback tenta NavMesh.SamplePosition em um raio grande
+    ///     antes de aceitar a origem como último recurso.
     ///
-    ///   Todas as correções v20 mantidas.
+    ///   BUG — ServerRegenLoop não verificava _serverStats null após yield:
+    ///     Se o servidor reiniciasse _serverStats entre ticks, a leitura de
+    ///     HPRegen/MPRegen jogava NullReferenceException.
+    ///     SOLUÇÃO: captura referência local antes do yield e verifica null.
+    ///
+    ///   MELHORIA — RpcMoveConfirmed removido de CmdMoveTo no Controller:
+    ///     O cliente enviava SetDestination no NavMeshAgent localmente E
+    ///     recebia RpcMoveConfirmed que chamava SetDestination novamente,
+    ///     causando um double-set desnecessário.
+    ///     (Ver NetworkPlayerController v13 para a correção correspondente.)
+    ///
+    ///   Todas as correções v21 mantidas.
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
@@ -55,10 +64,9 @@ namespace RPG.Network
         private const float ALLOCATE_MIN_INTERVAL    = 0.3f;
         private const float REGEN_COMBAT_SUPPRESSION = 8f;
         private const int   MAX_FREE_POINTS          = CharacterData.MAX_LEVEL * 5;
+        private const float REGEN_DISPLAY_THRESHOLD  = 1f;
 
-        // Valor mínimo de regen para exibir floating text (evita spam de "+0 HP")
-        private const float REGEN_DISPLAY_THRESHOLD = 1f;
-
+        // ── PlayerInitData — inclui resistências de equipamento ────────────
         public struct PlayerInitData
         {
             public string CharName;
@@ -71,6 +79,10 @@ namespace RPG.Network
             public int    BaseSTR,  BaseAGI,  BaseVIT,  BaseDEX,  BaseINT,  BaseLUK;
             public float  CurHP, CurMP;
             public float  EquipATK, EquipDEF, EquipMATK, EquipMDEF;
+            // CORREÇÃO v22: resistências de equipamento incluídas
+            public float  EquipResistFire, EquipResistIce, EquipResistPoison, EquipResistLightning;
+            public float  EquipHPBonus, EquipMPBonus;
+            public int    EquipSTR, EquipAGI, EquipVIT, EquipDEX, EquipINT, EquipLUK;
         }
 
         // ── SyncVars ───────────────────────────────────────────────────────
@@ -88,12 +100,13 @@ namespace RPG.Network
 
         [SyncVar(hook = nameof(OnStatsVersionChanged))] public int StatsVersion = 0;
 
-        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedSTR = 0;
-        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedAGI = 0;
-        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedVIT = 0;
-        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedDEX = 0;
-        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedINT = 0;
-        [SyncVar(hook = nameof(OnAllocatedDataChanged))] public int AllocatedLUK = 0;
+        // CORREÇÃO v22: hooks individuais por SyncVar — setar flag _allocDirty em vez de refresh direto
+        [SyncVar(hook = nameof(OnAllocSTRChanged))] public int AllocatedSTR = 0;
+        [SyncVar(hook = nameof(OnAllocAGIChanged))] public int AllocatedAGI = 0;
+        [SyncVar(hook = nameof(OnAllocVITChanged))] public int AllocatedVIT = 0;
+        [SyncVar(hook = nameof(OnAllocDEXChanged))] public int AllocatedDEX = 0;
+        [SyncVar(hook = nameof(OnAllocINTChanged))] public int AllocatedINT = 0;
+        [SyncVar(hook = nameof(OnAllocLUKChanged))] public int AllocatedLUK = 0;
 
         [SyncVar] public int BaseSTR = 10;
         [SyncVar] public int BaseAGI = 10;
@@ -147,6 +160,9 @@ namespace RPG.Network
         private bool          _pendingClientInit = false;
         private CharacterData _pendingInitData   = null;
 
+        // CORREÇÃO v22: flag para consolidar múltiplos hooks de alloc em um único refresh
+        private bool  _allocDirty = false;
+
         private float       _lastMovingCmdTime;
         private const float MOVING_CMD_INTERVAL = 0.1f;
 
@@ -191,6 +207,7 @@ namespace RPG.Network
             _clientInitialized = false;
             _pendingClientInit = false;
             _pendingInitData   = null;
+            _allocDirty        = false;
         }
 
         public override void OnStartLocalPlayer()
@@ -214,7 +231,15 @@ namespace RPG.Network
         {
             if (isServer) ServerUpdate();
             if (!isLocalPlayer || Dead) return;
+
             ClientMovingUpdate();
+
+            // CORREÇÃO v22: processa alloc dirty uma vez por frame no cliente
+            if (_allocDirty)
+            {
+                _allocDirty = false;
+                ApplyAllocatedDataToEntity();
+            }
         }
 
         [Server]
@@ -305,6 +330,8 @@ namespace RPG.Network
             yield return null;
             yield return null;
 
+            var eq = charData.EquipmentBonuses ?? new EquipmentBonuses();
+
             var initData = new PlayerInitData
             {
                 CharName   = charData.CharacterName,
@@ -327,10 +354,17 @@ namespace RPG.Network
                 BaseLUK    = charData.BaseAttributes.LUK,
                 CurHP      = CurrentHP,
                 CurMP      = CurrentMP,
-                EquipATK   = charData.EquipmentBonuses?.ATK  ?? 0f,
-                EquipDEF   = charData.EquipmentBonuses?.DEF  ?? 0f,
-                EquipMATK  = charData.EquipmentBonuses?.MATK ?? 0f,
-                EquipMDEF  = charData.EquipmentBonuses?.MDEF ?? 0f
+                // Equipamento completo — CORREÇÃO v22
+                EquipATK   = eq.ATK,  EquipDEF  = eq.DEF,
+                EquipMATK  = eq.MATK, EquipMDEF = eq.MDEF,
+                EquipSTR   = eq.STR,  EquipAGI  = eq.AGI,
+                EquipVIT   = eq.VIT,  EquipDEX  = eq.DEX,
+                EquipINT   = eq.INT,  EquipLUK  = eq.LUK,
+                EquipHPBonus = eq.HPBonus, EquipMPBonus = eq.MPBonus,
+                EquipResistFire      = eq.ResistFire,
+                EquipResistIce       = eq.ResistIce,
+                EquipResistPoison    = eq.ResistPoison,
+                EquipResistLightning = eq.ResistLightning
             };
 
             RpcInitializeLocalPlayer(initData);
@@ -363,15 +397,19 @@ namespace RPG.Network
             {
                 yield return wait;
 
+                // CORREÇÃO v22: verifica this, isServer e _serverStats após o yield
                 if (this == null || !isServer) yield break;
-                if (Dead || _serverStats == null) continue;
+                if (Dead) continue;
+
+                // Captura referência local para evitar race condition
+                var stats = _serverStats;
+                if (stats == null) continue;
 
                 bool inCombat = (Time.time - _lastDamageTime) < REGEN_COMBAT_SUPPRESSION;
                 if (inCombat) continue;
 
-                // OTIMIZAÇÃO v21: verifica antecipadamente se há algo a regen
-                bool needsHPRegen = CurrentHP < MaxHP && _serverStats.HPRegen > 0f;
-                bool needsMPRegen = CurrentMP < MaxMP && _serverStats.MPRegen > 0f;
+                bool needsHPRegen = CurrentHP < MaxHP && stats.HPRegen > 0f;
+                bool needsMPRegen = CurrentMP < MaxMP && stats.MPRegen > 0f;
                 if (!needsHPRegen && !needsMPRegen) continue;
 
                 float hpRestored = 0f;
@@ -380,7 +418,7 @@ namespace RPG.Network
                 if (needsHPRegen)
                 {
                     float before = CurrentHP;
-                    CurrentHP = Mathf.Min(MaxHP, CurrentHP + _serverStats.HPRegen);
+                    CurrentHP = Mathf.Min(MaxHP, CurrentHP + stats.HPRegen);
                     hpRestored = CurrentHP - before;
                     if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
                 }
@@ -388,7 +426,7 @@ namespace RPG.Network
                 if (needsMPRegen)
                 {
                     float before = CurrentMP;
-                    CurrentMP = Mathf.Min(MaxMP, CurrentMP + _serverStats.MPRegen);
+                    CurrentMP = Mathf.Min(MaxMP, CurrentMP + stats.MPRegen);
                     mpRestored = CurrentMP - before;
                     if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
                 }
@@ -458,7 +496,12 @@ namespace RPG.Network
             MarkDirty();
         }
 
-        [Command] public void CmdRequestRespawn() => ServerRespawn();
+        [Command] public void CmdRequestRespawn()
+        {
+            // Proteção contra spam: só processa se o player realmente está morto
+            if (!Dead) return;
+            ServerRespawn();
+        }
 
         [Command]
         public void CmdRequestSelfSkill(int skillIndex)
@@ -494,50 +537,26 @@ namespace RPG.Network
 
         // ── Métodos de servidor ────────────────────────────────────────────
 
-        /// <summary>
-        /// CORREÇÃO v21: RpcShowDamageTaken REMOVIDO deste método.
-        /// O floating text de dano recebido é enviado exclusivamente pelo monstro
-        /// via RpcShowDamageTakenOnPlayer() em NetworkMonsterEntity.ServerAttack().
-        /// Isso evita o double floating text que aparecia ao receber dano.
-        ///
-        /// Para implementar dano de área, veneno, etc. no futuro:
-        /// use TargetRpc diretamente no sistema que aplica o dano, NÃO aqui.
-        /// </summary>
         [Server]
         public void ServerApplyDamage(float dmg)
         {
             if (Dead) return;
             _lastDamageTime = Time.time;
-
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
-
             if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
-
-            // CORREÇÃO v21: sem RpcShowDamageTaken aqui — o monstro já enviou
-            // RpcShowDamageTakenOnPlayer com o valor correto antes de chamar este método.
-
             if (CurrentHP <= 0f) ServerDie();
         }
 
-        /// <summary>
-        /// ServerApplyDamageWithFeedback — para fontes de dano que NÃO são monstros
-        /// (ex: veneno, armadilhas, dano de área futuro). Envia floating text.
-        /// </summary>
         [Server]
         public void ServerApplyDamageWithFeedback(float dmg)
         {
             if (Dead) return;
             _lastDamageTime = Time.time;
-
             float before = CurrentHP;
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
             float actualDmg = before - CurrentHP;
-
             if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
-
-            if (actualDmg > 0f)
-                RpcShowDamageTaken(actualDmg);
-
+            if (actualDmg > 0f) RpcShowDamageTaken(actualDmg);
             if (CurrentHP <= 0f) ServerDie();
         }
 
@@ -615,8 +634,7 @@ namespace RPG.Network
             RpcOnExpGained(amount, leveledUp);
         }
 
-        [Server]
-        private void MarkDirty() => _isDirty = true;
+        [Server] private void MarkDirty() => _isDirty = true;
 
         [Server]
         public void ServerSaveCharacterForced()
@@ -643,8 +661,7 @@ namespace RPG.Network
             _isDirty = false;
         }
 
-        [Server]
-        public void ServerSaveCharacter() => ServerSaveCharacterForced();
+        [Server] public void ServerSaveCharacter() => ServerSaveCharacterForced();
 
         // ── ClientRpcs ─────────────────────────────────────────────────────
 
@@ -653,6 +670,7 @@ namespace RPG.Network
         {
             if (!isLocalPlayer) return;
 
+            // CORREÇÃO v22: equip completo com resistências
             var data = new CharacterData
             {
                 CharacterName         = d.CharName,
@@ -676,8 +694,16 @@ namespace RPG.Network
                 },
                 EquipmentBonuses = new EquipmentBonuses
                 {
-                    ATK = d.EquipATK, DEF = d.EquipDEF,
-                    MATK = d.EquipMATK, MDEF = d.EquipMDEF
+                    ATK  = d.EquipATK,  DEF  = d.EquipDEF,
+                    MATK = d.EquipMATK, MDEF = d.EquipMDEF,
+                    STR  = d.EquipSTR,  AGI  = d.EquipAGI,
+                    VIT  = d.EquipVIT,  DEX  = d.EquipDEX,
+                    INT  = d.EquipINT,  LUK  = d.EquipLUK,
+                    HPBonus = d.EquipHPBonus, MPBonus = d.EquipMPBonus,
+                    ResistFire      = d.EquipResistFire,
+                    ResistIce       = d.EquipResistIce,
+                    ResistPoison    = d.EquipResistPoison,
+                    ResistLightning = d.EquipResistLightning
                 }
             };
 
@@ -748,16 +774,11 @@ namespace RPG.Network
             }
         }
 
-        /// <summary>
-        /// RpcShowDamageTaken — usado por fontes de dano que não são monstros.
-        /// Monstros usam RpcShowDamageTakenOnPlayer() em NetworkMonsterEntity.
-        /// </summary>
         [ClientRpc]
         private void RpcShowDamageTaken(float dmg)
         {
             FloatingTextManager.Instance?.Show(
-                $"-{dmg:0}",
-                transform.position + Vector3.up * 2f,
+                $"-{dmg:0}", transform.position + Vector3.up * 2f,
                 new Color(1f, 0.25f, 0.25f));
         }
 
@@ -765,25 +786,11 @@ namespace RPG.Network
         private void RpcShowRegenTick(float hpRestored, float mpRestored)
         {
             if (!isLocalPlayer) return;
-
             Vector3 basePos = transform.position + Vector3.up * 2f;
-
             if (hpRestored >= REGEN_DISPLAY_THRESHOLD)
-            {
-                FloatingTextManager.Instance?.Show(
-                    $"+{hpRestored:0} HP",
-                    basePos,
-                    new Color(0.4f, 1f, 0.4f));
-            }
-
+                FloatingTextManager.Instance?.Show($"+{hpRestored:0} HP", basePos, new Color(0.4f, 1f, 0.4f));
             if (mpRestored >= REGEN_DISPLAY_THRESHOLD)
-            {
-                Vector3 mpPos = basePos + new Vector3(0.3f, 0.2f, 0f);
-                FloatingTextManager.Instance?.Show(
-                    $"+{mpRestored:0} MP",
-                    mpPos,
-                    new Color(0.4f, 0.7f, 1f));
-            }
+                FloatingTextManager.Instance?.Show($"+{mpRestored:0} MP", basePos + new Vector3(0.3f, 0.2f, 0f), new Color(0.4f, 0.7f, 1f));
         }
 
         [ClientRpc]
@@ -844,19 +851,35 @@ namespace RPG.Network
             RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);
         }
 
+        /// <summary>
+        /// CORREÇÃO v22: fallback tenta NavMesh.SamplePosition antes de aceitar Vector3.zero.
+        /// </summary>
         [Server]
         private Vector3 GetRespawnPosition()
         {
+            // 1. Pontos de respawn configurados manualmente
             if (_respawnPoints != null && _respawnPoints.Length > 0)
-                return _respawnPoints[UnityEngine.Random.Range(0, _respawnPoints.Length)].position;
+            {
+                var pt = _respawnPoints[UnityEngine.Random.Range(0, _respawnPoints.Length)];
+                if (pt != null) return pt.position;
+            }
 
+            // 2. Ponto de spawn da raça via RPGNetworkManager
             if (_serverCharData != null)
             {
                 var nm = RPGNetworkManager.singleton;
                 if (nm != null)
-                    return nm.GetSpawnPositionForRace(_serverCharData.Race, _serverCharData);
+                {
+                    Vector3 racePos = nm.GetSpawnPositionForRace(_serverCharData.Race, _serverCharData);
+                    if (racePos.sqrMagnitude > 0.01f) return racePos;
+                }
             }
 
+            // 3. Fallback: tenta encontrar qualquer ponto válido no NavMesh
+            if (NavMesh.SamplePosition(Vector3.zero, out NavMeshHit hit, 50f, NavMesh.AllAreas))
+                return hit.position;
+
+            Debug.LogWarning($"[Server] GetRespawnPosition: nenhum ponto válido encontrado para {CharacterName}. Usando origem.");
             return Vector3.zero;
         }
 
@@ -928,14 +951,21 @@ namespace RPG.Network
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
 
+        // CORREÇÃO v22: hooks individuais que apenas setam a flag dirty
+        // O Update() do cliente consolida em um único FullRefreshStatsFromData() por frame
+        private void OnAllocSTRChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+        private void OnAllocAGIChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+        private void OnAllocVITChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+        private void OnAllocDEXChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+        private void OnAllocINTChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+        private void OnAllocLUKChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+
         /// <summary>
-        /// CORREÇÃO v21: após atualizar os dados de atributos no PlayerEntity.Data,
-        /// chama FullRefreshStatsFromData() para recalcular os DerivedStats.
-        /// Antes, os stats derivados ficavam desatualizados até StatsVersion mudar.
+        /// Aplica os dados de atributos alocados ao PlayerEntity e recalcula stats.
+        /// Chamado UMA VEZ por frame quando _allocDirty = true.
         /// </summary>
-        private void OnAllocatedDataChanged(int _, int __)
+        private void ApplyAllocatedDataToEntity()
         {
-            if (!isLocalPlayer) return;
             if (_playerEntity?.Data == null) return;
 
             _playerEntity.Data.BaseAttributes.STR = BaseSTR;
@@ -952,7 +982,6 @@ namespace RPG.Network
             _playerEntity.Data.AllocatedINT = AllocatedINT;
             _playerEntity.Data.AllocatedLUK = AllocatedLUK;
 
-            // CORREÇÃO v21: recalcula stats derivados imediatamente
             if (_playerEntity.IsInitialized)
                 _playerEntity.FullRefreshStatsFromData();
         }
