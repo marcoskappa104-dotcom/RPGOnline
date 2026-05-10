@@ -8,23 +8,25 @@ using System.Collections;
 namespace RPG.Network
 {
     /// <summary>
-    /// ServerAuthManager v7
+    /// ServerAuthManager v8
     ///
-    /// CORREÇÕES v7:
+    /// CORREÇÃO v8 — BUG: Sessões Authenticated nunca expiravam.
     ///
-    ///   ALINHAMENTO COM PIPELINE v9:
-    ///     TryLoginWithSignedHash agora funciona porque o banco armazena SHA256(senha)
-    ///     e ValidateLoginWithNonce calcula SHA256(SHA256(senha)+nonce) corretamente.
-    ///     Nenhuma mudança de lógica necessária aqui — o bug estava em GameManager/DatabaseManager.
+    ///   PROBLEMA:
+    ///     CleanupExpiredSessions() só limpava sessões no estado Unauthenticated.
+    ///     Isso significa que um cliente que logou (Authenticated) mas nunca selecionou
+    ///     um personagem ficava na memória indefinidamente, mesmo sem atividade por horas.
+    ///     Em um servidor de longa duração, isso acumula entradas zumbi em _sessions.
+    ///     Sessões InGame são excluídas corretamente pelo OnServerDisconnect, mas
+    ///     sessões Authenticated ociosas (idle) não tinham caminho de limpeza.
     ///
-    ///   MELHORIA — logs de debug detalhados no fluxo de login:
-    ///     Agora é possível rastrear exatamente onde o login falha sem modificar o código.
-    ///     Ative DEBUG_AUTH no Inspector ou via define para ver os detalhes.
+    ///   SOLUÇÃO:
+    ///     CleanupExpiredSessions agora limpa TANTO Unauthenticated QUANTO Authenticated
+    ///     sessões que excederam SESSION_TTL_SECONDS sem atividade.
+    ///     Sessões InGame são propositalmente ignoradas — elas são removidas por
+    ///     OnServerDisconnect, que é sempre chamado pelo Mirror.
     ///
-    ///   MELHORIA — OnCreateAccountRequest agora retorna erro apropriado quando
-    ///     username ou hash são vazios, em vez de passar null para TryCreateAccount.
-    ///
-    ///   Todas as correções v6 mantidas (rate limiting, nonce, session TTL, cleanup).
+    ///   Todas as correções v7 mantidas (rate limiting, nonce, challenge-response).
     /// </summary>
     public class ServerAuthManager : MonoBehaviour
     {
@@ -113,7 +115,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Rate limiting por conexão
             session.LoginAttempts++;
             if (session.LoginAttempts > LOGIN_MAX_ATTEMPTS)
             {
@@ -123,7 +124,6 @@ namespace RPG.Network
                 return;
             }
 
-            // Validação de entrada
             if (string.IsNullOrWhiteSpace(msg.Username) || string.IsNullOrWhiteSpace(msg.SignedHash))
             {
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Dados de login inválidos." });
@@ -132,7 +132,7 @@ namespace RPG.Network
 
             if (string.IsNullOrWhiteSpace(session.SessionNonce))
             {
-                Debug.LogError($"[ServerAuth] SessionNonce vazio para conn:{conn.connectionId}! Isso não deveria acontecer.");
+                Debug.LogError($"[ServerAuth] SessionNonce vazio para conn:{conn.connectionId}!");
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Erro de sessão. Reconecte." });
                 return;
             }
@@ -165,7 +165,6 @@ namespace RPG.Network
 
         private void OnCreateAccountRequest(NetworkConnectionToClient conn, MsgCreateAccountRequest msg)
         {
-            // Validação de entrada antes de passar para o banco
             if (string.IsNullOrWhiteSpace(msg.Username))
             {
                 conn.Send(new MsgCreateAccountResponse { Success = false, Error = "Username inválido." });
@@ -306,6 +305,18 @@ namespace RPG.Network
 
         // ── Limpeza de sessões expiradas ───────────────────────────────────
 
+        /// <summary>
+        /// CORREÇÃO v8: agora limpa TANTO Unauthenticated QUANTO Authenticated ociosas.
+        ///
+        /// Sessões InGame são propositalmente ignoradas — elas são sempre removidas
+        /// pelo OnServerDisconnect (garantia do Mirror), então não precisam de limpeza
+        /// por timer e não devem ser expiradas enquanto o jogador está ativo.
+        ///
+        /// Estado de limpeza por timer:
+        ///   Unauthenticated → limpa após SESSION_TTL_SECONDS sem atividade  ✓ (antes)
+        ///   Authenticated   → limpa após SESSION_TTL_SECONDS sem atividade  ✓ (NOVO v8)
+        ///   InGame          → NUNCA limpa por timer (apenas via disconnect) ✓
+        /// </summary>
         private IEnumerator CleanupExpiredSessions()
         {
             var wait = new WaitForSeconds(60f);
@@ -316,17 +327,19 @@ namespace RPG.Network
                 var expired = new List<int>();
                 foreach (var kv in _sessions)
                 {
-                    if (kv.Value.State == ConnState.Unauthenticated &&
-                        Time.time - kv.Value.LastActivityTime > SESSION_TTL_SECONDS)
-                    {
+                    var state = kv.Value.State;
+                    bool isIdle = Time.time - kv.Value.LastActivityTime > SESSION_TTL_SECONDS;
+
+                    // Limpa qualquer sessão não-InGame que esteja ociosa há tempo demais
+                    if (state != ConnState.InGame && isIdle)
                         expired.Add(kv.Key);
-                    }
                 }
 
                 foreach (var id in expired)
                 {
+                    var state = _sessions[id].State;
                     _sessions.Remove(id);
-                    Debug.Log($"[ServerAuthManager] Sessão expirada removida: connId={id}");
+                    Debug.Log($"[ServerAuthManager] Sessão expirada removida: connId={id} estado={state}");
                 }
             }
         }
